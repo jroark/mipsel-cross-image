@@ -6,72 +6,47 @@ This container provides a development environment for cross-compiling the Linux 
 
 ### 1. Build the Container
 ```bash
-docker build -t mipsel-cross-dev .
-# OR using docker-compose
 docker-compose build
 ```
 
 ### 2. Run the Container
 ```bash
-docker run -it --rm -v $(pwd):/work mipsel-cross-dev
-# OR using docker-compose
 docker-compose run mips-dev
 ```
 
-## Cross-Compiling Examples
+## Automating the Tiny Core MIPS Build
 
-### Building BusyBox
-Inside the container:
+The following scripts are included to automate the creation of a minimal Tiny Core style system:
+
+1.  **`./build_tcl_kernel.sh`**: Downloads the Tiny Core 7.x patched Linux 4.2.9 source, applies modern GCC compatibility fixes, and builds `vmlinux`.
+2.  **`./build_busybox.sh`**: Downloads BusyBox 1.24.2, configures it for MIPS with internal crypt support, and performs a static build.
+3.  **`./create_initramfs.sh`**: Packages the BusyBox `_install` directory into a bootable `rootfs.gz` with a custom `/init` script.
+
+To run them all sequentially inside the container:
 ```bash
-wget https://busybox.net/downloads/busybox-1.36.1.tar.bz2
-tar xjf busybox-1.36.1.tar.bz2
-cd busybox-1.36.1
-
-# Configure for mipsel
-make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- defconfig
-# (Optional) Customize with: make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- menuconfig
-
-# Build
-make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- -j$(nproc)
-make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- install
+docker-compose run mips-dev bash -c "./build_tcl_kernel.sh && ./build_busybox.sh && ./create_initramfs.sh"
 ```
 
-### Building the Linux Kernel
-Inside the container:
+## Modern Toolchain Compatibility
+Building legacy kernels (like 4.2.9) on modern systems (Ubuntu 22.04 / GCC 10+) requires specific fixes included in the scripts:
+- **yylloc fix**: Handled via `extern` in lexer files.
+- **log2.h fix**: Resolved `noreturn`/`const` attribute conflicts.
+- **Werror**: Recursively stripped from Makefiles to prevent build stops on modern compiler warnings.
+- **Static Crypt**: BusyBox is configured with `CONFIG_USE_BB_CRYPT` because modern glibc requires external `libcrypt` for static linking.
+
+## Testing the Build
+You can test the resulting kernel and initramfs using QEMU:
 ```bash
-wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
-tar xf linux-6.6.tar.xz
-cd linux-6.6
-
-# Configure for mipsel (example for generic malta board)
-make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- malta_defconfig
-
-# Build
-make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- -j$(nproc) vmlinux
+qemu-system-mipsel -M malta \
+    -kernel linux-4.2.9/vmlinux \
+    -initrd rootfs.gz \
+    -append "console=ttyS0" \
+    -nographic
 ```
-
-## Tiny Core / MicroCore Specifics
-
-The official Tiny Core MIPS port targets 32-bit little-endian (`mipsel`). Official support for `mips64el` is limited in older releases, but you can build custom kernels using the provided tools.
-
-Resources for Tiny Core MIPS (7.x):
-- **Kernel Config:** [http://tinycorelinux.net/7.x/mips/release/src/kernel/](http://tinycorelinux.net/7.x/mips/release/src/kernel/)
-- **Repository Mirror:** [http://distro.ibiblio.org/tinycorelinux/7.x/mips/](http://distro.ibiblio.org/tinycorelinux/7.x/mips/)
-
-For MIPS:
--   **Config:** Look for `config-3.16.6-tinycore` files.
--   **Patches:** TCL often applies patches for size optimization (like SquashFS patches).
--   **Rootfs:** The `rootfs.gz` is a standard cpio archive. You can unpack it, add your BusyBox build, and repack it:
-    ```bash
-    # Unpack
-    zcat rootfs.gz | cpio -id
-    # Repack
-    find . | cpio -o -H newc | gzip > ../rootfs_new.gz
-    ```
 
 ## Tools Included
 - `mipsel-linux-gnu-gcc` (32-bit Little Endian)
 - `mips64el-linux-gnuabi64-gcc` (64-bit Little Endian)
-- `make`, `bc`, `bison`, `flex`, `libssl-dev`, `libelf-dev`
-- `cpio` (for creating initramfs)
-- `xz-utils`, `rsync`
+- `make`, `bc`, `bison`, `flex`, `libssl-dev`, `libelf-dev`, `libncurses-dev`
+- `cpio`, `xz-utils`, `zstd`, `zlib1g-dev`
+- `rsync`, `wget`, `curl`
