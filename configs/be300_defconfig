@@ -1,0 +1,111 @@
+#
+# Linux 4.2.9 minimal defconfig for Casio Cassiopeia BE-300 (VR4131)
+# Stripped to match the minimal hw support of the known-good 2.4/2.6 kernels.
+#
+
+# Platform
+CONFIG_MACH_VR41XX=y
+CONFIG_CASIO_BE300=y
+
+# Absolutely minimal general options
+# CONFIG_SWAP is not set
+# CONFIG_MODULES is not set
+CONFIG_EMBEDDED=y
+# CONFIG_SYSVIPC is not set
+# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set
+CONFIG_LOG_BUF_SHIFT=14
+
+# Use SLAB instead of SLUB (matches 2.4/2.6 era)
+# CONFIG_SLUB is not set
+CONFIG_SLAB=y
+
+# Executable format
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+# CONFIG_BINFMT_MISC is not set
+
+# Block devices — only RAM disk
+CONFIG_BLK_DEV_RAM=y
+CONFIG_BLK_DEV_RAM_SIZE=4096
+CONFIG_BLK_DEV_INITRD=y
+# CONFIG_BLK_DEV_LOOP is not set
+
+# Disable ALL IO schedulers except noop
+# CONFIG_IOSCHED_DEADLINE is not set
+# CONFIG_IOSCHED_CFQ is not set
+CONFIG_DEFAULT_IOSCHED="noop"
+
+# Console & TTY — minimal
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_HW_CONSOLE=y
+CONFIG_DUMMY_CONSOLE=y
+CONFIG_UNIX98_PTYS=y
+
+# Early printk
+CONFIG_EARLY_PRINTK=y
+
+# Framebuffer — minimal (sfb built into board support)
+CONFIG_FB=y
+CONFIG_FB_CFB_FILLRECT=y
+CONFIG_FB_CFB_COPYAREA=y
+CONFIG_FB_CFB_IMAGEBLIT=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FONTS=y
+CONFIG_FONT_8x8=y
+# CONFIG_FONT_8x16 is not set
+
+# NO serial (BE300 UART is not 8250)
+# CONFIG_SERIAL_8250 is not set
+
+# Filesystem — minimal
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_TMPFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_EXT2_FS=y
+
+# Disable EVERYTHING not needed
+# CONFIG_NET is not set
+# CONFIG_SOUND is not set
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_PCI is not set
+# CONFIG_IDE is not set
+# CONFIG_SCSI is not set
+# CONFIG_MTD is not set
+# CONFIG_INPUT_MOUSEDEV is not set
+# CONFIG_INPUT_JOYDEV is not set
+# CONFIG_INPUT_EVDEV is not set
+# CONFIG_SERIO is not set
+# CONFIG_INPUT_KEYBOARD is not set
+# CONFIG_INPUT_MOUSE is not set
+# CONFIG_INPUT_TOUCHSCREEN is not set
+# CONFIG_HWMON is not set
+# CONFIG_I2C is not set
+# CONFIG_SPI is not set
+# CONFIG_CRYPTO is not set
+# CONFIG_MISC_DEVICES is not set
+# CONFIG_INPUT_MISC is not set
+# CONFIG_NEW_LEDS is not set
+# CONFIG_RTC_CLASS is not set
+# CONFIG_DMADEVICES is not set
+# CONFIG_STAGING is not set
+# CONFIG_THERMAL is not set
+# CONFIG_MFD_SUPPORT is not set
+# CONFIG_REGULATOR is not set
+# CONFIG_MEDIA_SUPPORT is not set
+# CONFIG_AGP is not set
+# CONFIG_VGA_ARB is not set
+# CONFIG_DRM is not set
+# CONFIG_FB_SIMPLE is not set
+# CONFIG_POWER_SUPPLY is not set
+# CONFIG_BLOCK_COMPAT is not set
+# CONFIG_WEXT_CORE is not set
+# CONFIG_WIRELESS is not set
+
+# Printk/debug — minimal
+CONFIG_PRINTK=y
+CONFIG_KALLSYMS=y
+# CONFIG_DEBUG_KERNEL is not set
+# CONFIG_FTRACE is not set

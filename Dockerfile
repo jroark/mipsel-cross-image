@@ -27,6 +27,8 @@ RUN apt-get update && apt-get install -y \
     rsync \
     unzip \
     vim \
+    libsdl2-dev \
+    ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 # Install MIPS and MIPS64 cross-compilers (little-endian)
