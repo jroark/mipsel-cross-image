@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a cross-compilation environment for porting Linux to the Casio Cassiopeia BE-300 PDA. The BE-300 uses a NEC VR4131 CPU (MIPS III, little-endian) with a VRC4173 companion chip for peripherals. The current effort is porting Linux 4.2.9 to boot to userspace on the BE-300 emulator.
+This is a cross-compilation environment for building Linux kernels for the Casio Cassiopeia BE-300 PDA. The BE-300 uses a NEC VR4131 CPU (MIPS III, little-endian) with a VRC4173 companion chip for peripherals. Linux 4.2.9 boots to userspace on both the BE-300 emulator and real hardware.
 
 ## Build Commands
 
@@ -84,31 +84,29 @@ The build script also patches `arch/mips/vr41xx/Kconfig` and `Platform` to add t
 - **Emulator is strictly 32-bit**: The be300 emulator runs 32-bit MIPS code only. Disassembly of both known-good kernels (2.4.18, 2.6.8.1) confirms zero 64-bit instructions (no sd, ld, daddu, daddiu, dsll, dsrl). The 4.2.9 kernel's dynamically generated `clear_page`/`copy_page` functions use `sd`/`ld` by default because VR4131 reports `cpu_has_64bit_gp_regs=true`. This MUST be disabled — force `clear_word_size=4` and `copy_word_size=4` in `arch/mips/mm/page.c`.
 - **Emulator has no --initrd**: Initramfs must be built into vmlinux via CONFIG_INITRAMFS_SOURCE
 - **Memory registration**: Common VR41xx `prom_init()` doesn't call `add_memory_region()`. The build script patches it to register 16MB. Do NOT rely solely on `mem=16M` on the cmdline — this has caused the kernel to allocate pages beyond physical RAM (writes to non-existent memory are silently dropped by the emulator, corrupting page tables and file data).
-- **Emulator address reporting bug**: The emulator reports 263K+ "memory WRITE to non-existant paddr" messages for KSEG0 writes. A C wrapper for `clear_page` confirmed the kernel virtual addresses ARE valid (< 0x81000000). The emulator's physical address computation/reporting is wrong, but the data IS written to the correct location. This is cosmetic — NOT the root cause. Using `--sdram 64` eliminates all reported OOB writes but doesn't fix the userspace crash.
-- **serial_be300 is incomplete**: The custom serial TTY driver in the source overlays is unfinished
-- **VR4131 cache bug**: Hit_Writeback_Inv_D must be split into separate writeback + invalidate (patches in `patches/`). The build script patches `flush_dcache_line()` and `protected_flush_dcache_line()` in `r4kcache.h`. Note: the emulator may not emulate the instruction cache, so this fix may be irrelevant for emulator testing but is needed for real hardware.
+- **serial_be300 is incomplete**: The custom serial TTY driver in the source overlays is unfinished. Use `keep_bootcon` on the kernel cmdline to retain early printk serial output past normal console registration.
+- **VR4131 cache bug**: Hit_Writeback_Inv_D must be split into separate writeback + invalidate. The build script patches `flush_dcache_line()` and `protected_writeback_dcache_line()` in `r4kcache.h`. Required for real hardware; also works on the emulator.
 - **BusyBox ISA**: Must not use MIPS32r2 instructions. The toolchain's libc is mips32r2 so `file` will still report "rel2", but BusyBox code uses `-march=mips32` via EXTRA_CFLAGS. Binaries must be compiled with `-mno-abicalls -fno-pic` for `-nostdlib` builds (PIC without libc's crt0 leaves `$gp` uninitialized).
 - **Docker mknod**: Cannot create device nodes in unprivileged Docker; use kernel's initramfs_list.txt format instead
 - **simplefb doesn't work**: The mainline `simplefb` driver uses `ioremap_wc()` which doesn't work for the BE300's KSEG1-mapped VRAM. Use the ported `sfb.c` instead, which directly accesses 0xAA200000 as a KSEG1 virtual address.
 - **Framebuffer console requires CFB helpers**: `CONFIG_FB_CFB_FILLRECT/COPYAREA/IMAGEBLIT` must be force-selected in Kconfig since no standard driver selects them. The build script adds `select FB_CFB_*` to the CASIO_BE300 Kconfig entry.
 
-### Boot Status (as of March 2026)
+### VR41xx TLB Compatibility
 
-**BOOTS TO USERSPACE** — The 4.2.9 kernel boots and executes userspace code (test_init.S).
+Both the emulator and real hardware implement VR41xx TLB, which differs from standard R4000. Do NOT change these to standard R4000 values:
+- **PageMask**: VR41xx format (PM_4K=0x1800, not standard 0x0)
+- **build_adjust_context**: +2 shift (VR41xx Context.BadVPN2 starts at bit 6, not standard bit 4)
+- **EntryLo PFN position**: bit 8 (not standard R4000 bit 6)
 
-The root cause of the prior userspace failure was a VR41xx `pfn_pte` shift mismatch:
-- The VR41xx `pfn_pte` in `pgtable-32.h` stored PFN at `PAGE_SHIFT+2` (bit 14), designed for the 2.4-era PTE layout where `_PAGE_GLOBAL` was at bit 6
-- In 4.2.9, `_PAGE_GLOBAL` moved to bit 5, so the TLB handler SRLs by 5 instead of 6
-- After SRL by 5, PFN landed at EntryLo bit 9 instead of the VR41xx-correct bit 8
-- Result: every user physical address was 2x too high, pointing beyond 16MB RAM
-- **Fix**: `sed -i 's/PAGE_SHIFT + 2/PAGE_SHIFT + 1/g' arch/mips/include/asm/pgtable-32.h`
+The mainline VR41xx `pfn_pte` stores PFN at `PAGE_SHIFT+2` (bit 14), designed for the 2.4-era `_PAGE_GLOBAL` at bit 6. In 4.2.9, `_PAGE_GLOBAL` moved to bit 5, so the build script adjusts to `PAGE_SHIFT+1` to keep PFN aligned at EntryLo bit 8 after the TLB handler's SRL by 5.
 
-**Important**: The emulator faithfully implements VR41xx TLB hardware. Do NOT change:
-- PageMask values (PM_4K=0x1800 is correct for VR41xx)
-- build_adjust_context +2 shift (VR41xx Context.BadVPN2 starts at bit 6)
-- EntryLo PFN position (VR41xx has PFN at bit 8, not standard R4000 bit 6)
+### Real Hardware Notes
 
-Only the pfn_pte shift needed adjustment to compensate for the _PAGE_GLOBAL bit position change.
+- **D-cache linesize**: 16 bytes (emulator reports 32)
+- **TClock**: 41472000Hz (emulator reports 20736000Hz)
+- **BogoMIPS**: ~110 (emulator varies)
+- **Serial output**: Use `keep_bootcon` on cmdline to retain early printk output via companion UART past console switch. Without a ttyS0 driver, serial goes silent otherwise.
+- **Bad page state warnings**: ~19 non-fatal "nonzero mapcount" warnings during `free_all_bootmem` for PFNs near top of RAM (0xe26-0xff1). Kernel continues with ~12MB usable.
 
 ### Source Overlays (src/)
 
