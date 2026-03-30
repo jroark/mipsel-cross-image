@@ -185,11 +185,17 @@ sed -i '/case CPU_VR4131:/,/break;/{
   s/tlbw(p);/tlbw(p);\n\t\tuasm_i_nop(p);\n\t\tuasm_i_nop(p);/
 }' arch/mips/mm/tlbex.c
 
-# VR4131 cache bug fix: DISABLED for emulator testing.
-# The real VR4131 needs Hit_Writeback_Inv_D split into separate ops,
-# but the emulator may only implement the combined op. The 2.4/2.6
-# kernels use the combined op and work on the emulator.
-# This fix should be RE-ENABLED for real hardware.
+# VR4131 cache bug fix: split Hit_Writeback_Inv_D into separate
+# Hit_Writeback_D + Hit_Invalidate_D. Required for real VR4131 silicon
+# (combined op has a hardware bug). Also works on the emulator.
+sed -i '/^static inline void flush_dcache_line/,/^}/ {
+  s/cache_op(Hit_Writeback_Inv_D, addr);/cache_op(Hit_Writeback_D, addr);\n\tcache_op(Hit_Invalidate_D, addr);/
+}' arch/mips/include/asm/r4kcache.h
+
+sed -i '/^static inline void protected_writeback_dcache_line/,/^}/ {
+  s/protected_cachee_op(Hit_Writeback_Inv_D, addr);/protected_cachee_op(Hit_Writeback_D, addr);\n\tprotected_cachee_op(Hit_Invalidate_D, addr);/
+  s/protected_cache_op(Hit_Writeback_Inv_D, addr);/protected_cache_op(Hit_Writeback_D, addr);\n\tprotected_cache_op(Hit_Invalidate_D, addr);/
+}' arch/mips/include/asm/r4kcache.h
 
 # FIX: Adjust VR41xx pfn_pte/pte_pfn shift in pgtable-32.h.
 # The VR41xx EntryLo has PFN starting at bit 8 (not bit 6 like standard
