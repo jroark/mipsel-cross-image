@@ -24,6 +24,7 @@
 #include <linux/ioport.h>
 
 #include <asm/io.h>
+#include <asm/idle.h>
 
 /*
  * The companion chip I/O region starts at physical 0x0A00C000.
@@ -45,6 +46,11 @@
 #define BE300_UART_OFS_LSR	0x14
 #define BE300_UART_LSR_THRE	0x20
 
+static void casio_be300_wait(void)
+{
+	local_irq_enable();
+}
+
 static int __init casio_be300_setup(void)
 {
 	set_io_port_base(BE300_IO_PORT_BASE);
@@ -57,6 +63,21 @@ static int __init casio_be300_setup(void)
 arch_initcall(casio_be300_setup);
 
 /*
+ * The VR41xx PMU driver (subsys_initcall) sets cpu_wait to
+ * vr41xx_cpu_wait() which uses the VR41xx "standby" instruction.
+ * The BE-300 emulator doesn't wake from standby on interrupt,
+ * so override with a simple enable-and-return idle function.
+ * Must run after the PMU's subsys_initcall.
+ */
+static int __init casio_be300_idle_setup(void)
+{
+	cpu_wait = casio_be300_wait;
+	return 0;
+}
+
+device_initcall(casio_be300_idle_setup);
+
+/*
  * Early console output via the companion chip UART.
  * Called by the MIPS early_printk infrastructure when CONFIG_EARLY_PRINTK
  * is enabled and "earlyprintk" is on the kernel command line.
@@ -64,8 +85,10 @@ arch_initcall(casio_be300_setup);
 void prom_putchar(char c)
 {
 	volatile u8 *uart = (volatile u8 *)KSEG1ADDR(BE300_UART_BASE);
+	int timeout = 10000;
 
 	while ((uart[BE300_UART_OFS_LSR] & BE300_UART_LSR_THRE) == 0)
-		;
+		if (--timeout == 0)
+			return; /* bail if no serial cable connected */
 	uart[BE300_UART_OFS_THR] = c;
 }

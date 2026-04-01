@@ -1,1 +1,1 @@
-obj-y := setup.o sfb.o
+obj-y := setup.o sfb.o keys.o
