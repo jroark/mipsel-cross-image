@@ -5,63 +5,34 @@ KERNEL_SOURCE_URL="http://distro.ibiblio.org/tinycorelinux/7.x/x86/release/src/k
 BUSYBOX_VERSION="1.24.2"
 
 ###############################################################################
-# Phase 1: Extract full known-good ramdisk contents for initramfs
+# Phase 1: Build C test init with musl (tests data page mapping)
 ###############################################################################
 
-echo "=== Phase 1: Extracting known-good ramdisk contents ==="
+echo "=== Phase 1: Building C test init ==="
 
-# The 2002-era ramdisk contains a dynamically-linked BusyBox plus uClibc
-# shared libraries that work with the 2.4/2.6 kernels on the emulator.
-# Extract the ENTIRE ramdisk filesystem and use it as the initramfs root.
-RAMDISK_EXTRACT="/work/ramdisk_extracted"
-if [ ! -f "${RAMDISK_EXTRACT}/bin/busybox" ]; then
-    echo "--- Extracting full ramdisk contents ---"
-    gunzip -c /work/ramdisk-pgui-full.gz > /tmp/ramdisk.img
-    rm -rf "${RAMDISK_EXTRACT}"
-    mkdir -p "${RAMDISK_EXTRACT}"
-
-    # Use debugfs to extract the entire filesystem tree.
-    # First get the directory listing, then extract files recursively.
-    cd "${RAMDISK_EXTRACT}"
-
-    # Extract directory structure and files using debugfs rdump
-    debugfs -R "rdump / ${RAMDISK_EXTRACT}" /tmp/ramdisk.img 2>/dev/null || true
-
-    # rdump puts contents under a "/" subdir sometimes; flatten if needed
-    if [ -d "${RAMDISK_EXTRACT}//" ]; then
-        mv "${RAMDISK_EXTRACT}//"* "${RAMDISK_EXTRACT}/" 2>/dev/null || true
-    fi
-
-    # Make binaries executable (debugfs doesn't preserve permissions)
-    chmod +x "${RAMDISK_EXTRACT}/bin/"* 2>/dev/null || true
-    chmod +x "${RAMDISK_EXTRACT}/sbin/"* 2>/dev/null || true
-    chmod +x "${RAMDISK_EXTRACT}/usr/bin/"* 2>/dev/null || true
-    chmod +x "${RAMDISK_EXTRACT}/usr/sbin/"* 2>/dev/null || true
-    find "${RAMDISK_EXTRACT}/lib" -name "*.so*" -exec chmod +x {} \; 2>/dev/null || true
-    chmod +x "${RAMDISK_EXTRACT}/linuxrc" 2>/dev/null || true
-
-    rm -f /tmp/ramdisk.img
-    cd /work
-fi
-
-# Create initramfs directory from extracted ramdisk
 ROOTFS="$(pwd)/rootfs_be300"
-
-echo "--- Creating minimal initramfs ---"
 rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"
 cd "$ROOTFS"
-mkdir -p proc sys dev mnt
+mkdir -p proc sys dev
 
-# Include compressed ramdisk (727KB)
-cp /work/ramdisk-pgui-full.gz ramdisk.gz
+# Build minimal C init statically linked with musl.
+# This tests whether data pages (separate from text) are readable
+# from userspace — the key diagnostic for the data-page-zeros bug.
+echo "--- Building C test init with musl ---"
+# Build C test init with musl (normal linking, separate text+data segments).
+# Tests whether ELF loader correctly maps the second LOAD segment.
+mipsel-linux-gnu-gcc -static -march=mips32 -mabi=32 \
+    -specs /work/musl-mipsel/lib/musl-gcc.specs \
+    -o init /work/board/casio-be300/test_c_init.c
+chmod +x init
 
-# Install assembly init that decompresses ramdisk and pivots into it.
-# This avoids running ANY dynamically-linked binary from tmpfs (which
-# has the data-page-reads-as-zeros issue). The ext2-on-ramdisk path
-# uses different page cache code that may work correctly.
-echo "--- Creating /init (assembly, diagnostic) ---"
-cat > /tmp/ramdisk_init.S << 'INITASM'
+cd /work
+
+# Keep the old ramdisk init approach commented out for reference.
+# To revert, replace the above with the ramdisk_init.S approach.
+if false; then
+cat > /dev/null << 'INITASM_DISABLED'
 	.set noreorder
 	.text
 	.globl __start
@@ -380,13 +351,9 @@ argv_init:	.word s_sbin_init, 0
 argv_sh:	.word s_bin_sh, 0
 
 	/* no BSS - use stack for copy buffer */
-INITASM
-mipsel-linux-gnu-gcc -nostdlib -static -march=mips1 -mfp32 -mabi=32 \
-    -mno-abicalls -fno-pic \
-    -o init /tmp/ramdisk_init.S
-chmod +x init
-
-cd /work
+INITASM_DISABLED
+fi
+# End of disabled ramdisk init approach
 
 ###############################################################################
 # Phase 2: Download and extract kernel
@@ -530,9 +497,17 @@ void clear_page_simple(void *page)
 }
 CLEAR_PAGE_PATCH
 
-# Patch build_clear_page to install a jump to the C version
-sed -i '/memset(labels, 0, sizeof(labels));/i\
-\t/* BE300: use C clear_page instead of dynamic code */\n\t{\n\t\textern void clear_page_simple(void *);\n\t\tunsigned long fn = (unsigned long)clear_page_simple;\n\t\tbuf[0] = 0x08000000 | ((fn >> 2) \& 0x03ffffff);\n\t\tbuf[1] = 0x00000000;\n\t\treturn;\n\t}' arch/mips/mm/page.c
+# Patch build_clear_page ONLY (not build_copy_page!) to install a jump to
+# the C clear_page_simple. Using sed range to limit to build_clear_page.
+# BUG FIX 2026-04-11: Previously the sed pattern was applied to BOTH
+# build_clear_page AND build_copy_page (because memset(labels,...) appears
+# in both), causing copy_page to zero destination pages instead of copying.
+# This broke COW for MAP_PRIVATE file mappings — data segment pages read
+# as zeros in userspace because the COW copy zeroed the new page.
+sed -i '/^void build_clear_page/,/^void build_copy_page/{
+  /memset(labels, 0, sizeof(labels));/i\
+\t/* BE300: use C clear_page instead of dynamic code */\n\t{\n\t\textern void clear_page_simple(void *);\n\t\tunsigned long fn = (unsigned long)clear_page_simple;\n\t\tbuf[0] = 0x08000000 | ((fn >> 2) \& 0x03ffffff);\n\t\tbuf[1] = 0x00000000;\n\t\treturn;\n\t}
+}' arch/mips/mm/page.c
 
 # NOTE: copy_page left as dynamically generated (C replacement broke test2 on real HW)
 
@@ -559,7 +534,18 @@ sed -i '/^static inline void protected_writeback_dcache_line/,/^}/ {
 
 # NOTE: EntryLo1 workaround for emulator removed - testing on real HW first
 
-# D-cache flush: revert to standard behavior (per-page flush breaks real HW framebuffer)
+# (Debug ELF loader prints removed — COW bug root cause identified and fixed)
+
+# FIX: Always flush D-cache when Page_dcache_dirty is set in __update_cache.
+# The stock kernel only flushes when pages_do_alias() returns true, but with
+# a VIPT D-cache (VR4131: 16KB, 2-way), data written at the kernel VA (KSEG0)
+# may be in cache at a different set index than the user VA. Without writeback,
+# the user reads stale zeros from RAM instead of the kernel-written data.
+# The pages_do_alias check only detects same-index conflicts, not the
+# writeback-needed case where kernel and user VAs index different sets.
+sed -i '/^void __update_cache/,/^}/ {
+  s/if (exec || pages_do_alias(addr, address & PAGE_MASK))/if (1)/
+}' arch/mips/mm/cache.c
 
 # FIX: Force _PAGE_VALID in set_pte for VR41xx.
 # The lazy-VALID mechanism relies on TLB Invalid exceptions (handle_tlbl)
