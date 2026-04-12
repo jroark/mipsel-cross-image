@@ -5,27 +5,176 @@ KERNEL_SOURCE_URL="http://distro.ibiblio.org/tinycorelinux/7.x/x86/release/src/k
 BUSYBOX_VERSION="1.24.2"
 
 ###############################################################################
-# Phase 1: Build C test init with musl (tests data page mapping)
+# Phase 0a: Rebuild musl with -march=mips2 (no SPECIAL2 mul instruction)
+###############################################################################
+# VR4131 is MIPS III, which predates MIPS32. It does NOT implement the
+# SPECIAL2 opcode space (where MIPS32 `mul rd, rs, rt` lives). The stock
+# musl-mipsel built with -march=mips32 uses `mul` throughout, which raises
+# a Reserved Instruction exception on VR4131 (both emulator and real HW).
+# Rebuild with -march=mips2 which uses only mult/mflo.
+
+MUSL_MIPS2="/work/musl-mipsel"
+if ! mipsel-linux-gnu-objdump -d "$MUSL_MIPS2/lib/libc.a" 2>/dev/null \
+        | grep -qE '^[[:space:]]+[0-9a-f]+:[[:space:]]+[0-9a-f]+[[:space:]]+mul[[:space:]]'; then
+    echo "--- musl-mipsel already mul-free, skipping rebuild ---"
+else
+    echo "=== Phase 0a: Rebuilding musl-mipsel with -march=mips2 ==="
+    MUSL_SRC="/work/musl-1.2.5"
+    if [ ! -d "$MUSL_SRC" ]; then
+        cd /work
+        tar xf musl-1.2.5.tar.gz
+    fi
+    cd "$MUSL_SRC"
+    make distclean 2>/dev/null || true
+    # Explicitly set cross tools so musl doesn't try mipsel-linux-musl-*
+    CROSS=mipsel-linux-gnu-
+    CC="${CROSS}gcc -march=mips2" \
+    AR="${CROSS}ar" \
+    RANLIB="${CROSS}ranlib" \
+    LD="${CROSS}ld" \
+        ./configure --target=mipsel-linux-gnu \
+            --prefix="$MUSL_MIPS2" \
+            --disable-shared 2>&1 | tail -5
+    make CC="${CROSS}gcc -march=mips2" \
+         AR="${CROSS}ar" \
+         RANLIB="${CROSS}ranlib" \
+         -j$(nproc) 2>&1 | tail -5
+    make install 2>&1 | tail -5
+    cd /work
+fi
+
+###############################################################################
+# Phase 0: Prepare sanitized Linux UAPI headers for musl (needed by Phase 1)
 ###############################################################################
 
-echo "=== Phase 1: Building C test init ==="
+KHDRS="/work/musl-khdrs"
+if [ ! -d "$KHDRS/include/linux" ]; then
+    echo "=== Phase 0: Installing sanitized kernel headers for musl ==="
+    # Use a separate untar to avoid touching the kernel build tree we will
+    # configure later (the kernel tree gets blown away in Phase 2).
+    mkdir -p /tmp/khdrs_src
+    if [ ! -d /tmp/khdrs_src/linux-4.2.9 ]; then
+        tar xf /work/linux-4.2.9-patched.tar.xz -C /tmp/khdrs_src
+    fi
+    rm -rf "$KHDRS"
+    mkdir -p "$KHDRS"
+    make -C /tmp/khdrs_src/linux-4.2.9 \
+        ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- \
+        INSTALL_HDR_PATH="$KHDRS" headers_install 2>&1 | tail -5
+fi
 
-ROOTFS="$(pwd)/rootfs_be300"
+###############################################################################
+# Phase 1: Build BusyBox with musl, install into initramfs
+###############################################################################
+
+echo "=== Phase 1: Building BusyBox with musl ==="
+
+BBOX_DIR="/work/busybox-${BUSYBOX_VERSION}"
+if [ ! -d "$BBOX_DIR" ]; then
+    echo "ERROR: $BBOX_DIR not found — extract busybox-${BUSYBOX_VERSION}.tar.bz2 first"
+    exit 1
+fi
+
+# Rebuild busybox from scratch with musl + mips32 (no mips32r2 instructions).
+cd "$BBOX_DIR"
+make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- distclean || true
+make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- defconfig
+
+# Force static, disable NFS/RPC (not in musl), use internal crypt
+sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+sed -i 's/^# CONFIG_USE_BB_CRYPT is not set/CONFIG_USE_BB_CRYPT=y/' .config
+sed -i 's/^# CONFIG_USE_BB_CRYPT_SHA is not set/CONFIG_USE_BB_CRYPT_SHA=y/' .config
+# Disable WTMP (musl's _PATH_WTMP not auto-included in libbb)
+sed -i 's/^CONFIG_FEATURE_WTMP=y/CONFIG_FEATURE_WTMP=n/' .config
+sed -i 's/^CONFIG_FEATURE_UTMP=y/CONFIG_FEATURE_UTMP=n/' .config
+# Disable ALL networking applets — linux-4.2.9 UAPI headers lack the
+# __UAPI_DEF_* guards and conflict with musl's netinet/in.h.
+# Minimal embedded system doesn't need any of this.
+for cfg in CONFIG_ARP CONFIG_ARPING CONFIG_BRCTL CONFIG_DNSD CONFIG_ETHER_WAKE \
+    CONFIG_FAKEIDENTD CONFIG_FTPD CONFIG_FTPGET CONFIG_FTPPUT CONFIG_HOSTNAME \
+    CONFIG_HTTPD CONFIG_IFCONFIG CONFIG_IFENSLAVE CONFIG_IFPLUGD CONFIG_IFUPDOWN \
+    CONFIG_INETD CONFIG_IP CONFIG_IPADDR CONFIG_IPCALC CONFIG_IPLINK \
+    CONFIG_IPNEIGH CONFIG_IPROUTE CONFIG_IPRULE CONFIG_IPTUNNEL CONFIG_NAMEIF \
+    CONFIG_NBDCLIENT CONFIG_NC CONFIG_NETSTAT CONFIG_NSLOOKUP CONFIG_NTPD \
+    CONFIG_PING CONFIG_PING6 CONFIG_PSCAN CONFIG_ROUTE CONFIG_SLATTACH \
+    CONFIG_TCPSVD CONFIG_TELNET CONFIG_TELNETD CONFIG_TFTP CONFIG_TFTPD \
+    CONFIG_TRACEROUTE CONFIG_TRACEROUTE6 CONFIG_UDHCPC CONFIG_UDHCPD \
+    CONFIG_UDPSVD CONFIG_VCONFIG CONFIG_WGET CONFIG_ZCIP CONFIG_TUNCTL \
+    CONFIG_TC CONFIG_FEATURE_MOUNT_NFS CONFIG_FEATURE_HAVE_RPC \
+    CONFIG_FEATURE_INETD_RPC CONFIG_FEATURE_SYSLOGD_CFG \
+    CONFIG_RUNSV CONFIG_RUNSVDIR CONFIG_SV CONFIG_SVLOGD CONFIG_CHPST \
+    CONFIG_ENVDIR CONFIG_ENVUIDGID CONFIG_SETUIDGID CONFIG_SOFTLIMIT; do
+    sed -i "s/^${cfg}=y/${cfg}=n/" .config
+done
+
+yes "" | make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- oldconfig
+
+# Build with musl + mips32 (no r2 instructions). Use musl-gcc wrapper
+# via -specs. -nostdinc on the existing headers is not needed since musl
+# specs handle include paths.
+MUSL_SPECS="/work/musl-mipsel/lib/musl-gcc.specs"
+# musl doesn't ship Linux UAPI headers (linux/*.h); use sanitized headers
+# from linux-4.2.9 via `make headers_install` (see Phase 0 above).
+# Patched libgcc.a: the stock libgcc (from the mips32r2 cross toolchain)
+# uses the MIPS32 SPECIAL2 `mul` instruction in __divdi3/__moddi3/__udivdi3
+# etc. VR4131 is MIPS III and doesn't support SPECIAL2 — it raises
+# Reserved Instruction (SIGILL). Create a private libgcc.a that strips
+# those .o files and adds mips2-compiled replacements.
+mkdir -p /tmp/libgcc_patched
+LIBGCC_ORIG=$(mipsel-linux-gnu-gcc -print-libgcc-file-name)
+cp "$LIBGCC_ORIG" /tmp/libgcc_patched/libgcc.a
+# Remove the offending .o files (those using SPECIAL2 mul)
+mipsel-linux-gnu-ar d /tmp/libgcc_patched/libgcc.a \
+    _divdi3.o _moddi3.o _udivdi3.o _umoddi3.o \
+    _fixdfdi.o _fixunsdfdi.o _floatdidf.o _floatundidf.o \
+    _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o \
+    2>/dev/null || true
+# Compile our replacements with -march=mips2 and add them to the patched archive
+mipsel-linux-gnu-gcc -march=mips2 -O2 -c -o /tmp/libgcc_helpers.o \
+    /work/board/casio-be300/libgcc_helpers.c
+mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libgcc.a /tmp/libgcc_helpers.o
+
+make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- \
+    EXTRA_CFLAGS="-march=mips2 -specs $MUSL_SPECS -isystem $KHDRS/include" \
+    EXTRA_LDFLAGS="-specs $MUSL_SPECS -B/tmp/libgcc_patched" \
+    busybox -j$(nproc) 2>&1 | tail -5
+ls -l busybox
+mipsel-linux-gnu-strip busybox
+
+# Populate rootfs
+ROOTFS="/work/rootfs_be300"
 rm -rf "$ROOTFS"
-mkdir -p "$ROOTFS"
-cd "$ROOTFS"
-mkdir -p proc sys dev
+mkdir -p "$ROOTFS"/{bin,sbin,usr/bin,usr/sbin,proc,sys,dev,tmp,etc,root}
+cp busybox "$ROOTFS/bin/busybox"
+chmod +x "$ROOTFS/bin/busybox"
 
-# Build minimal C init statically linked with musl.
-# This tests whether data pages (separate from text) are readable
-# from userspace — the key diagnostic for the data-page-zeros bug.
-echo "--- Building C test init with musl ---"
-# Build C test init with musl (normal linking, separate text+data segments).
-# Tests whether ELF loader correctly maps the second LOAD segment.
-mipsel-linux-gnu-gcc -static -march=mips32 -mabi=32 \
-    -specs /work/musl-mipsel/lib/musl-gcc.specs \
-    -o init /work/board/casio-be300/test_c_init.c
-chmod +x init
+# Create standard busybox symlinks. We can't run ./busybox on the host
+# (different arch), so use a hardcoded list of the applets we need.
+for applet in sh ash mount umount echo cat ls ln cp mv rm mkdir rmdir \
+              pwd chmod chown uname date ps kill sleep \
+              dmesg true false clear printf head tail wc grep sed awk \
+              mknod sync poweroff reboot halt which env find test \
+              vi more less; do
+    ln -sf /bin/busybox "$ROOTFS/bin/$applet"
+done
+
+# /init is a shell script. /bin/ash is a busybox symlink; busybox
+# dispatches to the ash applet via argv[0].
+# /init is a direct symlink to /bin/busybox. The kernel execs /init,
+# argv[0] becomes "init", and busybox runs the init applet which reads
+# /etc/inittab. Provide a minimal inittab that spawns a shell on tty0.
+ln -sf /bin/busybox "$ROOTFS/init"
+
+mkdir -p "$ROOTFS/etc"
+cat > "$ROOTFS/etc/inittab" << 'INITTAB'
+::sysinit:/bin/mount -t proc proc /proc
+::sysinit:/bin/mount -t sysfs sysfs /sys
+::sysinit:/bin/mount -t devtmpfs devtmpfs /dev
+::sysinit:/bin/echo "=== Casio BE-300 Linux 4.2.9 (BusyBox) ==="
+tty0::askfirst:/bin/sh
+::ctrlaltdel:/bin/umount -a -r
+::shutdown:/bin/umount -a -r
+INITTAB
 
 cd /work
 
@@ -533,8 +682,6 @@ sed -i '/^static inline void protected_writeback_dcache_line/,/^}/ {
 }' arch/mips/include/asm/r4kcache.h
 
 # NOTE: EntryLo1 workaround for emulator removed - testing on real HW first
-
-# (Debug ELF loader prints removed — COW bug root cause identified and fixed)
 
 # FIX: Always flush D-cache when Page_dcache_dirty is set in __update_cache.
 # The stock kernel only flushes when pages_do_alias() returns true, but with

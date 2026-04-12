@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a cross-compilation environment for building Linux kernels for the Casio Cassiopeia BE-300 PDA. The BE-300 uses a NEC VR4131 CPU (MIPS III, little-endian) with a VRC4173 companion chip for peripherals. Linux 4.2.9 boots to userspace on both the BE-300 emulator and real hardware.
+This is a cross-compilation environment for building Linux kernels for the Casio Cassiopeia BE-300 PDA. The BE-300 uses a NEC VR4131 CPU (MIPS III, little-endian) with a VRC4173 companion chip for peripherals. Linux 4.2.9 boots to an interactive BusyBox shell on the BE-300 emulator (real hardware has also reached userspace with an earlier assembly-only init).
 
 ## Build Commands
 
@@ -62,21 +62,37 @@ Board support is minimal — just an `arch_initcall` with `set_io_port_base()` (
 ### BE-300 Board Support (board/casio-be300/)
 
 These files are injected into the kernel tree by `build_be300_kernel.sh`:
-- **setup.c** — `arch_initcall` sets I/O port base, `prom_putchar()` for early printk via companion UART
+- **setup.c** — `arch_initcall` sets I/O port base, idle override, `prom_putchar()` for early printk via companion UART
 - **sfb.c** — Framebuffer driver, directly accesses VRAM at KSEG1 address 0xAA200000 (no ioremap)
-- **Makefile** — builds setup.o and sfb.o
+- **keys.c** — Polled input driver for the hardware buttons
+- **libgcc_helpers.c** — mips2-compiled replacements for libgcc 64-bit helpers (see Toolchain Notes)
+- **Makefile** — builds setup.o, sfb.o, keys.o
+
+Test / diagnostic programs (not linked into the kernel):
+- **test_c_init.c** — minimal musl C /init used to isolate the COW / data-page bug
+- **test_page2.S** — minimal asm init that reads data from the second page to validate EntryLo1
 
 The build script also patches `arch/mips/vr41xx/Kconfig` and `Platform` to add the CASIO_BE300 config option.
 
 ### Build Pipeline (build_be300_kernel.sh)
 
-1. Build BusyBox with `-march=mips32` (avoids MIPS32r2 instructions the VR4131 can't execute)
-2. Create initramfs directory with BusyBox, /init script, /dev nodes via initramfs_list.txt
-3. Download linux-4.2.9-patched.tar.xz from Tiny Core Linux
-4. Apply GCC 10+ fixes: yylloc extern, log2.h noreturn/const, -Werror removal
-5. Inject board support files and Kconfig patches
-6. Configure with `configs/be300_defconfig`, set CONFIG_INITRAMFS_SOURCE
-7. Build vmlinux (initramfs is embedded — emulator has no --initrd flag)
+**Phase 0a** — Rebuild musl with `-march=mips2` if `libc.a` still contains SPECIAL2 `mul` (VR4131 is MIPS III — see Toolchain Notes below).
+
+**Phase 0** — Install sanitized Linux UAPI headers (`make headers_install`) for musl into `/work/musl-khdrs`. musl doesn't ship Linux `linux/*.h` UAPI; `uclibc-kernel-headers` can't be used because it lacks the `__UAPI_DEF_*` guards and collides with musl's `netinet/in.h`.
+
+**Phase 1** — Build BusyBox statically linked against musl:
+1. `make distclean && defconfig`
+2. Disable all networking applets (linux-4.2.9 UAPI headers still have UAPI/libc collisions on `linux/in.h` / `linux/netfilter_ipv4.h`), runit (`BUG_need_to_implement_gettimeofday_ns`), WTMP/UTMP, NFS/RPC, TC, syslogd cfg
+3. Patch a private copy of `libgcc.a` (`-B/tmp/libgcc_patched`): strip `_divdi3.o _moddi3.o _udivdi3.o _umoddi3.o _fixdfdi.o _fixunsdfdi.o _floatdidf.o _floatundidf.o _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o` and replace with mips2-compiled `libgcc_helpers.o`
+4. `make busybox EXTRA_CFLAGS="-march=mips2 -specs musl-gcc.specs -isystem musl-khdrs/include" EXTRA_LDFLAGS="-specs musl-gcc.specs -B/tmp/libgcc_patched"`
+5. Install busybox to `$ROOTFS/bin/busybox`, create applet symlinks, make `/init → /bin/busybox`, write `/etc/inittab` that mounts proc/sys/dev and spawns a shell on tty0
+
+**Phase 2–6** — Kernel build:
+1. Download linux-4.2.9-patched.tar.xz from Tiny Core Linux
+2. Apply GCC 10+ fixes: yylloc extern, log2.h noreturn/const, -Werror removal
+3. Inject board support files and Kconfig patches
+4. Configure with `configs/be300_defconfig`, set CONFIG_INITRAMFS_SOURCE
+5. Build vmlinux (initramfs is embedded — emulator has no --initrd flag)
 
 ### Key Constraints
 
@@ -86,10 +102,21 @@ The build script also patches `arch/mips/vr41xx/Kconfig` and `Platform` to add t
 - **Memory registration**: Common VR41xx `prom_init()` doesn't call `add_memory_region()`. The build script patches it to register 16MB. Do NOT rely solely on `mem=16M` on the cmdline — this has caused the kernel to allocate pages beyond physical RAM (writes to non-existent memory are silently dropped by the emulator, corrupting page tables and file data).
 - **serial_be300 is incomplete**: The custom serial TTY driver in the source overlays is unfinished. Use `keep_bootcon` on the kernel cmdline to retain early printk serial output past normal console registration.
 - **VR4131 cache bug**: Hit_Writeback_Inv_D must be split into separate writeback + invalidate. The build script patches `flush_dcache_line()` and `protected_writeback_dcache_line()` in `r4kcache.h`. Required for real hardware; also works on the emulator.
-- **BusyBox ISA**: Must not use MIPS32r2 instructions. The toolchain's libc is mips32r2 so `file` will still report "rel2", but BusyBox code uses `-march=mips32` via EXTRA_CFLAGS. Binaries must be compiled with `-mno-abicalls -fno-pic` for `-nostdlib` builds (PIC without libc's crt0 leaves `$gp` uninitialized).
+- **Userspace ISA — use `-march=mips2`, NOT `mips32`**: VR4131 is MIPS III and does NOT implement the MIPS32 SPECIAL2 opcode space. The SPECIAL2 `mul rd, rs, rt` instruction (which GCC happily emits under `-march=mips32`) raises a Reserved Instruction exception and kills the process with SIGILL. Build musl, BusyBox, and anything else linked into userspace with `-march=mips2`. Binaries compiled with `-nostdlib` additionally need `-mno-abicalls -fno-pic` so `$gp` isn't referenced before crt0 would initialize it.
+- **libgcc.a is mips32r2 — patch it**: The Debian `gcc-cross-mipsel-linux-gnu` package's `libgcc.a` was compiled with `-march=mips32r2` and its 64-bit helper routines (`__divdi3`, `__moddi3`, `__udivdi3`, `__umoddi3`, `__fixdfdi`, `__fixunsdfdi`, `__floatdidf`, `__floatundidf`, `__lshrdi3`, `__ashldi3`, `__ashrdi3`, `__negdi2`) contain SPECIAL2 `mul`. The build script creates a patched copy of libgcc.a in `/tmp/libgcc_patched/`, strips those objects, and adds C replacements from `board/casio-be300/libgcc_helpers.c` compiled with `-march=mips2`. Pass `-B/tmp/libgcc_patched` via EXTRA_LDFLAGS so gcc prefers the patched archive. There is no multilib for mips2 (`gcc -print-multi-lib` only lists n32/n64), so rebuilding gcc from source is the only alternative — not worth it.
+- **COW bug in build_clear_page patch**: The dynamically-generated `copy_page` was accidentally patched to become `clear_page_simple` by a sed that matched `memset(labels, 0, sizeof(labels));` in both `build_clear_page` and `build_copy_page`. This zeroed the destination of every COW copy, so userspace data-segment pages read as zeros after `padzero` triggered COW. The sed is now scoped to the `build_clear_page` function only (`/^void build_clear_page/,/^void build_copy_page/`).
 - **Docker mknod**: Cannot create device nodes in unprivileged Docker; use kernel's initramfs_list.txt format instead
 - **simplefb doesn't work**: The mainline `simplefb` driver uses `ioremap_wc()` which doesn't work for the BE300's KSEG1-mapped VRAM. Use the ported `sfb.c` instead, which directly accesses 0xAA200000 as a KSEG1 virtual address.
 - **Framebuffer console requires CFB helpers**: `CONFIG_FB_CFB_FILLRECT/COPYAREA/IMAGEBLIT` must be force-selected in Kconfig since no standard driver selects them. The build script adds `select FB_CFB_*` to the CASIO_BE300 Kconfig entry.
+
+### Toolchain Notes
+
+The Debian `gcc-cross-mipsel-linux-gnu` and its sibling `libc6-mipsel-cross` target mips32r2 by default. To target the VR4131 (MIPS III), everything linked into userspace must be built with `-march=mips2` (MIPS II is the highest ISA that neither uses SPECIAL2 nor 64-bit instructions — MIPS III is technically a better fit but `-march=mips3` enables `dmult`/`dsll` etc. that the emulator can't execute). `-march=mips2` produces strict 32-bit MIPS II code that runs on VR4131 and the emulator.
+
+- **musl**: rebuild from source with `CC="mipsel-linux-gnu-gcc -march=mips2"`. Phase 0a of `build_be300_kernel.sh` does this if `musl-mipsel/lib/libc.a` still has `mul` instructions.
+- **libgcc**: patched in-place at build time (see `libgcc.a is mips32r2` under Key Constraints).
+- **BusyBox**: built with `EXTRA_CFLAGS="-march=mips2 ..."`.
+- **Kernel headers for musl**: `make headers_install` into `/work/musl-khdrs`. Do NOT use `uclibc-kernel-headers/` — it predates the `__UAPI_DEF_*` guards and collides with musl's `netinet/in.h`. linux-4.2.9 headers are also old but usable if you only include them for selected applets; the build script disables all networking applets to sidestep residual `linux/in.h` collisions.
 
 ### VR41xx TLB Compatibility
 
