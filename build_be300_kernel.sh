@@ -683,16 +683,13 @@ sed -i '/^static inline void protected_writeback_dcache_line/,/^}/ {
 
 # NOTE: EntryLo1 workaround for emulator removed - testing on real HW first
 
-# FIX: Always flush D-cache when Page_dcache_dirty is set in __update_cache.
-# The stock kernel only flushes when pages_do_alias() returns true, but with
-# a VIPT D-cache (VR4131: 16KB, 2-way), data written at the kernel VA (KSEG0)
-# may be in cache at a different set index than the user VA. Without writeback,
-# the user reads stale zeros from RAM instead of the kernel-written data.
-# The pages_do_alias check only detects same-index conflicts, not the
-# writeback-needed case where kernel and user VAs index different sets.
-sed -i '/^void __update_cache/,/^}/ {
-  s/if (exec || pages_do_alias(addr, address & PAGE_MASK))/if (1)/
-}' arch/mips/mm/cache.c
+# NOTE: __update_cache left as stock behavior (exec || pages_do_alias).
+# An earlier attempt at unconditional `if (1)` per-page D-cache flush
+# was not what fixed the data-page-zeros bug — that turned out to be
+# the build_copy_page / clear_page_simple sed mishap (COW zeroing the
+# destination). Per-page flush here is also known to break real HW
+# (the kernel hangs at "Calibrating delay loop..." / timer-interrupt
+# path, see CLAUDE.md and git history).
 
 # FIX: Force _PAGE_VALID in set_pte for VR41xx.
 # The lazy-VALID mechanism relies on TLB Invalid exceptions (handle_tlbl)
