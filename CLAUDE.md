@@ -21,16 +21,22 @@ docker-compose run --rm mips-dev bash -c "./build_be300_kernel.sh"
 docker-compose run --rm mips-dev bash -c "./build_tcl_kernel.sh"
 
 # Test with the BE-300 emulator (run on macOS host, not in Docker)
-./bin/be300 --kernel linux-4.2.9/vmlinux --cmdline "console=tty0 earlyprintk" --speed 0
+#
+# Heads-up: the emulator binary in this tree dropped --kernel and only
+# accepts --nand / --restore --cf / a positional ROM. The build pipeline
+# produces linux-4.2.9/be300.nand (a structurally valid B000FF container at
+# NAND offset 0x4000), but the BE-300 boot ROM does NOT yet load Linux from
+# this image — see "BE-300 boot path" in Key Constraints. Until that's
+# unblocked, the most reliable smoke test is to run the existing reference
+# kernels under an emulator build that still has --kernel.
+./bin/be300 --nand linux-4.2.9/be300.nand --speed 0
 
 # Useful debug flags
-./bin/be300 --kernel linux-4.2.9/vmlinux --cmdline "console=tty0 earlyprintk" --speed 0 --log-mmio 2>mmio.log
-# Redirect stdout for kernel serial output, stderr for emulator diagnostics:
-./bin/be300 --kernel linux-4.2.9/vmlinux --cmdline "console=tty0 earlyprintk" --speed 0 >/tmp/be300_boot.log 2>/tmp/be300_err.log
+./bin/be300 --nand linux-4.2.9/be300.nand --speed 0 --log-mmio 2>mmio.log
+./bin/be300 --nand linux-4.2.9/be300.nand --detect-stall --mmio-coverage 2>cov.err
 
-# Test known-good reference kernels
-./bin/be300 --kernel kernels/vmlinux-2.4 --cmdline "console=tty0 root=/dev/ram"
-./bin/be300 --kernel kernels/vmlinux-2.6
+# Re-pack vmlinux as a NAND image without rebuilding the kernel
+python3 tools/mk_be300_nand.py --vmlinux linux-4.2.9/vmlinux --out linux-4.2.9/be300.nand
 ```
 
 Emulator keys: Q=quit, S=screenshot, M=help. Useful flags: `--log-mmio`, `--trace`, `--sfb-5bit-green`, `--speed 0` (unthrottled).
@@ -94,9 +100,23 @@ The build script also patches `arch/mips/vr41xx/Kconfig` and `Platform` to add t
 4. Configure with `configs/be300_defconfig`, set CONFIG_INITRAMFS_SOURCE
 5. Build vmlinux (initramfs is embedded — emulator has no --initrd flag)
 
+**Phase 7** — Package vmlinux as a B000FF NAND image: `tools/mk_be300_nand.py` reads each `PT_LOAD` segment and emits a 12-byte `(addr, len, 0xFFFFFFFF)` record followed by the segment bytes, terminating with `(e_entry, 0, 0xFFFFFFFF)`. The container starts with `"B000FF\n"` at NAND offset `0x4000`. Output is `linux-4.2.9/be300.nand` (16 MB, padded with `0xFF`).
+
 ### Key Constraints
 
 - **No single source of truth**: Cross-reference all sources (2.4.18 tree, 2.6.x overlays, patches, hardware docs, boot logs, emulator behavior) when making hardware decisions
+- **BE-300 boot path** (`bin/be300 --nand`): two-stage. The build pipeline emits a 16 MB NAND image with a WinCE-shape partition table at page 0, a stage-1 SPL B000FF container at NAND offset `0x4000` (partition 1), and a flat kernel binary at NAND offset `0x14000` (partition 2). The real BE-300 boot ROM (16 KB blob in `boot_rom_embedded.h` of `/Users/jroark/src/be300-framebuffer`) loads the SPL via its B000FF record walker; the SPL then drives the VRC4173 SPL transfer engine (`0xAA00A4xx` / `0xAA00B000`) to copy the kernel page-by-page into SDRAM and `jr`s to `kernel_entry`. The kernel boots Linux 4.2.9 to the BusyBox shell. Pieces:
+  - `board/casio-be300/spl_start.S` + `spl.c` + `spl.lds` — stage-1 SPL, linked at `0x80F00000`. Disables interrupts, sets `sp = 0x80FF0000`, calls `spl_main()`, zeros `a0..a3` (so the kernel's `prom_init` doesn't dereference garbage as cmdline pointers), `jr`s to the kernel entry returned in `v0`.
+  - `tools/mk_be300_nand.py` — packs `(spl.elf, vmlinux)` into a 16 MB NAND image. Partition table entries: `[0]=(0, 0x20)`, `[1]=(SPL_OFFSET/512, spl_sectors)`, `[2]=(KERNEL_OFFSET/512, kernel_sectors)`.
+  - `build_be300_kernel.sh` Phase 7 — extracts kernel constants (`KERNEL_LOAD_VA`/`KERNEL_ENTRY_VA`/`KERNEL_SIZE`) from `vmlinux` ELF, compiles SPL with those baked in via `-D`, then runs `mk_be300_nand.py`.
+  - Kernel link address is `0xffffffff80020000` (PA `0x20000`) — high enough to clear the boot ROM's RAM scratch (`0x80010000`-`0x800102FF`) so SPL writes don't overwrite ROM state mid-walker.
+
+  Confirmed boot-ROM contract (RE'd against `be300_boot_rom.ghidra` via Ghidra HTTP API, function names `FUN_9fc00d7c`/`FUN_9fc00dec`/`FUN_9fc015dc`/`FUN_9fc016b4`/`FUN_9fc00464`):
+  1. NAND page 0 holds an 8-entry partition table (16 bytes/entry: `[8 reserved] + start_sector u32 LE + sector_count u32 LE`).
+  2. Walker uses entry index 1; the state-2 probe returns "applicable" iff both fields `!= 0xFFFFFFFF` (the MIPS16 `cmpi`+`bteqz` is `T = (rx XOR imm)`).
+  3. Records: 7-byte `"B000FF\n"` magic (compared against the copy at RAM `0x80010010`), then `(image_start u32, image_length u32)`, then 12-byte `(addr, len, cksum)` records. Records with `addr != 0` and `len != 0` are copied to `addr | 0x20000000`; `len == 0` records are skipped; `addr == 0` ends the walker and `len` is taken as the entry. `cksum` is NOT validated.
+  4. The XFER engine address phase pushes 3 bytes (`col_lo`, `page_lo`, `page_hi`) — sending a fourth byte overflows the 3-byte queue and shifts `col` out. KICK must precede MODE; MODE = `0x05` latches the address into `stream_page`/`stream_col` and sets `ready = true`.
+  5. Mailbox handoff: SPL writes `entry` to `*0xA00024FC` and `0x03020101` to `*0xA0002400`; ROM's outer loop polls and `jr`s to the entry value. The ROM does NOT OR `0x20000000` into the entry — that's the SPL's responsibility for the NK handoff in WinCE; for our SPL the kernel runs from the cached KSEG0 alias, which is fine because the SPL writes records via uncached KSEG1.
 - **Emulator is strictly 32-bit**: The be300 emulator runs 32-bit MIPS code only. Disassembly of both known-good kernels (2.4.18, 2.6.8.1) confirms zero 64-bit instructions (no sd, ld, daddu, daddiu, dsll, dsrl). The 4.2.9 kernel's dynamically generated `clear_page`/`copy_page` functions use `sd`/`ld` by default because VR4131 reports `cpu_has_64bit_gp_regs=true`. This MUST be disabled — force `clear_word_size=4` and `copy_word_size=4` in `arch/mips/mm/page.c`.
 - **Emulator has no --initrd**: Initramfs must be built into vmlinux via CONFIG_INITRAMFS_SOURCE
 - **Memory registration**: Common VR41xx `prom_init()` doesn't call `add_memory_region()`. The build script patches it to register 16MB. Do NOT rely solely on `mem=16M` on the cmdline — this has caused the kernel to allocate pages beyond physical RAM (writes to non-existent memory are silently dropped by the emulator, corrupting page tables and file data).

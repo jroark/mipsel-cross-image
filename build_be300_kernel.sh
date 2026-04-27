@@ -723,7 +723,13 @@ if ! grep -q "CASIO_BE300" arch/mips/vr41xx/Platform; then
 # CASIO CASSIOPEIA BE-300 (VR4131)
 #
 platform-$(CONFIG_CASIO_BE300)	+= vr41xx/casio-be300/
-load-$(CONFIG_CASIO_BE300)	+= 0xffffffff80004000
+# Load above the BE-300 boot ROM's RAM scratch zone. The ROM's MIPS16
+# record walker keeps state in 0x80010000-0x80010300 and reads from the
+# stack at 0x80003800. Loading the kernel at 0x80020000 (PA 0x20000,
+# 128 KiB into SDRAM) leaves both regions untouched while the walker is
+# copying records into RAM, so the walker can finish and write the
+# 0x24FC mailbox correctly.
+load-$(CONFIG_CASIO_BE300)	+= 0xffffffff80020000
 PLATFORM
 fi
 
@@ -774,10 +780,86 @@ make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- vmlinux -j1 || true
 if [ -f vmlinux ]; then
     echo "=== SUCCESS: vmlinux created ==="
     ls -l vmlinux
-    echo ""
-    echo "Test with:"
-    echo "  ./bin/be300 --kernel linux-4.2.9/vmlinux --cmdline \"mem=16M console=tty0 earlyprintk\""
 else
     echo "=== FAILURE: vmlinux NOT created ==="
     exit 1
 fi
+
+###############################################################################
+# Phase 7: Build the stage-1 SPL and pack it together with the kernel into a
+# NAND image bootable through `./bin/be300 --nand`.
+#
+# The boot ROM's record walker is sized for a small SPL (empirical limit
+# around 352 KB of NAND traffic per run), so we don't try to package a 3 MB
+# kernel as a single B000FF container. Instead:
+#   - Stage-1 SPL (board/casio-be300/spl.c + spl_start.S, linked at
+#     0x80F00000) is wrapped as the B000FF container at NAND offset 0x4000
+#     and is what the boot ROM actually loads.
+#   - The kernel is laid out raw at NAND offset 0x14000 (partition 2). The
+#     SPL reads it page-by-page via the VRC4173 SPL transfer engine and
+#     jumps to kernel_entry.
+###############################################################################
+
+echo ""
+echo "=== Phase 7: Building stage-1 SPL ==="
+
+cd /work/board/casio-be300
+SPL_DIR=/work/linux-4.2.9/spl_build
+mkdir -p "$SPL_DIR"
+
+# Extract kernel constants from vmlinux for the SPL to embed.
+python3 - <<'PYEOF' >"$SPL_DIR/kernel_consts.txt"
+import struct, sys
+data = open('/work/linux-4.2.9/vmlinux','rb').read()
+e_entry = struct.unpack_from('<I', data, 24)[0]
+e_phoff = struct.unpack_from('<I', data, 28)[0]
+e_phnum = struct.unpack_from('<H', data, 44)[0]
+loads = []
+for i in range(e_phnum):
+    o = e_phoff + i*32
+    p_type, p_offset, p_vaddr, p_paddr, p_filesz, *_ = struct.unpack_from("<IIIIIIII", data, o)
+    if p_type == 1 and p_filesz:
+        loads.append((p_vaddr, p_filesz))
+base = min(a for a, _ in loads)
+end = max(a + s for a, s in loads)
+print(f"KERNEL_LOAD_VA=0x{base:08X}")
+print(f"KERNEL_ENTRY_VA=0x{e_entry:08X}")
+print(f"KERNEL_SIZE=0x{end - base:X}")
+PYEOF
+
+# shellcheck disable=SC1091
+. "$SPL_DIR/kernel_consts.txt"
+
+echo "  KERNEL_LOAD_VA=$KERNEL_LOAD_VA"
+echo "  KERNEL_ENTRY_VA=$KERNEL_ENTRY_VA"
+echo "  KERNEL_SIZE=$KERNEL_SIZE"
+
+CC=mipsel-linux-gnu-gcc
+LD=mipsel-linux-gnu-ld
+SPL_CFLAGS="-march=mips2 -mabi=32 -mno-abicalls -fno-pic -nostdlib \
+    -fno-builtin -ffreestanding -Os -g -fno-stack-protector \
+    -DKERNEL_LOAD_VA=${KERNEL_LOAD_VA}u \
+    -DKERNEL_ENTRY_VA=${KERNEL_ENTRY_VA}u \
+    -DKERNEL_SIZE=${KERNEL_SIZE}u"
+
+$CC $SPL_CFLAGS -c -o "$SPL_DIR/spl_start.o" /work/board/casio-be300/spl_start.S
+$CC $SPL_CFLAGS -c -o "$SPL_DIR/spl.o"      /work/board/casio-be300/spl.c
+$LD -m elf32ltsmip -T /work/board/casio-be300/spl.lds \
+    -o "$SPL_DIR/spl.elf" "$SPL_DIR/spl_start.o" "$SPL_DIR/spl.o"
+
+ls -l "$SPL_DIR/spl.elf"
+
+cd /work
+
+echo ""
+echo "=== Phase 7b: Packing NAND image ==="
+
+python3 /work/tools/mk_be300_nand.py \
+    --vmlinux /work/linux-4.2.9/vmlinux \
+    --spl "$SPL_DIR/spl.elf" \
+    --out /work/linux-4.2.9/be300.nand
+
+ls -l /work/linux-4.2.9/be300.nand
+echo ""
+echo "Test with:"
+echo "  ./bin/be300 --nand linux-4.2.9/be300.nand"
