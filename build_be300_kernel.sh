@@ -56,6 +56,13 @@ if [ ! -d "$KHDRS/include/linux" ]; then
     if [ ! -d /tmp/khdrs_src/linux-4.2.9 ]; then
         tar xf /work/linux-4.2.9-patched.tar.xz -C /tmp/khdrs_src
     fi
+    # libc-compat.h in 4.2.9 only handles __GLIBC__. Musl sets _NETINET_IN_H
+    # in its <netinet/in.h> too, so widen the outer guard so the inner
+    # _NETINET_IN_H check applies for any libc. Without this, including
+    # both musl's netinet/in.h and linux/in.h conflicts on sockaddr_in,
+    # in_addr, etc. — which is what blocks BusyBox networking applets.
+    sed -i 's@^#if defined(__GLIBC__)$@#if defined(__GLIBC__) || defined(_NETINET_IN_H)@' \
+        /tmp/khdrs_src/linux-4.2.9/include/uapi/linux/libc-compat.h
     rm -rf "$KHDRS"
     mkdir -p "$KHDRS"
     make -C /tmp/khdrs_src/linux-4.2.9 \
@@ -64,7 +71,7 @@ if [ ! -d "$KHDRS/include/linux" ]; then
 fi
 
 ###############################################################################
-# Phase 1: Build BusyBox with musl, install into initramfs
+# Phase 1: Build BusyBox with musl, install into the JFFS2 rootfs source tree
 ###############################################################################
 
 echo "=== Phase 1: Building BusyBox with musl ==="
@@ -87,23 +94,22 @@ sed -i 's/^# CONFIG_USE_BB_CRYPT_SHA is not set/CONFIG_USE_BB_CRYPT_SHA=y/' .con
 # Disable WTMP (musl's _PATH_WTMP not auto-included in libbb)
 sed -i 's/^CONFIG_FEATURE_WTMP=y/CONFIG_FEATURE_WTMP=n/' .config
 sed -i 's/^CONFIG_FEATURE_UTMP=y/CONFIG_FEATURE_UTMP=n/' .config
-# Disable ALL networking applets — linux-4.2.9 UAPI headers lack the
-# __UAPI_DEF_* guards and conflict with musl's netinet/in.h.
-# Minimal embedded system doesn't need any of this.
-for cfg in CONFIG_ARP CONFIG_ARPING CONFIG_BRCTL CONFIG_DNSD CONFIG_ETHER_WAKE \
-    CONFIG_FAKEIDENTD CONFIG_FTPD CONFIG_FTPGET CONFIG_FTPPUT CONFIG_HOSTNAME \
-    CONFIG_HTTPD CONFIG_IFCONFIG CONFIG_IFENSLAVE CONFIG_IFPLUGD CONFIG_IFUPDOWN \
-    CONFIG_INETD CONFIG_IP CONFIG_IPADDR CONFIG_IPCALC CONFIG_IPLINK \
-    CONFIG_IPNEIGH CONFIG_IPROUTE CONFIG_IPRULE CONFIG_IPTUNNEL CONFIG_NAMEIF \
-    CONFIG_NBDCLIENT CONFIG_NC CONFIG_NETSTAT CONFIG_NSLOOKUP CONFIG_NTPD \
-    CONFIG_PING CONFIG_PING6 CONFIG_PSCAN CONFIG_ROUTE CONFIG_SLATTACH \
-    CONFIG_TCPSVD CONFIG_TELNET CONFIG_TELNETD CONFIG_TFTP CONFIG_TFTPD \
-    CONFIG_TRACEROUTE CONFIG_TRACEROUTE6 CONFIG_UDHCPC CONFIG_UDHCPD \
-    CONFIG_UDPSVD CONFIG_VCONFIG CONFIG_WGET CONFIG_ZCIP CONFIG_TUNCTL \
-    CONFIG_TC CONFIG_FEATURE_MOUNT_NFS CONFIG_FEATURE_HAVE_RPC \
-    CONFIG_FEATURE_INETD_RPC CONFIG_FEATURE_SYSLOGD_CFG \
-    CONFIG_RUNSV CONFIG_RUNSVDIR CONFIG_SV CONFIG_SVLOGD CONFIG_CHPST \
-    CONFIG_ENVDIR CONFIG_ENVUIDGID CONFIG_SETUIDGID CONFIG_SOFTLIMIT; do
+# Phase 0's libc-compat.h sed teaches the linux UAPI to keep its hands off
+# struct definitions when musl already provides them, so most networking
+# applets compile against -isystem $KHDRS/include now. Keep disabled only
+# the applets that need niche kernel headers (linux/pkt_sched.h, if_vlan.h,
+# if_bridge.h, if_tunnel.h, …) or runtime support we don't have (NFS/RPC,
+# nanosleep — gettimeofday_ns).
+for cfg in CONFIG_BRCTL CONFIG_DNSD CONFIG_FAKEIDENTD CONFIG_FTPD \
+    CONFIG_HTTPD CONFIG_IFENSLAVE CONFIG_IFPLUGD CONFIG_IFUPDOWN \
+    CONFIG_INETD CONFIG_IPTUNNEL CONFIG_NBDCLIENT CONFIG_NTPD \
+    CONFIG_PSCAN CONFIG_SLATTACH CONFIG_TCPSVD CONFIG_TELNETD \
+    CONFIG_TFTPD CONFIG_UDHCPD CONFIG_UDPSVD CONFIG_VCONFIG \
+    CONFIG_ZCIP CONFIG_TUNCTL CONFIG_TC CONFIG_FEATURE_MOUNT_NFS \
+    CONFIG_FEATURE_HAVE_RPC CONFIG_FEATURE_INETD_RPC \
+    CONFIG_FEATURE_SYSLOGD_CFG CONFIG_RUNSV CONFIG_RUNSVDIR CONFIG_SV \
+    CONFIG_SVLOGD CONFIG_CHPST CONFIG_ENVDIR CONFIG_ENVUIDGID \
+    CONFIG_SETUIDGID CONFIG_SOFTLIMIT; do
     sed -i "s/^${cfg}=y/${cfg}=n/" .config
 done
 
@@ -141,10 +147,10 @@ make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- \
 ls -l busybox
 mipsel-linux-gnu-strip busybox
 
-# Populate rootfs
+# Populate full rootfs (this becomes the JFFS2 mtd3 partition).
 ROOTFS="/work/rootfs_be300"
 rm -rf "$ROOTFS"
-mkdir -p "$ROOTFS"/{bin,sbin,usr/bin,usr/sbin,proc,sys,dev,tmp,etc,root}
+mkdir -p "$ROOTFS"/{bin,sbin,usr/bin,usr/sbin,proc,sys,dev,tmp,etc,root,mnt}
 cp busybox "$ROOTFS/bin/busybox"
 chmod +x "$ROOTFS/bin/busybox"
 
@@ -154,27 +160,31 @@ for applet in sh ash mount umount echo cat ls ln cp mv rm mkdir rmdir \
               pwd chmod chown uname date ps kill sleep \
               dmesg true false clear printf head tail wc grep sed awk \
               mknod sync poweroff reboot halt which env find test \
-              vi more less; do
+              vi more less switch_root pivot_root \
+              ifconfig ip route arp arping ping ping6 hostname netstat \
+              nslookup wget telnet ftpget ftpput nc traceroute udhcpc \
+              ipcalc nameif; do
     ln -sf /bin/busybox "$ROOTFS/bin/$applet"
 done
 
-# /init is a shell script. /bin/ash is a busybox symlink; busybox
-# dispatches to the ash applet via argv[0].
-# /init is a direct symlink to /bin/busybox. The kernel execs /init,
-# argv[0] becomes "init", and busybox runs the init applet which reads
-# /etc/inittab. Provide a minimal inittab that spawns a shell on tty0.
-ln -sf /bin/busybox "$ROOTFS/init"
+# busybox-as-init reads /etc/inittab. The kernel mounts JFFS2 as `/` and execs
+# /sbin/init.
+ln -sf /bin/busybox "$ROOTFS/sbin/init"
 
 mkdir -p "$ROOTFS/etc"
 cat > "$ROOTFS/etc/inittab" << 'INITTAB'
 ::sysinit:/bin/mount -t proc proc /proc
 ::sysinit:/bin/mount -t sysfs sysfs /sys
-::sysinit:/bin/mount -t devtmpfs devtmpfs /dev
 ::sysinit:/bin/echo "=== Casio BE-300 Linux 4.2.9 (BusyBox) ==="
-tty0::askfirst:/bin/sh
+tty0::respawn:/bin/sh
+ttyVR0::respawn:/bin/sh
 ::ctrlaltdel:/bin/umount -a -r
 ::shutdown:/bin/umount -a -r
 INITTAB
+
+# The kernel boots straight off the JFFS2 rootfs in NAND mtd3 — no embedded
+# initramfs. Clean up artifacts from older runs that did build one.
+rm -rf /work/initramfs_be300 /work/initramfs_list.txt
 
 cd /work
 
@@ -546,12 +556,24 @@ grep -rl "\-Werror" . | xargs sed -i 's/=\-Werror/=/g' || true
 
 echo "=== Phase 4: Injecting BE300 board support ==="
 
-# Copy board support files (setup.c, sfb.c framebuffer, Makefile)
+# Copy board support files (setup.c, sfb.c framebuffer, nand.c MTD glue,
+# irq.c GIRQ0 demuxer, keys.c button driver, Makefile)
 mkdir -p arch/mips/vr41xx/casio-be300
 cp /work/board/casio-be300/setup.c arch/mips/vr41xx/casio-be300/
 cp /work/board/casio-be300/sfb.c arch/mips/vr41xx/casio-be300/
 cp /work/board/casio-be300/keys.c arch/mips/vr41xx/casio-be300/
+cp /work/board/casio-be300/nand.c arch/mips/vr41xx/casio-be300/
+cp /work/board/casio-be300/irq.c arch/mips/vr41xx/casio-be300/
+cp /work/board/casio-be300/stowaway_serio.c arch/mips/vr41xx/casio-be300/
 cp /work/board/casio-be300/Makefile arch/mips/vr41xx/casio-be300/
+
+# Slow down kernel auto-repeat for the in-tree Stowaway keyboard driver.
+# Defaults are REP_DELAY=250ms / REP_PERIOD=33ms (~30 Hz), which feels
+# runaway-fast on the BE-300's slow framebuffer console. Set 400ms delay
+# and 100ms period (10 Hz) on the input device right after EV_REP is
+# advertised in skbd_connect.
+sed -i 's@input_dev->evbit\[0\] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP);@&\n\tinput_dev->rep[REP_DELAY] = 400;\n\tinput_dev->rep[REP_PERIOD] = 100;@' \
+    drivers/input/keyboard/stowaway.c
 
 # Patch Kconfig: add CASIO_BE300 entry before endchoice
 if ! grep -q "CASIO_BE300" arch/mips/vr41xx/Kconfig; then
@@ -563,6 +585,7 @@ config CASIO_BE300\
 \tselect DMA_NONCOHERENT\
 \tselect IRQ_MIPS_CPU\
 \tselect ISA\
+\tselect HAVE_PATA_PLATFORM\
 \tselect SYS_SUPPORTS_32BIT_KERNEL\
 \tselect SYS_SUPPORTS_LITTLE_ENDIAN\
 \tselect SYS_HAS_EARLY_PRINTK\
@@ -703,6 +726,25 @@ sed -i '0,/\*ptep = pteval;/{s/\*ptep = pteval;/if (pte_val(pteval) \& _PAGE_PRE
 # Apply to the second set_pte as well (32-bit path)
 sed -i '0,/\*ptep = pteval;/{s/\*ptep = pteval;/if (pte_val(pteval) \& _PAGE_PRESENT) pte_val(pteval) |= _PAGE_VALID | _PAGE_ACCESSED;\n\t\*ptep = pteval;/}' arch/mips/include/asm/pgtable.h
 
+# FIX: vr41xx/common/irq.c::irq_dispatch unconditionally calls
+# chip->irq_ack() on the cascade path. The SYSINT1 / SYSINT2 chips defined
+# right next door (icu.c) only provide irq_mask/irq_unmask — they have no
+# irq_ack — so this NULL-derefs the moment a *cascaded* SYSINT1 IRQ fires
+# (notably SYSINT1_IRQ(8), the GIU summary). Make the call conditional.
+sed -i 's|^\t\t\tchip->irq_ack(idata);$|\t\t\tif (chip->irq_ack) chip->irq_ack(idata);|' \
+    arch/mips/vr41xx/common/irq.c
+
+# FIX: gpio-vr41xx.c giu_probe has an inverted error check around
+# gpiochip_add() — the `if (!ret)` branch tears down and returns -ENODEV
+# when the call SUCCEEDED. The intent was clearly `if (ret)`. Without
+# this fix, the GIU IRQ chips never get installed, and any chained
+# handler attached to GIU_IRQ(0) sees no_irq_chip and warns.
+sed -i 's|ret = gpiochip_add(&vr41xx_gpio_chip);\n\tif (!ret) {|ret = gpiochip_add(\&vr41xx_gpio_chip);\n\tif (ret) {|' \
+    drivers/gpio/gpio-vr41xx.c
+# sed doesn't handle multiline easily; do it as two sequential pattern matches:
+sed -i '/ret = gpiochip_add(&vr41xx_gpio_chip);/{n;s|^\tif (!ret) {|\tif (ret) {|}' \
+    drivers/gpio/gpio-vr41xx.c
+
 # FIX: Adjust VR41xx pfn_pte/pte_pfn shift in pgtable-32.h.
 # The VR41xx EntryLo has PFN starting at bit 8 (not bit 6 like standard
 # R4000), matching its 1KB-granularity TLB. In 2.4 Linux, _PAGE_GLOBAL
@@ -733,6 +775,20 @@ load-$(CONFIG_CASIO_BE300)	+= 0xffffffff80020000
 PLATFORM
 fi
 
+# Suppress the legacy ISA NE2000 autoprobe path in drivers/net/Space.c.
+# Space.c::net_olddevs_init -> ethif_probe2 -> ne_probe(unit) iterates units
+# 0..7 and registers MAX_NE_CARDS=4 dummy ne.0..ne.3 platform devices with
+# no IRQ resource. ne_drv_probe then runs probe_irq_on/probe_irq_off against
+# each dummy, which on the BE-300 emulator briefly sets the NE2000 IMR=0x50
+# and triggers a remote-DMA read (RREAD). The 10ms mdelay during this probe
+# is what causes the storm: cf_giu_source_bits keeps GIRQ0 bit 0 high while
+# (isr & imr) != 0, the cascade fires, and our chained handler in
+# board/casio-be300/irq.c isn't installed until late_initcall. Killing the
+# legacy entry leaves our own platform_device (id=-1, with IORESOURCE_IRQ)
+# as the only path into ne_drv_probe — single-shot at 0x300, no autoprobe.
+sed -i 's@^\(\s*\){ne_probe, 0},@\1/* {ne_probe, 0}, removed for BE-300 */@' \
+    drivers/net/Space.c
+
 ###############################################################################
 # Phase 5: Configure kernel
 ###############################################################################
@@ -741,24 +797,6 @@ echo "=== Phase 5: Configuring kernel ==="
 
 # Copy defconfig
 cp /work/configs/be300_defconfig arch/mips/configs/be300_defconfig
-
-# Create initramfs file list that includes the rootfs directory
-# plus device nodes (avoids needing mknod privileges in Docker)
-INITRAMFS_LIST="${ROOTFS}/../initramfs_list.txt"
-cat > "$INITRAMFS_LIST" <<CPIO_LIST
-# Include the rootfs directory
-dir /dev 0755 0 0
-nod /dev/console 0622 0 0 c 5 1
-nod /dev/null 0666 0 0 c 1 3
-nod /dev/zero 0666 0 0 c 1 5
-nod /dev/tty 0666 0 0 c 5 0
-nod /dev/tty0 0666 0 0 c 4 0
-nod /dev/tty1 0666 0 0 c 4 1
-CPIO_LIST
-
-# Set initramfs source: directory + device node list
-sed -i '/CONFIG_INITRAMFS_SOURCE/d' arch/mips/configs/be300_defconfig
-echo "CONFIG_INITRAMFS_SOURCE=\"${ROOTFS} ${INITRAMFS_LIST}\"" >> arch/mips/configs/be300_defconfig
 
 # Generate .config
 make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- be300_defconfig
@@ -852,14 +890,34 @@ ls -l "$SPL_DIR/spl.elf"
 cd /work
 
 echo ""
-echo "=== Phase 7b: Packing NAND image ==="
+echo "=== Phase 7b: Building JFFS2 rootfs image ==="
+# mtd3 is 0xB00000 bytes (11 MiB) starting at NAND offset 0x500000.
+# NAND geometry: 32 pages × 512 B = 16 KiB erase block; 512 B page.
+# --no-cleanmarkers is the right call for NAND (mtd's NAND wbuf path
+# regenerates them at runtime). --little-endian matches the kernel.
+ROOTFS_JFFS2="/work/linux-4.2.9/rootfs.jffs2"
+mkfs.jffs2 \
+    --root="$ROOTFS" \
+    --output="$ROOTFS_JFFS2" \
+    --eraseblock=16384 \
+    --pagesize=512 \
+    --no-cleanmarkers \
+    --pad=0xB00000 \
+    --little-endian
+ls -l "$ROOTFS_JFFS2"
+
+echo ""
+echo "=== Phase 7c: Packing NAND image ==="
 
 python3 /work/tools/mk_be300_nand.py \
     --vmlinux /work/linux-4.2.9/vmlinux \
     --spl "$SPL_DIR/spl.elf" \
+    --rootfs "$ROOTFS_JFFS2" \
     --out /work/linux-4.2.9/be300.nand
 
 ls -l /work/linux-4.2.9/be300.nand
 echo ""
 echo "Test with:"
 echo "  ./bin/be300 --nand linux-4.2.9/be300.nand"
+echo "  ./bin/be300 --nand linux-4.2.9/be300.nand --cf cf.img"
+echo "  ./bin/be300 --nand linux-4.2.9/be300.nand --ne2000 --net-mac 02:de:ad:be:ef:01"

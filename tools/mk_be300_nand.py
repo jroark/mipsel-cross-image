@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""Pack a BE-300 stage-1 SPL plus a flat kernel image as a NAND boot dump.
+"""Pack a BE-300 stage-1 SPL, flat kernel image, and optional rootfs as a
+NAND boot dump.
 
 Layout (matches WinCE's partition table convention; see
 build-host/All_nand_300_repacked.bin in the emulator source tree for the
 reference image):
 
   NAND[0x000..0x200)   page 0 = 16-byte/entry partition table
-                         entry 0  : (start_sector=0,    count=0x20)
-                         entry 1  : (start_sector=0x20, count=<spl sectors>)
-                         entry 2  : (start_sector=0xA0, count=<kernel sectors>)
-                         entries 3..7: 0xFFFFFFFF (unused)
+                         entry 0  : (start_sector=0,        count=0x20)
+                         entry 1  : (start_sector=0x20,     count=<spl sectors>)
+                         entry 2  : (start_sector=0xA0,     count=<kernel sectors>)
+                         entry 3  : (start_sector=0x2800,   count=<rootfs sectors>)
+                                    (only present when --rootfs is supplied)
+                         entries 4..7: 0xFFFFFFFF (unused)
   NAND[0x4000..)       partition 1 = SPL B000FF container
                          "B000FF\\n", image_start, image_length, records,
                          terminator (0, kernel_entry_via_SPL, 0xFFFFFFFF)
   NAND[0x14000..)      partition 2 = flat kernel binary (objcopy -O binary)
+  NAND[0x500000..)     partition 3 = rootfs blob (e.g. JFFS2)
   NAND[0x10000000-1]   padded with 0xFF to 16 MiB
 
 The boot ROM walks partition 1 (the SPL); the SPL then reads partition 2 a
 page at a time via the VRC4173 SPL transfer engine and jumps to the kernel
-entry. See board/casio-be300/spl.c for the SPL.
+entry. The rootfs is read by Linux's MTD/JFFS2 subsystem via
+board/casio-be300/nand.c (mtd3 = "rootfs"). See board/casio-be300/spl.c for
+the SPL.
 """
 
 import argparse
@@ -29,6 +35,7 @@ from pathlib import Path
 NAND_IMAGE_SIZE = 16 * 1024 * 1024
 SPL_OFFSET = 0x4000
 KERNEL_OFFSET = 0x14000
+ROOTFS_OFFSET = 0x500000
 B000FF_SIG = b"B000FF\n"
 NAND_FILL = 0xFF
 RECORD_CKSUM = 0xFFFFFFFF
@@ -149,6 +156,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--vmlinux", required=True, help="Path to vmlinux ELF (used for the kernel partition)")
     ap.add_argument("--spl", required=True, help="Path to spl.elf (stage-1 SPL ELF)")
+    ap.add_argument("--rootfs", help="Optional path to rootfs blob (e.g. rootfs.jffs2) to place at NAND offset 0x{:X}".format(ROOTFS_OFFSET))
     ap.add_argument("--out", required=True, help="Output NAND image path")
     ap.add_argument("--chunk", type=lambda s: int(s, 0), default=DEFAULT_CHUNK,
                     help=f"Max bytes per SPL B000FF record (default: 0x{DEFAULT_CHUNK:X})")
@@ -156,6 +164,7 @@ def main() -> int:
 
     spl_elf = Path(args.spl).read_bytes()
     vmlinux = Path(args.vmlinux).read_bytes()
+    rootfs = Path(args.rootfs).read_bytes() if args.rootfs else None
 
     # Build the SPL B000FF container.
     spl_container, spl_meta = build_b000ff(spl_elf, args.chunk)
@@ -171,21 +180,33 @@ def main() -> int:
     spl_sectors = (len(spl_container) + 511) // 512
     kernel_sectors = (len(kernel_flat) + 511) // 512
 
-    if KERNEL_OFFSET + kernel_sectors * 512 > NAND_IMAGE_SIZE:
+    if KERNEL_OFFSET + kernel_sectors * 512 > ROOTFS_OFFSET:
         raise SystemExit(
-            f"kernel ({len(kernel_flat)} bytes) overflows NAND at offset "
-            f"0x{KERNEL_OFFSET:X}"
+            f"kernel ({len(kernel_flat)} bytes) overflows the kernel partition; "
+            f"rootfs starts at 0x{ROOTFS_OFFSET:X}"
         )
 
     image = bytearray([NAND_FILL]) * NAND_IMAGE_SIZE
     image[SPL_OFFSET:SPL_OFFSET + len(spl_container)] = spl_container
     image[KERNEL_OFFSET:KERNEL_OFFSET + len(kernel_flat)] = kernel_flat
 
-    write_partition_table(image, [
+    partitions = [
         (0,                          0x20),                  # entry 0: PT region
         (SPL_OFFSET // 512,          spl_sectors),            # entry 1: SPL
         (KERNEL_OFFSET // 512,       kernel_sectors),         # entry 2: kernel
-    ])
+    ]
+
+    if rootfs is not None:
+        if ROOTFS_OFFSET + len(rootfs) > NAND_IMAGE_SIZE:
+            raise SystemExit(
+                f"rootfs ({len(rootfs)} bytes) overflows NAND at offset "
+                f"0x{ROOTFS_OFFSET:X}"
+            )
+        image[ROOTFS_OFFSET:ROOTFS_OFFSET + len(rootfs)] = rootfs
+        rootfs_sectors = (len(rootfs) + 511) // 512
+        partitions.append((ROOTFS_OFFSET // 512, rootfs_sectors))
+
+    write_partition_table(image, partitions)
 
     Path(args.out).write_bytes(image)
 
@@ -198,9 +219,14 @@ def main() -> int:
         f"  Kernel load  = 0x{kernel_meta['load_va']:08X}\n"
         f"  Kernel entry = 0x{kernel_meta['entry_va']:08X}\n"
         f"  Kernel flat  = 0x{kernel_meta['size']:X} bytes\n"
-        f"  Kernel slot  = sector 0x{KERNEL_OFFSET // 512:X} count 0x{kernel_sectors:X}\n"
-        f"  NAND size    = 0x{NAND_IMAGE_SIZE:X} ({NAND_IMAGE_SIZE >> 20} MiB)"
+        f"  Kernel slot  = sector 0x{KERNEL_OFFSET // 512:X} count 0x{kernel_sectors:X}"
     )
+    if rootfs is not None:
+        print(
+            f"  Rootfs slot  = sector 0x{ROOTFS_OFFSET // 512:X} count 0x{rootfs_sectors:X}\n"
+            f"  Rootfs size  = 0x{len(rootfs):X} bytes"
+        )
+    print(f"  NAND size    = 0x{NAND_IMAGE_SIZE:X} ({NAND_IMAGE_SIZE >> 20} MiB)")
     return 0
 
 

@@ -80,6 +80,7 @@ struct be300_key_state {
 	u8 prev_set1;
 	u8 prev_set2;
 	int char_pos;
+	bool pending_edit;
 };
 
 static struct be300_key_state be300_state;
@@ -90,14 +91,6 @@ static void be300_tap(struct input_dev *input, unsigned short key)
 	input_sync(input);
 	input_report_key(input, key, 0);
 	input_sync(input);
-}
-
-/* Emit <backspace> <char> <left> to "replace" the char under the cursor. */
-static void be300_replace_char(struct input_dev *input, int pos)
-{
-	be300_tap(input, KEY_BACKSPACE);
-	be300_tap(input, char_keys[pos]);
-	be300_tap(input, KEY_LEFT);
 }
 
 /*
@@ -130,6 +123,7 @@ static void be300_keys_poll(struct input_polled_dev *dev)
 	 * as a modifier and never produces an event of its own.
 	 */
 	if ((changed1 & BE300_BTN_OK) && (set1 & BE300_BTN_OK)) {
+		be300_state.pending_edit = false;
 		if (rocket)
 			be300_tap(input, KEY_SPACE);
 		else
@@ -137,6 +131,7 @@ static void be300_keys_poll(struct input_polled_dev *dev)
 	}
 
 	if ((changed1 & BE300_BTN_ESC) && (set1 & BE300_BTN_ESC)) {
+		be300_state.pending_edit = false;
 		if (rocket)
 			be300_tap(input, KEY_BACKSPACE);
 		else
@@ -145,9 +140,15 @@ static void be300_keys_poll(struct input_polled_dev *dev)
 
 	if ((changed1 & BE300_BTN_UP) && (set1 & BE300_BTN_UP)) {
 		if (rocket) {
-			be300_replace_char(input, be300_state.char_pos);
-			be300_state.char_pos =
-			    (be300_state.char_pos + 1) % NUM_CHAR_KEYS;
+			if (be300_state.pending_edit) {
+				be300_state.char_pos =
+				    (be300_state.char_pos + 1) % NUM_CHAR_KEYS;
+				be300_tap(input, KEY_BACKSPACE);
+			} else {
+				be300_state.char_pos = 0;
+				be300_state.pending_edit = true;
+			}
+			be300_tap(input, char_keys[be300_state.char_pos]);
 		} else {
 			be300_tap(input, KEY_UP);
 		}
@@ -155,33 +156,46 @@ static void be300_keys_poll(struct input_polled_dev *dev)
 
 	if ((changed1 & BE300_BTN_DOWN) && (set1 & BE300_BTN_DOWN)) {
 		if (rocket) {
-			be300_replace_char(input, be300_state.char_pos);
-			be300_state.char_pos =
-			    (be300_state.char_pos + NUM_CHAR_KEYS - 1) %
-			    NUM_CHAR_KEYS;
+			if (be300_state.pending_edit) {
+				be300_state.char_pos =
+				    (be300_state.char_pos + NUM_CHAR_KEYS - 1) %
+				    NUM_CHAR_KEYS;
+				be300_tap(input, KEY_BACKSPACE);
+			} else {
+				be300_state.char_pos = NUM_CHAR_KEYS - 1;
+				be300_state.pending_edit = true;
+			}
+			be300_tap(input, char_keys[be300_state.char_pos]);
 		} else {
 			be300_tap(input, KEY_DOWN);
 		}
 	}
 
 	if ((changed1 & BE300_BTN_RIGHT) && (set1 & BE300_BTN_RIGHT)) {
-		/* rocket+right commits: just advance the cursor */
+		be300_state.pending_edit = false;
 		be300_tap(input, KEY_RIGHT);
 	}
 
 	if ((changed1 & BE300_BTN_LEFT) && (set1 & BE300_BTN_LEFT)) {
-		if (rocket)
+		if (rocket) {
+			be300_state.pending_edit = false;
 			be300_tap(input, KEY_BACKSPACE);
-		else
+		} else {
 			be300_tap(input, KEY_LEFT);
+		}
 	}
 
 	if ((changed2 & BE300_BTN_POWER) && (set2 & BE300_BTN_POWER)) {
+		be300_state.pending_edit = false;
 		if (rocket)
 			be300_ctrl_c(input);
 		else
 			be300_tap(input, KEY_POWER);
 	}
+
+	/* Rocket released: commit any pending edit. */
+	if ((changed2 & BE300_BTN_ROCKET) && !(set2 & BE300_BTN_ROCKET))
+		be300_state.pending_edit = false;
 
 	be300_state.prev_set1 = set1;
 	be300_state.prev_set2 = set2;

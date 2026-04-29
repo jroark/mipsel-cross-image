@@ -14,7 +14,7 @@ All builds run inside the Docker container. The host mounts the repo at `/work`.
 # Build the Docker cross-compilation image
 docker-compose build
 
-# Build the BE-300 kernel (full pipeline: BusyBox + initramfs + kernel)
+# Build the BE-300 kernel (full pipeline: BusyBox + JFFS2 rootfs + kernel)
 docker-compose run --rm mips-dev bash -c "./build_be300_kernel.sh"
 
 # Build just the Malta/QEMU kernel (simpler, for reference)
@@ -86,21 +86,24 @@ The build script also patches `arch/mips/vr41xx/Kconfig` and `Platform` to add t
 
 **Phase 0** — Install sanitized Linux UAPI headers (`make headers_install`) for musl into `/work/musl-khdrs`. musl doesn't ship Linux `linux/*.h` UAPI; `uclibc-kernel-headers` can't be used because it lacks the `__UAPI_DEF_*` guards and collides with musl's `netinet/in.h`.
 
-**Phase 1** — Build BusyBox statically linked against musl:
+**Phase 1** — Build BusyBox statically linked against musl, populate the JFFS2 rootfs source tree at `/work/rootfs_be300/`:
 1. `make distclean && defconfig`
 2. Disable all networking applets (linux-4.2.9 UAPI headers still have UAPI/libc collisions on `linux/in.h` / `linux/netfilter_ipv4.h`), runit (`BUG_need_to_implement_gettimeofday_ns`), WTMP/UTMP, NFS/RPC, TC, syslogd cfg
 3. Patch a private copy of `libgcc.a` (`-B/tmp/libgcc_patched`): strip `_divdi3.o _moddi3.o _udivdi3.o _umoddi3.o _fixdfdi.o _fixunsdfdi.o _floatdidf.o _floatundidf.o _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o` and replace with mips2-compiled `libgcc_helpers.o`
 4. `make busybox EXTRA_CFLAGS="-march=mips2 -specs musl-gcc.specs -isystem musl-khdrs/include" EXTRA_LDFLAGS="-specs musl-gcc.specs -B/tmp/libgcc_patched"`
-5. Install busybox to `$ROOTFS/bin/busybox`, create applet symlinks, make `/init → /bin/busybox`, write `/etc/inittab` that mounts proc/sys/dev and spawns a shell on tty0
+5. Install busybox to `$ROOTFS/bin/busybox`, create applet symlinks, point `/sbin/init` at busybox, write `/etc/inittab` (mounts proc + sysfs, spawns respawn shells on tty0 and ttyVR0). This tree becomes the JFFS2 image at Phase 7b and is the actual booted root filesystem.
 
 **Phase 2–6** — Kernel build:
 1. Download linux-4.2.9-patched.tar.xz from Tiny Core Linux
 2. Apply GCC 10+ fixes: yylloc extern, log2.h noreturn/const, -Werror removal
 3. Inject board support files and Kconfig patches
-4. Configure with `configs/be300_defconfig`, set CONFIG_INITRAMFS_SOURCE
-5. Build vmlinux (initramfs is embedded — emulator has no --initrd flag)
+4. Configure with `configs/be300_defconfig`. The kernel cmdline carries `root=/dev/mtdblock3 rootfstype=jffs2 rootwait`, so the kernel mounts JFFS2 from NAND mtd3 directly as `/` — no embedded initramfs.
+5. Build vmlinux. `CONFIG_DEVTMPFS_MOUNT=y` causes the kernel to mount devtmpfs over `/dev` before exec'ing `/sbin/init` from the JFFS2 rootfs.
 
-**Phase 7** — Package vmlinux as a B000FF NAND image: `tools/mk_be300_nand.py` reads each `PT_LOAD` segment and emits a 12-byte `(addr, len, 0xFFFFFFFF)` record followed by the segment bytes, terminating with `(e_entry, 0, 0xFFFFFFFF)`. The container starts with `"B000FF\n"` at NAND offset `0x4000`. Output is `linux-4.2.9/be300.nand` (16 MB, padded with `0xFF`).
+**Phase 7** — Build SPL + JFFS2 + NAND image:
+- **7a**: extract `KERNEL_LOAD_VA`/`KERNEL_ENTRY_VA`/`KERNEL_SIZE` from the vmlinux ELF, compile `board/casio-be300/spl_start.S` + `spl.c` + `spl.lds` with those baked in via `-D`, link as `spl.elf`.
+- **7b**: `mkfs.jffs2 --root=$ROOTFS --output=linux-4.2.9/rootfs.jffs2 --eraseblock=16384 --pagesize=512 --no-cleanmarkers --pad=0xB00000 --little-endian` to package the BusyBox tree from Phase 1 as the mtd3 image.
+- **7c**: `tools/mk_be300_nand.py --vmlinux ... --spl ... --rootfs rootfs.jffs2 --out linux-4.2.9/be300.nand` packs everything into the 16 MiB NAND image (partition table at page 0, SPL B000FF container at `0x4000`, flat kernel binary at `0x14000`, JFFS2 rootfs at `0x500000`).
 
 ### Key Constraints
 
@@ -118,7 +121,7 @@ The build script also patches `arch/mips/vr41xx/Kconfig` and `Platform` to add t
   4. The XFER engine address phase pushes 3 bytes (`col_lo`, `page_lo`, `page_hi`) — sending a fourth byte overflows the 3-byte queue and shifts `col` out. KICK must precede MODE; MODE = `0x05` latches the address into `stream_page`/`stream_col` and sets `ready = true`.
   5. Mailbox handoff: SPL writes `entry` to `*0xA00024FC` and `0x03020101` to `*0xA0002400`; ROM's outer loop polls and `jr`s to the entry value. The ROM does NOT OR `0x20000000` into the entry — that's the SPL's responsibility for the NK handoff in WinCE; for our SPL the kernel runs from the cached KSEG0 alias, which is fine because the SPL writes records via uncached KSEG1.
 - **Emulator is strictly 32-bit**: The be300 emulator runs 32-bit MIPS code only. Disassembly of both known-good kernels (2.4.18, 2.6.8.1) confirms zero 64-bit instructions (no sd, ld, daddu, daddiu, dsll, dsrl). The 4.2.9 kernel's dynamically generated `clear_page`/`copy_page` functions use `sd`/`ld` by default because VR4131 reports `cpu_has_64bit_gp_regs=true`. This MUST be disabled — force `clear_word_size=4` and `copy_word_size=4` in `arch/mips/mm/page.c`.
-- **Emulator has no --initrd**: Initramfs must be built into vmlinux via CONFIG_INITRAMFS_SOURCE
+- **vmlinux must fit before the JFFS2 partition**: the flat kernel binary lives at NAND offset `0x14000` and the JFFS2 rootfs starts at `0x500000`, leaving ~4.92 MiB for vmlinux. `tools/mk_be300_nand.py` (lines 183–187) fails the build if this is exceeded; if it ever does, either shrink the kernel or move the rootfs offset (and update the partition table in `board/casio-be300/nand.c` and `tools/mk_be300_nand.py` together).
 - **Memory registration**: Common VR41xx `prom_init()` doesn't call `add_memory_region()`. The build script patches it to register 16MB. Do NOT rely solely on `mem=16M` on the cmdline — this has caused the kernel to allocate pages beyond physical RAM (writes to non-existent memory are silently dropped by the emulator, corrupting page tables and file data).
 - **serial_be300 is incomplete**: The custom serial TTY driver in the source overlays is unfinished. Use `keep_bootcon` on the kernel cmdline to retain early printk serial output past normal console registration.
 - **VR4131 cache bug**: Hit_Writeback_Inv_D must be split into separate writeback + invalidate. The build script patches `flush_dcache_line()` and `protected_writeback_dcache_line()` in `r4kcache.h`. Required for real hardware; also works on the emulator.
@@ -126,7 +129,8 @@ The build script also patches `arch/mips/vr41xx/Kconfig` and `Platform` to add t
 - **libgcc.a is mips32r2 — patch it**: The Debian `gcc-cross-mipsel-linux-gnu` package's `libgcc.a` was compiled with `-march=mips32r2` and its 64-bit helper routines (`__divdi3`, `__moddi3`, `__udivdi3`, `__umoddi3`, `__fixdfdi`, `__fixunsdfdi`, `__floatdidf`, `__floatundidf`, `__lshrdi3`, `__ashldi3`, `__ashrdi3`, `__negdi2`) contain SPECIAL2 `mul`. The build script creates a patched copy of libgcc.a in `/tmp/libgcc_patched/`, strips those objects, and adds C replacements from `board/casio-be300/libgcc_helpers.c` compiled with `-march=mips2`. Pass `-B/tmp/libgcc_patched` via EXTRA_LDFLAGS so gcc prefers the patched archive. There is no multilib for mips2 (`gcc -print-multi-lib` only lists n32/n64), so rebuilding gcc from source is the only alternative — not worth it.
 - **COW bug in build_clear_page patch**: The dynamically-generated `copy_page` was accidentally patched to become `clear_page_simple` by a sed that matched `memset(labels, 0, sizeof(labels));` in both `build_clear_page` and `build_copy_page`. This zeroed the destination of every COW copy, so userspace data-segment pages read as zeros after `padzero` triggered COW. The sed is now scoped to the `build_clear_page` function only (`/^void build_clear_page/,/^void build_copy_page/`).
 - **Do NOT force per-page D-cache flush in `__update_cache`**: An unconditional `if (1)` replacement of the `exec || pages_do_alias(...)` guard in `arch/mips/mm/cache.c` is a no-op on the emulator (which doesn't simulate the D-cache) but hangs real hardware at `Calibrating delay loop...` — something in the per-page flush path on VR4131 silicon prevents the timer interrupt from delivering, so `jiffies` never advances. An earlier cycle of work hit the same thing ("per-page flush breaks real HW framebuffer"). Leave `__update_cache` at its stock behavior. The real fix for data-page-zeros was the `build_copy_page` sed scoping, not this.
-- **Docker mknod**: Cannot create device nodes in unprivileged Docker; use kernel's initramfs_list.txt format instead
+- **Docker mknod**: Cannot create device nodes in unprivileged Docker. Not an issue at runtime — the kernel mounts devtmpfs (`CONFIG_DEVTMPFS_MOUNT=y`) over `/dev` on the JFFS2 root before exec'ing `/sbin/init`, so all required device nodes appear dynamically.
+- **NAND DIO and `--ne2000` are mutually exclusive**: the legacy NAND DIO ports (`PA 0x0A00D200/D202`, used by `board/casio-be300/nand.c`) live inside the same emulator-claimed page range as the VRC4173 PCMCIA card window (`0x0A00D000-0x0A00D7FF`). With `--ne2000` attached, the NAND state machine ends up returning `0x00` for every D200 byte read during Linux's `nand_get_flash_type` probe, so JFFS2 mount fails and the kernel hangs on `Waiting for root device /dev/mtdblock3...`. Plain `./bin/be300 --nand …` works; `--ne2000 …` does not. The fix is to port the kernel NAND driver off the legacy DIO ports and onto the VRC4173 SPL transfer engine (`PA 0x0A00A4xx` / `0x0A00B000`), which is outside the PCMCIA decode range. Until then, run the emulator without `--ne2000` if you need a working rootfs.
 - **simplefb doesn't work**: The mainline `simplefb` driver uses `ioremap_wc()` which doesn't work for the BE300's KSEG1-mapped VRAM. Use the ported `sfb.c` instead, which directly accesses 0xAA200000 as a KSEG1 virtual address.
 - **Framebuffer console requires CFB helpers**: `CONFIG_FB_CFB_FILLRECT/COPYAREA/IMAGEBLIT` must be force-selected in Kconfig since no standard driver selects them. The build script adds `select FB_CFB_*` to the CASIO_BE300 Kconfig entry.
 

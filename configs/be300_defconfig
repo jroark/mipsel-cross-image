@@ -27,7 +27,7 @@ CONFIG_BINFMT_SCRIPT=y
 # Block devices — only RAM disk
 CONFIG_BLK_DEV_RAM=y
 CONFIG_BLK_DEV_RAM_SIZE=4096
-CONFIG_BLK_DEV_INITRD=y
+# CONFIG_BLK_DEV_INITRD is not set
 # CONFIG_BLK_DEV_LOOP is not set
 
 # Disable ALL IO schedulers except noop
@@ -45,6 +45,14 @@ CONFIG_UNIX98_PTYS=y
 # Early printk
 CONFIG_EARLY_PRINTK=y
 
+# Built-in kernel command line. Two consoles:
+#   tty0       — framebuffer console (visible on the LCD).
+#   ttyVR0     — VR4131 SIU at 0x0F000800; emulator pipes TX to its stdout.
+# printk goes to both. ttyVR0 is RX-only on the host stdin if the emulator
+# is invoked with the right flag; without it, ttyVR0 is TX-only.
+CONFIG_CMDLINE_BOOL=y
+CONFIG_CMDLINE="earlyprintk console=tty0 console=ttyVR0,115200 root=/dev/mtdblock3 rootfstype=jffs2 rootwait"
+
 # Framebuffer — minimal (sfb built into board support)
 CONFIG_FB=y
 CONFIG_FB_CFB_FILLRECT=y
@@ -55,8 +63,12 @@ CONFIG_FONTS=y
 CONFIG_FONT_8x8=y
 # CONFIG_FONT_8x16 is not set
 
-# NO serial (BE300 UART is not 8250)
+# Serial: VR41xx SIU. The BE300 emulator's VR4131 SIU at 0xAF000800 is
+# ns16550-compatible and wired to VRIP 9. The mainline VR41xx common code
+# auto-registers a platform device at the right address.
 # CONFIG_SERIAL_8250 is not set
+CONFIG_SERIAL_VR41XX=y
+CONFIG_SERIAL_VR41XX_CONSOLE=y
 
 # Filesystem — minimal
 CONFIG_PROC_FS=y
@@ -66,14 +78,54 @@ CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 CONFIG_EXT2_FS=y
 
+# GPIO/GIU: drives the VR41xx GIU GPIO unit AND the per-pin IRQ chips for
+# GIU_IRQ_BASE..GIU_IRQ_LAST. Required so that board/casio-be300/irq.c's
+# chained_handler on GIU_IRQ(0) finds a real irq_chip there.
+CONFIG_GPIOLIB=y
+CONFIG_GPIO_VR41XX=y
+
+# MTD/NAND for the on-board NAND. plat_nand drives the chip via
+# board/casio-be300/nand.c; partitions match tools/mk_be300_nand.py.
+CONFIG_MTD=y
+CONFIG_MTD_BLOCK=y
+CONFIG_MTD_NAND=y
+CONFIG_MTD_NAND_PLATFORM=y
+# Allow `mtdparts=` on the kernel cmdline to override the in-driver table.
+CONFIG_MTD_CMDLINE_PARTS=y
+
+# JFFS2: writable rootfs on raw NAND.
+CONFIG_JFFS2_FS=y
+CONFIG_JFFS2_FS_WRITEBUFFER=y
+
+# Networking core + NE2000 (drivers/net/ethernet/8390/ne.c platform path).
+# Wired up by board/casio-be300/setup.c when --ne2000 is supplied to the
+# emulator; otherwise probe fails cleanly.
+CONFIG_NET=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+# CONFIG_IPV6 is not set
+CONFIG_NETDEVICES=y
+CONFIG_ETHERNET=y
+CONFIG_NET_VENDOR_8390=y
+CONFIG_NE2000=y
+
+# CompactFlash via pata_platform (drivers/ata/pata_platform.c). Wired up
+# by board/casio-be300/setup.c. SCSI midlayer + sd are required because
+# libata feeds through SCSI.
+CONFIG_ATA=y
+CONFIG_PATA_PLATFORM=y
+CONFIG_SCSI=y
+CONFIG_BLK_DEV_SD=y
+CONFIG_VFAT_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+
 # Disable EVERYTHING not needed
-# CONFIG_NET is not set
 # CONFIG_SOUND is not set
 # CONFIG_USB_SUPPORT is not set
 # CONFIG_PCI is not set
 # CONFIG_IDE is not set
-# CONFIG_SCSI is not set
-# CONFIG_MTD is not set
 # CONFIG_INPUT_MOUSEDEV is not set
 # CONFIG_INPUT_JOYDEV is not set
 # CONFIG_INPUT_EVDEV is not set
@@ -81,7 +133,13 @@ CONFIG_INPUT=y
 CONFIG_INPUT_KEYBOARD=y
 CONFIG_INPUT_POLLDEV=y
 # CONFIG_KEYBOARD_ATKBD is not set
-# CONFIG_SERIO is not set
+CONFIG_KEYBOARD_STOWAWAY=y
+CONFIG_SERIO=y
+# CONFIG_SERIO_SERPORT is not set
+# CONFIG_SERIO_LIBPS2 is not set
+# CONFIG_SERIO_RAW is not set
+# CONFIG_SERIO_ALTERA_PS2 is not set
+# CONFIG_SERIO_ARC_PS2 is not set
 # CONFIG_INPUT_MOUSE is not set
 # CONFIG_INPUT_TOUCHSCREEN is not set
 # CONFIG_HWMON is not set

@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y \
     vim \
     libsdl2-dev \
     ripgrep \
+    mtd-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install MIPS and MIPS64 cross-compilers (little-endian)
