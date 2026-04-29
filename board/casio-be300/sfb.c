@@ -289,7 +289,23 @@ static int sfb_pan_display(struct fb_var_screeninfo *var,
 static int sfb_mmap(struct fb_info *info,
 		    struct vm_area_struct *vma)
 {
-	return -EINVAL;
+	unsigned long len = vma->vm_end - vma->vm_start;
+	unsigned long pfn;
+
+	if (vma->vm_pgoff > (videomemorysize >> PAGE_SHIFT))
+		return -EINVAL;
+	if (len > videomemorysize - (vma->vm_pgoff << PAGE_SHIFT))
+		return -EINVAL;
+
+	/* videomemory_phys holds the KSEG1 virtual address (0xaa200000);
+	 * the physical base is the low 29 bits (0x0a200000). */
+	pfn = ((videomemory_phys & 0x1fffffff) >> PAGE_SHIFT) + vma->vm_pgoff;
+
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	if (remap_pfn_range(vma, vma->vm_start, pfn, len, vma->vm_page_prot))
+		return -EAGAIN;
+
+	return 0;
 }
 
 static int __init sfb_init(void)

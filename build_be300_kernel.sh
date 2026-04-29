@@ -154,6 +154,95 @@ mkdir -p "$ROOTFS"/{bin,sbin,usr/bin,usr/sbin,proc,sys,dev,tmp,etc,root,mnt}
 cp busybox "$ROOTFS/bin/busybox"
 chmod +x "$ROOTFS/bin/busybox"
 
+# Phase A smoke test: a userspace mmap of /dev/fb0 that draws a checkerboard.
+# Sanity-checks the sfb_mmap() path before any real GUI lib (Microwindows,
+# Qt/E, SDL) tries to use it.
+mipsel-linux-gnu-gcc -march=mips2 -O2 -static \
+    -specs "$MUSL_SPECS" -isystem "$KHDRS/include" \
+    -B/tmp/libgcc_patched \
+    /work/board/casio-be300/fb_mmap_test.c \
+    -o /tmp/fb_mmap_test
+mipsel-linux-gnu-strip /tmp/fb_mmap_test
+cp /tmp/fb_mmap_test "$ROOTFS/bin/fb_mmap_test"
+chmod +x "$ROOTFS/bin/fb_mmap_test"
+
+# Phase B smoke test: query the PIU touchscreen input_dev capabilities.
+mipsel-linux-gnu-gcc -march=mips2 -O2 -static \
+    -specs "$MUSL_SPECS" -isystem "$KHDRS/include" \
+    -B/tmp/libgcc_patched \
+    /work/board/casio-be300/touch_query_test.c \
+    -o /tmp/touch_query_test
+mipsel-linux-gnu-strip /tmp/touch_query_test
+cp /tmp/touch_query_test "$ROOTFS/bin/touch_query_test"
+chmod +x "$ROOTFS/bin/touch_query_test"
+
+# Phase C' — Microwindows / Nano-X (pure C, builds against musl + mips2,
+# no libstdc++ needed). Builds the libnano-X.a static lib and a small set
+# of demos with the server linked into each binary (LINK_APP_INTO_SERVER=Y),
+# so each demo is a self-contained executable. Input devices wire through
+# evdev: /dev/input/event0 (BE-300 buttons) and event1 (PIU touchscreen).
+#
+# Source tree layout: microwindows/ is a fresh extraction of
+# ghaerr/microwindows; our overlays live at /work/board/microwindows/ and
+# are copied + patched in here so the upstream tree stays clean.
+echo "=== Building Microwindows / Nano-X for BE-300 ==="
+if [ ! -f microwindows-master.tar.gz ]; then
+    wget -q "https://github.com/ghaerr/microwindows/archive/refs/heads/master.tar.gz" \
+        -O microwindows-master.tar.gz
+fi
+if [ ! -d microwindows ]; then
+    tar xzf microwindows-master.tar.gz
+    mv microwindows-master microwindows
+fi
+# Overlay our config + evdev drivers, idempotently
+cp /work/board/microwindows/config.be300 \
+   /work/microwindows/src/Configs/config.be300
+cp /work/board/microwindows/kbd_evdev.c \
+   /work/microwindows/src/drivers/kbd_evdev.c
+cp /work/board/microwindows/mou_evdev.c \
+   /work/microwindows/src/drivers/mou_evdev.c
+# Patch Objects.rules to register EVDEVKBD and EVDEVMOUSE driver hooks
+# (idempotent — only inserts when the marker line is absent)
+if ! grep -q "MOUSE.*EVDEVMOUSE" /work/microwindows/src/drivers/Objects.rules; then
+    sed -i '/^# FBE mouse driver$/i\
+# Linux evdev mouse driver (touchscreen via /dev/input/eventN)\
+ifeq ($(MOUSE), EVDEVMOUSE)\
+MW_CORE_OBJS += $(MW_DIR_OBJ)/drivers/mou_evdev.o\
+endif\
+' /work/microwindows/src/drivers/Objects.rules
+fi
+if ! grep -q "KEYBOARD.*EVDEVKBD" /work/microwindows/src/drivers/Objects.rules; then
+    sed -i '/^# FBE keyboard driver$/i\
+# Linux evdev keyboard driver (/dev/input/eventN, BE-300 buttons / Stowaway)\
+ifeq ($(KEYBOARD), EVDEVKBD)\
+MW_CORE_OBJS += $(MW_DIR_OBJ)/drivers/kbd_evdev.o\
+endif\
+' /work/microwindows/src/drivers/Objects.rules
+fi
+
+cd /work/microwindows/src
+cp Configs/config.be300 config
+make clean >/dev/null 2>&1 || true
+MW_CC="mipsel-linux-gnu-gcc -march=mips2 -mfpxx -specs $MUSL_SPECS -isystem $KHDRS/include -B/tmp/libgcc_patched"
+make -j$(nproc) MIPSTOOLSPREFIX="" \
+    COMPILER=gcc \
+    CC="$MW_CC" \
+    AR="mipsel-linux-gnu-ar" \
+    LDFLAGS="-static" \
+    EXTRAFLAGS="" \
+    2>&1 | tail -3 || true
+echo "--- Microwindows artifacts ---"
+ls -la /work/microwindows/src/lib/libnano-X.a /work/microwindows/src/bin/demo-hello 2>/dev/null
+# Stage demo-hello into rootfs (stripped, ~400 KB)
+mipsel-linux-gnu-strip /work/microwindows/src/bin/demo-hello
+cp /work/microwindows/src/bin/demo-hello "$ROOTFS/bin/demo-hello"
+chmod +x "$ROOTFS/bin/demo-hello"
+# Stage a minimal font set so MWFONTDIR-less demos can fall back to disk if
+# the built-in font picker misses.
+mkdir -p "$ROOTFS/usr/share/microwindows/pcf"
+cp /work/microwindows/src/fonts/pcf/*.pcf.gz "$ROOTFS/usr/share/microwindows/pcf/" 2>/dev/null || true
+cd /work
+
 # Create standard busybox symlinks. We can't run ./busybox on the host
 # (different arch), so use a hardcoded list of the applets we need.
 for applet in sh ash mount umount echo cat ls ln cp mv rm mkdir rmdir \
@@ -161,6 +250,7 @@ for applet in sh ash mount umount echo cat ls ln cp mv rm mkdir rmdir \
               dmesg true false clear printf head tail wc grep sed awk \
               mknod sync poweroff reboot halt which env find test \
               vi more less switch_root pivot_root \
+              dd hexdump od xxd \
               ifconfig ip route arp arping ping ping6 hostname netstat \
               nslookup wget telnet ftpget ftpput nc traceroute udhcpc \
               ipcalc nameif; do
@@ -175,7 +265,8 @@ mkdir -p "$ROOTFS/etc"
 cat > "$ROOTFS/etc/inittab" << 'INITTAB'
 ::sysinit:/bin/mount -t proc proc /proc
 ::sysinit:/bin/mount -t sysfs sysfs /sys
-::sysinit:/bin/echo "=== Casio BE-300 Linux 4.2.9 (BusyBox) ==="
+::sysinit:/bin/echo "=== Casio BE-300 Linux 4.2.9 (BusyBox + Nano-X) ==="
+::sysinit:/bin/echo "  Run /bin/demo-hello to launch a Nano-X demo."
 tty0::respawn:/bin/sh
 ttyVR0::respawn:/bin/sh
 ::ctrlaltdel:/bin/umount -a -r
@@ -565,6 +656,7 @@ cp /work/board/casio-be300/keys.c arch/mips/vr41xx/casio-be300/
 cp /work/board/casio-be300/nand.c arch/mips/vr41xx/casio-be300/
 cp /work/board/casio-be300/irq.c arch/mips/vr41xx/casio-be300/
 cp /work/board/casio-be300/stowaway_serio.c arch/mips/vr41xx/casio-be300/
+cp /work/board/casio-be300/touch_be300.c arch/mips/vr41xx/casio-be300/
 cp /work/board/casio-be300/Makefile arch/mips/vr41xx/casio-be300/
 
 # Slow down kernel auto-repeat for the in-tree Stowaway keyboard driver.
