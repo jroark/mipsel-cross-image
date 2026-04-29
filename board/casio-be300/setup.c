@@ -49,6 +49,9 @@
 #define BE300_UART_OFS_LSR	0x14
 #define BE300_UART_LSR_THRE	0x20
 
+#define BE300_PCMCIA_BRIDGE_PA	0x0a00a01c
+#define BE300_PCMCIA_BRIDGE_EN	0x04
+
 static void casio_be300_wait(void)
 {
 	local_irq_enable();
@@ -61,20 +64,17 @@ static int __init casio_be300_setup(void)
 	ioport_resource.end = BE300_ISA_IO_END;
 
 	/*
-	 * Do NOT enable the VRC4173 PCMCIA bridge windows here. Writing 0x04
-	 * to PA 0x0A00A01C tells the bridge to claim PA 0x0A00C000-0x0A00D7FF
-	 * for the CF taskfile and CIS windows, which collides with the NAND
-	 * direct-I/O ports at PA 0x0A00D200 / 0x0A00D202 used by
-	 * board/casio-be300/nand.c. With the bridge enabled, NAND DIO reads
-	 * return CIS data and writes are silently dropped, so the NAND chip
-	 * never enumerates and root=/dev/mtdblock3 never appears.
-	 *
-	 * The trade-off: pata_platform (CF) and ne2000 stop decoding. We keep
-	 * NAND working because JFFS2 on mtd3 is the actual root filesystem.
-	 * If CF/NE2000 are needed later, the NAND driver must be ported off
-	 * the legacy DIO path and onto the SPL transfer engine (PA 0x0A00A4xx
-	 * / 0x0A00B000), which doesn't share decode with the PCMCIA bridge.
+	 * Enable the VRC4173 PCMCIA bridge windows. NAND uses the XFER engine
+	 * at PA 0x0A00A4xx / 0x0A00B000, so the bridge may own the C000/D000
+	 * card windows needed by CF and NE2000 without stealing NAND I/O.
 	 */
+	{
+		void __iomem *bridge = ioremap(BE300_PCMCIA_BRIDGE_PA, 4);
+		if (bridge) {
+			writel(readl(bridge) | BE300_PCMCIA_BRIDGE_EN, bridge);
+			iounmap(bridge);
+		}
+	}
 
 	/*
 	 * Drain the VRC4173 GIRQ0 cascade source before IRQs come up.
