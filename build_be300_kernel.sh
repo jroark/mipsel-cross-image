@@ -87,6 +87,17 @@ cd "$BBOX_DIR"
 make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- distclean || true
 make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- defconfig
 
+enable_busybox_config() {
+    cfg="$1"
+    if grep -q "^# ${cfg} is not set" .config; then
+        sed -i "s/^# ${cfg} is not set/${cfg}=y/" .config
+    elif grep -q "^${cfg}=n" .config; then
+        sed -i "s/^${cfg}=n/${cfg}=y/" .config
+    elif ! grep -q "^${cfg}=" .config; then
+        echo "${cfg}=y" >> .config
+    fi
+}
+
 # Force static, disable NFS/RPC (not in musl), use internal crypt
 sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
 sed -i 's/^# CONFIG_USE_BB_CRYPT is not set/CONFIG_USE_BB_CRYPT=y/' .config
@@ -94,6 +105,14 @@ sed -i 's/^# CONFIG_USE_BB_CRYPT_SHA is not set/CONFIG_USE_BB_CRYPT_SHA=y/' .con
 # Disable WTMP (musl's _PATH_WTMP not auto-included in libbb)
 sed -i 's/^CONFIG_FEATURE_WTMP=y/CONFIG_FEATURE_WTMP=n/' .config
 sed -i 's/^CONFIG_FEATURE_UTMP=y/CONFIG_FEATURE_UTMP=n/' .config
+# Keep the NE2000 boot smoke test available on clean BusyBox rebuilds.
+for cfg in CONFIG_ARP CONFIG_ARPING CONFIG_IFCONFIG CONFIG_IP \
+    CONFIG_FEATURE_IP_ADDRESS CONFIG_FEATURE_IP_LINK CONFIG_FEATURE_IP_ROUTE \
+    CONFIG_IPADDR CONFIG_IPLINK CONFIG_IPROUTE CONFIG_NSLOOKUP CONFIG_PING \
+    CONFIG_ROUTE CONFIG_UDHCPC CONFIG_WGET; do
+    enable_busybox_config "$cfg"
+done
+sed -i 's@^CONFIG_UDHCPC_DEFAULT_SCRIPT=.*@CONFIG_UDHCPC_DEFAULT_SCRIPT="/usr/share/udhcpc/default.script"@' .config
 # Phase 0's libc-compat.h sed teaches the linux UAPI to keep its hands off
 # struct definitions when musl already provides them, so most networking
 # applets compile against -isystem $KHDRS/include now. Keep disabled only
@@ -150,7 +169,7 @@ mipsel-linux-gnu-strip busybox
 # Populate full rootfs (this becomes the JFFS2 mtd3 partition).
 ROOTFS="/work/rootfs_be300"
 rm -rf "$ROOTFS"
-mkdir -p "$ROOTFS"/{bin,sbin,usr/bin,usr/sbin,proc,sys,dev,tmp,etc,root,mnt}
+mkdir -p "$ROOTFS"/{bin,sbin,usr/bin,usr/sbin,proc,sys,dev,tmp,etc,root,mnt,usr/share/udhcpc}
 cp busybox "$ROOTFS/bin/busybox"
 chmod +x "$ROOTFS/bin/busybox"
 
@@ -257,16 +276,119 @@ for applet in sh ash mount umount echo cat ls ln cp mv rm mkdir rmdir \
     ln -sf /bin/busybox "$ROOTFS/bin/$applet"
 done
 
+# BusyBox 1.24.2's wget applet faults on this VR4131/musl build after DNS.
+# Keep BusyBox for the rest of the network tools, but replace /bin/wget with a
+# small static HTTP fetcher so the boot smoke test can verify TCP/HTTP.
+mipsel-linux-gnu-gcc -march=mips2 -Os -static \
+    -specs "$MUSL_SPECS" -isystem "$KHDRS/include" \
+    -B/tmp/libgcc_patched \
+    -o /tmp/be300-wget /work/board/casio-be300/be300_wget.c
+mipsel-linux-gnu-strip /tmp/be300-wget
+/bin/rm -f "$ROOTFS/bin/wget"
+cp /tmp/be300-wget "$ROOTFS/bin/wget"
+chmod +x "$ROOTFS/bin/wget"
+
 # busybox-as-init reads /etc/inittab. The kernel mounts JFFS2 as `/` and execs
 # /sbin/init.
 ln -sf /bin/busybox "$ROOTFS/sbin/init"
 
 mkdir -p "$ROOTFS/etc"
+ln -sf /tmp/resolv.conf "$ROOTFS/etc/resolv.conf"
+
+cat > "$ROOTFS/usr/share/udhcpc/default.script" << 'UDHCPC_SCRIPT'
+#!/bin/sh
+
+RESOLV_CONF=/tmp/resolv.conf
+
+case "$1" in
+deconfig)
+    /bin/ifconfig "$interface" 0.0.0.0
+    ;;
+
+bound|renew)
+    if [ -n "$broadcast" ]; then
+        /bin/ifconfig "$interface" "$ip" netmask "$subnet" broadcast "$broadcast"
+    else
+        /bin/ifconfig "$interface" "$ip" netmask "$subnet"
+    fi
+
+    while /bin/route del default gw 0.0.0.0 dev "$interface" 2>/dev/null; do
+        :
+    done
+
+    metric=0
+    for gw in $router; do
+        /bin/route add default gw "$gw" dev "$interface" metric "$metric"
+        metric=$(($metric + 1))
+    done
+
+    tmp_resolv="${RESOLV_CONF}.$$"
+    : > "$tmp_resolv"
+    if [ -n "$domain" ]; then
+        echo "search $domain" >> "$tmp_resolv"
+    fi
+    if [ -n "$dns" ]; then
+        for ns in $dns; do
+            echo "nameserver $ns" >> "$tmp_resolv"
+        done
+    else
+        echo "nameserver 10.0.0.254" >> "$tmp_resolv"
+    fi
+    /bin/mv "$tmp_resolv" "$RESOLV_CONF"
+    ;;
+esac
+UDHCPC_SCRIPT
+chmod +x "$ROOTFS/usr/share/udhcpc/default.script"
+
+cat > "$ROOTFS/bin/ne2000-net-test" << 'NET_TEST'
+#!/bin/sh
+
+log() {
+    echo "[net] $*"
+    echo "[net] $*" >/dev/kmsg 2>/dev/null || true
+}
+
+fail() {
+    log "FAIL $*"
+    exit 1
+}
+
+log "starting NE2000 DHCP/wget smoke test"
+/bin/ifconfig lo 127.0.0.1 up 2>/dev/null || true
+
+[ -d /sys/class/net/eth0 ] || fail "eth0 not present; boot with --ne2000"
+
+log "bringing up eth0"
+/bin/ifconfig eth0 up || fail "could not bring eth0 up"
+
+log "requesting DHCP lease on eth0"
+/bin/udhcpc -i eth0 -s /usr/share/udhcpc/default.script \
+    -p /tmp/udhcpc.eth0.pid -q -n -t 5 -T 3 || fail "DHCP lease failed"
+
+log "eth0 configuration"
+/bin/ifconfig eth0 || true
+/bin/route -n || true
+[ -f /etc/resolv.conf ] && /bin/cat /etc/resolv.conf
+
+log "checking DNS"
+/bin/nslookup google.com || fail "nslookup google.com failed"
+
+log "fetching google.com"
+/bin/rm -f /tmp/google.html
+/bin/wget -T 30 -O /tmp/google.html google.com || fail "wget google.com failed"
+[ -s /tmp/google.html ] || fail "wget google.com produced an empty file"
+
+log "PASS wget google.com"
+NET_TEST
+chmod +x "$ROOTFS/bin/ne2000-net-test"
+
 cat > "$ROOTFS/etc/inittab" << 'INITTAB'
 ::sysinit:/bin/mount -t proc proc /proc
 ::sysinit:/bin/mount -t sysfs sysfs /sys
+::sysinit:/bin/mount -t tmpfs tmpfs /tmp
 ::sysinit:/bin/echo "=== Casio BE-300 Linux 4.2.9 (BusyBox + Nano-X) ==="
 ::sysinit:/bin/echo "  Run /bin/demo-hello to launch a Nano-X demo."
+::sysinit:/bin/ne2000-net-test
 tty0::respawn:/bin/sh
 ttyVR0::respawn:/bin/sh
 ::ctrlaltdel:/bin/umount -a -r
