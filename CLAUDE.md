@@ -20,15 +20,11 @@ docker-compose run --rm mips-dev bash -c "./build_be300_kernel.sh"
 # Build just the Malta/QEMU kernel (simpler, for reference)
 docker-compose run --rm mips-dev bash -c "./build_tcl_kernel.sh"
 
-# Test with the BE-300 emulator (run on macOS host, not in Docker)
-#
-# Heads-up: the emulator binary in this tree dropped --kernel and only
-# accepts --nand / --restore --cf / a positional ROM. The build pipeline
-# produces linux-4.2.9/be300.nand (a structurally valid B000FF container at
-# NAND offset 0x4000), but the BE-300 boot ROM does NOT yet load Linux from
-# this image — see "BE-300 boot path" in Key Constraints. Until that's
-# unblocked, the most reliable smoke test is to run the existing reference
-# kernels under an emulator build that still has --kernel.
+# Test with the BE-300 emulator (run on macOS host, not in Docker).
+# The emulator boots only from a NAND image (--nand), CF recovery image
+# (--restore --cf), or a positional ROM. The build pipeline produces
+# linux-4.2.9/be300.nand and the boot ROM walks its B000FF SPL container
+# to load Linux. See "BE-300 boot path" in Key Constraints for details.
 ./bin/be300 --nand linux-4.2.9/be300.nand --speed 0
 
 # Useful debug flags

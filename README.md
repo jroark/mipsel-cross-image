@@ -31,27 +31,31 @@ utilities needed to build the kernel, musl, and BusyBox.
 docker-compose run --rm mips-dev bash -c "./build_be300_kernel.sh"
 ```
 This runs the full pipeline (see *Build Pipeline* below) and produces
-`linux-4.2.9/vmlinux` with the initramfs embedded. Takes a few minutes on
-first run (builds musl, installs kernel headers, builds BusyBox, builds
+`linux-4.2.9/vmlinux`, a 16 MiB NAND image at `linux-4.2.9/be300.nand`
+that packages the SPL + kernel + JFFS2 rootfs, and a stripped BusyBox
+rootfs tree at `rootfs_be300/`. Takes a few minutes on first run
+(builds musl, installs kernel headers, builds BusyBox, Microwindows,
 the kernel); subsequent runs reuse the musl/headers caches.
 
 ### 3. Boot it on the emulator (macOS host)
 ```bash
-./bin/be300 --kernel linux-4.2.9/vmlinux \
-    --cmdline "console=tty0 earlyprintk keep_bootcon" --speed 0
+./bin/be300 --nand linux-4.2.9/be300.nand --speed 0
 ```
 Emulator keys: `Q` quit, `S` screenshot (saved as `screenshot_*.bmp`),
 `M` help. Useful flags: `--log-mmio`, `--trace`, `--speed 0` (unthrottled).
+The kernel command line baked into the NAND image carries
+`console=tty0 console=ttyVR0,115200 root=/dev/mtdblock3 rootfstype=jffs2`.
 
 The early kernel messages go to both the companion-chip serial UART and
 the framebuffer console. After `Console: switching to colour frame buffer
-device` everything goes to the framebuffer — use `keep_bootcon` to keep
-the kernel printks on serial as well.
+device` everything continues to both — `keep_bootcon` is appended to the
+cmdline so the kernel printks stay on serial as well.
 
-For reference, the repo includes two known-good older kernels:
+To exercise the NE2000 networking smoke test (DHCP + DNS + wget), boot
+with `--ne2000` attached:
 ```bash
-./bin/be300 --kernel kernels/vmlinux-2.4 --cmdline "console=tty0 root=/dev/ram"
-./bin/be300 --kernel kernels/vmlinux-2.6
+./bin/be300 --nand linux-4.2.9/be300.nand --ne2000 \
+    --net-mac 02:de:ad:be:ef:01 --speed 0
 ```
 
 ## Build Pipeline (`build_be300_kernel.sh`)
