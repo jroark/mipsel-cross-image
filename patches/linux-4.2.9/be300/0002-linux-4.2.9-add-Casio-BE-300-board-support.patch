@@ -1,0 +1,2075 @@
+From 79941b089346a480c47bc9b8e1c8412b0ff75fea Mon Sep 17 00:00:00 2001
+From: BE300 Patch Generator <be300@example.invalid>
+Date: Wed, 29 Apr 2026 21:18:05 -0700
+Subject: [PATCH 2/4] linux-4.2.9: add Casio BE-300 board support
+
+
+diff --git a/arch/mips/vr41xx/Kconfig b/arch/mips/vr41xx/Kconfig
+index 74927b4..12b40be 100644
+--- a/arch/mips/vr41xx/Kconfig
++++ b/arch/mips/vr41xx/Kconfig
+@@ -61,6 +61,22 @@ config ZAO_CAPCELLA
+ 	select SYS_SUPPORTS_32BIT_KERNEL
+ 	select SYS_SUPPORTS_LITTLE_ENDIAN
+ 
++config CASIO_BE300
++	bool "CASIO CASSIOPEIA BE-300"
++	select CEVT_R4K
++	select CSRC_R4K
++	select DMA_NONCOHERENT
++	select IRQ_MIPS_CPU
++	select ISA
++	select HAVE_PATA_PLATFORM
++	select SYS_SUPPORTS_32BIT_KERNEL
++	select SYS_SUPPORTS_LITTLE_ENDIAN
++	select SYS_HAS_EARLY_PRINTK
++	select FB_CFB_FILLRECT if FB
++	select FB_CFB_COPYAREA if FB
++	select FB_CFB_IMAGEBLIT if FB
++	select INPUT_POLLDEV
++
+ endchoice
+ 
+ choice
+diff --git a/arch/mips/vr41xx/Platform b/arch/mips/vr41xx/Platform
+index b6c8d5c..35902e9 100644
+--- a/arch/mips/vr41xx/Platform
++++ b/arch/mips/vr41xx/Platform
+@@ -30,3 +30,15 @@ load-$(CONFIG_VICTOR_MPC30X)	+= 0xffffffff80001000
+ # ZAO Networks Capcella (VR4131)
+ #
+ load-$(CONFIG_ZAO_CAPCELLA)	+= 0xffffffff80000000
++
++#
++# CASIO CASSIOPEIA BE-300 (VR4131)
++#
++platform-$(CONFIG_CASIO_BE300)	+= vr41xx/casio-be300/
++# Load above the BE-300 boot ROM's RAM scratch zone. The ROM's MIPS16
++# record walker keeps state in 0x80010000-0x80010300 and reads from the
++# stack at 0x80003800. Loading the kernel at 0x80020000 (PA 0x20000,
++# 128 KiB into SDRAM) leaves both regions untouched while the walker is
++# copying records into RAM, so the walker can finish and write the
++# 0x24FC mailbox correctly.
++load-$(CONFIG_CASIO_BE300)	+= 0xffffffff80020000
+diff --git a/arch/mips/vr41xx/casio-be300/Makefile b/arch/mips/vr41xx/casio-be300/Makefile
+new file mode 100644
+index 0000000..65bf482
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/Makefile
+@@ -0,0 +1 @@
++obj-y := setup.o sfb.o keys.o nand.o irq.o stowaway_serio.o touch_be300.o
+diff --git a/arch/mips/vr41xx/casio-be300/irq.c b/arch/mips/vr41xx/casio-be300/irq.c
+new file mode 100644
+index 0000000..d1df5e9
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/irq.c
+@@ -0,0 +1,176 @@
++/*
++ * arch/mips/vr41xx/casio-be300/irq.c
++ *
++ * Second-level interrupt demuxer for the BE-300.
++ *
++ * The VR4131 ICU (handled by mainline arch/mips/vr41xx/common/icu.c) reports
++ * the GIU summary as SYSINT1 bit 8, which Linux exposes as GIU_IRQ(0..31)
++ * (40..71). On the BE-300 every VRC4173 sub-source — touch, buttons, CF /
++ * NE2000, PC Connect — rides on a single GPIO pin (GIU line 0). The actual
++ * cascade source is the VRC4173 GIRQ0 status register at PA 0x0A000004.
++ *
++ *   SYSINT1.bit8 (GIU)
++ *      └── GIU0  (GIU_IRQ(0) = 40)
++ *             └── VRC4173 GIRQ0 word @ 0x0A000004:
++ *                    bit 0 → CF / NE2000   (VRC4173_IRQ(0) = 72)
++ *                    bit 1 → buttons       (VRC4173_IRQ(1) = 73)
++ *                    bit 4 → CommMode      (VRC4173_IRQ(4) = 76, unused)
++ *                    bit 9 → touch (PIU)   (VRC4173_IRQ(9) = 81)
++ *
++ * VRC4173_IRQ_BASE (72) is the existing mainline numbering convention — no
++ * other 4.2.9 driver uses it, but reusing the namespace keeps the IRQ
++ * numbering future-compatible with the upstream vrc4173_cardu PCMCIA driver
++ * if we ever switch to that.
++ *
++ * GIRQ0 status / mask / ack are all write-1-to-clear in the emulator. There
++ * is no separate hardware mask register at this layer; we keep a software
++ * shadow mask and AND it with the live status during demux.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/irqchip/chained_irq.h>
++
++#include <asm/vr41xx/irq.h>
++
++#define BE300_GIRQ0_STATUS_PA	0x0a000004
++#define BE300_GIRQ0_ACK_PA	0x0a000014
++#define BE300_GIRQ0_CAUSE_PA	0x0a00a03c
++
++#define BE300_GIUINTENL_PA	0x0f00014c
++
++#define BE300_GIRQ0_NR_SOURCES	16
++
++static void __iomem *be300_girq0_status_io;
++static void __iomem *be300_girq0_ack_io;
++static void __iomem *be300_girq0_cause_io;
++static u32 be300_girq0_mask;
++
++static void be300_girq0_irq_mask(struct irq_data *d)
++{
++	be300_girq0_mask &= ~(1u << (d->irq - VRC4173_IRQ_BASE));
++}
++
++static void be300_girq0_irq_unmask(struct irq_data *d)
++{
++	be300_girq0_mask |= 1u << (d->irq - VRC4173_IRQ_BASE);
++}
++
++static void be300_girq0_irq_ack(struct irq_data *d)
++{
++	writel(1u << (d->irq - VRC4173_IRQ_BASE), be300_girq0_ack_io);
++}
++
++static struct irq_chip be300_girq0_chip = {
++	.name		= "BE300-GIRQ0",
++	.irq_mask	= be300_girq0_irq_mask,
++	.irq_unmask	= be300_girq0_irq_unmask,
++	.irq_ack	= be300_girq0_irq_ack,
++};
++
++static void be300_girq0_demux(unsigned int irq, struct irq_desc *desc)
++{
++	struct irq_chip *chip = irq_desc_get_chip(desc);
++	u32 pending;
++
++	chained_irq_enter(chip, desc);
++
++	pending = readl(be300_girq0_status_io);
++
++	/*
++	 * Bit 0 = CF / NE2000. The emulator keeps it asserted while
++	 * cf_giu_source_bits() reports state_change_pending OR irq_pending
++	 * OR an unmasked NE2000 ISR bit. state_change_pending is cleared
++	 * only by a READ of the CF cause register at 0x0A00A03C — writes to
++	 * the GIRQ0 ack register do nothing for that source.
++	 */
++	if (pending & 0x1)
++		readl(be300_girq0_cause_io);
++
++	/*
++	 * W1C every observed pending bit. For bit 0 this routes through
++	 * cf_clear_irq() in the emulator, dropping irq_pending. For other
++	 * bits it just clears the GIRQ0 latch.
++	 */
++	writel(pending, be300_girq0_ack_io);
++
++	pending &= be300_girq0_mask;
++	while (pending) {
++		int bit = __ffs(pending);
++		generic_handle_irq(VRC4173_IRQ_BASE + bit);
++		pending &= ~(1u << bit);
++	}
++
++	chained_irq_exit(chip, desc);
++}
++
++/*
++ * arch_initcall: install the VRC4173 sub-IRQ chip and ioremap our MMIO
++ * windows BEFORE device_initcall. Two reasons:
++ *
++ *  1) ne_drv_probe / pata_platform_probe call request_irq(VRC4173_IRQ(0))
++ *     during device_initcall. __setup_irq returns -ENOSYS if the chip is
++ *     still no_irq_chip, so without this the drivers print
++ *     "unable to get IRQ 72 (errno=-89)" and bail.
++ *
++ *  2) be300_girq0_irq_ack writes to be300_girq0_ack_io. The ack path is
++ *     only reached once the chained handler dispatches into
++ *     handle_level_irq (late_initcall onward), so doing the ioremap here
++ *     is safe.
++ */
++static int __init be300_irq_chip_init(void)
++{
++	int i;
++
++	be300_girq0_status_io = ioremap(BE300_GIRQ0_STATUS_PA, 4);
++	be300_girq0_ack_io = ioremap(BE300_GIRQ0_ACK_PA, 4);
++	be300_girq0_cause_io = ioremap(BE300_GIRQ0_CAUSE_PA, 4);
++	if (!be300_girq0_status_io || !be300_girq0_ack_io ||
++	    !be300_girq0_cause_io)
++		return -ENOMEM;
++
++	for (i = 0; i < BE300_GIRQ0_NR_SOURCES; i++)
++		irq_set_chip_and_handler(VRC4173_IRQ_BASE + i,
++					 &be300_girq0_chip, handle_level_irq);
++
++	return 0;
++}
++arch_initcall(be300_irq_chip_init);
++
++/*
++ * late_initcall: must run AFTER vr41xx_giu_add (device_initcall) and the
++ * platform-bound giu_probe so that GIU_IRQ(0)'s irq_chip is set to the
++ * GIU's chip rather than the no_irq_chip default. arch_initcall is too
++ * early — it triggers a "irq_data->chip == &no_irq_chip" warning in
++ * irq_set_chained_handler.
++ */
++static int __init be300_irq_cascade_init(void)
++{
++	irq_set_chained_handler(GIU_IRQ(0), be300_girq0_demux);
++
++	/*
++	 * irq_set_chained_handler is supposed to call irq_startup ->
++	 * startup_giuint -> unmask_giuint_low and enable GIUINTENL bit 0,
++	 * but the 4.2.9 / VR41xx-cascade flow on this board leaves it at 0,
++	 * so giu_get_irq sees `pendl & maskl == 0` and prints
++	 * "spurious GIU interrupt" instead of dispatching GIU pin 0 to our
++	 * demux. Force GIUINTENL bit 0 = 1 directly so the cascade can
++	 * dispatch.
++	 */
++	{
++		void __iomem *inten = ioremap(BE300_GIUINTENL_PA, 4);
++		if (inten) {
++			writew(readw(inten) | 0x1, inten);
++			iounmap(inten);
++		}
++	}
++	return 0;
++}
++late_initcall(be300_irq_cascade_init);
+diff --git a/arch/mips/vr41xx/casio-be300/keys.c b/arch/mips/vr41xx/casio-be300/keys.c
+new file mode 100644
+index 0000000..3d0d267
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/keys.c
+@@ -0,0 +1,247 @@
++/*
++ * arch/mips/vr41xx/casio-be300/keys.c
++ *
++ * Polled button input driver for the Casio Cassiopeia BE-300.
++ *
++ * The BE-300 has 8 physical buttons read via two byte registers on the
++ * companion chip:
++ *   0xAA00A042 (set1): OK, ESC, UP, DOWN, RIGHT, LEFT
++ *   0xAA00A043 (set2): Rocket (modifier), Power
++ *
++ * A bit value of 1 means the button is currently pressed.
++ *
++ * Key scheme (matches the linux4.be scan_be300.c typing scheme):
++ *
++ *   plain                rocket + key
++ *   -----                ------------
++ *   OK    = Enter        Rocket+OK    = Space
++ *   ESC   = Tab          Rocket+ESC   = Backspace
++ *   UP    = Up           Rocket+UP    = next char in alphabet cycle
++ *   DOWN  = Down         Rocket+DOWN  = previous char in alphabet cycle
++ *   RIGHT = Right        Rocket+RIGHT = commit char and advance
++ *   LEFT  = Left         Rocket+LEFT  = backspace (overwrite previous char)
++ *   PWR   = Power        Rocket+PWR   = Ctrl+C
++ *
++ * The rocket+up/down "cycle" scheme works by emitting
++ *   <BACKSPACE> <new char> <LEFT>
++ * so the character under the cursor is replaced each tick and the cursor
++ * stays on top of the new char. Rocket+right moves the cursor past it to
++ * commit.
++ *
++ * Based on scan_be300.c from the linux4.be project (2002):
++ *   Marc <themaw@linux4.be>, John Roark <jroark@linux4.be>
++ *
++ * Ported to Linux 4.2.9 input_polled_dev API.
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/init.h>
++#include <linux/input.h>
++#include <linux/input-polldev.h>
++#include <asm/io.h>
++
++#define BE300_KEYS_POLL_MS	50
++#define BE300_REG_SET1		0xAA00A042
++#define BE300_REG_SET2		0xAA00A043
++
++/* Set 1 bit masks */
++#define BE300_BTN_OK		0x04
++#define BE300_BTN_ESC		0x08
++#define BE300_BTN_UP		0x10
++#define BE300_BTN_DOWN		0x20
++#define BE300_BTN_RIGHT		0x40
++#define BE300_BTN_LEFT		0x80
++
++/* Set 2 bit masks */
++#define BE300_BTN_ROCKET	0x10
++#define BE300_BTN_POWER		0x80
++
++/*
++ * Character cycle for rocket+up/down. Matches the original 48-entry
++ * scheme: a-z, space, 0-9, and punctuation. Each entry is a KEY_* code.
++ * A held rocket+up cycles through these; rocket+down goes backward.
++ */
++static const unsigned short char_keys[] = {
++	KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J,
++	KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T,
++	KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z,
++	KEY_SPACE,
++	KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,
++	KEY_GRAVE, KEY_MINUS, KEY_EQUAL, KEY_LEFTBRACE, KEY_RIGHTBRACE,
++	KEY_SEMICOLON, KEY_APOSTROPHE, KEY_BACKSLASH,
++	KEY_COMMA, KEY_DOT, KEY_SLASH,
++};
++#define NUM_CHAR_KEYS ARRAY_SIZE(char_keys)
++
++struct be300_key_state {
++	u8 prev_set1;
++	u8 prev_set2;
++	int char_pos;
++	bool pending_edit;
++};
++
++static struct be300_key_state be300_state;
++
++static void be300_tap(struct input_dev *input, unsigned short key)
++{
++	input_report_key(input, key, 1);
++	input_sync(input);
++	input_report_key(input, key, 0);
++	input_sync(input);
++}
++
++/*
++ * Emit Ctrl+C as a held-down modifier sequence:
++ *   press Ctrl, press C, release C, release Ctrl
++ */
++static void be300_ctrl_c(struct input_dev *input)
++{
++	input_report_key(input, KEY_LEFTCTRL, 1);
++	input_sync(input);
++	input_report_key(input, KEY_C, 1);
++	input_sync(input);
++	input_report_key(input, KEY_C, 0);
++	input_sync(input);
++	input_report_key(input, KEY_LEFTCTRL, 0);
++	input_sync(input);
++}
++
++static void be300_keys_poll(struct input_polled_dev *dev)
++{
++	struct input_dev *input = dev->input;
++	u8 set1 = readb((void __iomem *)BE300_REG_SET1);
++	u8 set2 = readb((void __iomem *)BE300_REG_SET2);
++	u8 changed1 = set1 ^ be300_state.prev_set1;
++	u8 changed2 = set2 ^ be300_state.prev_set2;
++	int rocket = !!(set2 & BE300_BTN_ROCKET);
++
++	/*
++	 * Detect rising edges on the main buttons. Rocket itself is treated
++	 * as a modifier and never produces an event of its own.
++	 */
++	if ((changed1 & BE300_BTN_OK) && (set1 & BE300_BTN_OK)) {
++		be300_state.pending_edit = false;
++		if (rocket)
++			be300_tap(input, KEY_SPACE);
++		else
++			be300_tap(input, KEY_ENTER);
++	}
++
++	if ((changed1 & BE300_BTN_ESC) && (set1 & BE300_BTN_ESC)) {
++		be300_state.pending_edit = false;
++		if (rocket)
++			be300_tap(input, KEY_BACKSPACE);
++		else
++			be300_tap(input, KEY_TAB);
++	}
++
++	if ((changed1 & BE300_BTN_UP) && (set1 & BE300_BTN_UP)) {
++		if (rocket) {
++			if (be300_state.pending_edit) {
++				be300_state.char_pos =
++				    (be300_state.char_pos + 1) % NUM_CHAR_KEYS;
++				be300_tap(input, KEY_BACKSPACE);
++			} else {
++				be300_state.char_pos = 0;
++				be300_state.pending_edit = true;
++			}
++			be300_tap(input, char_keys[be300_state.char_pos]);
++		} else {
++			be300_tap(input, KEY_UP);
++		}
++	}
++
++	if ((changed1 & BE300_BTN_DOWN) && (set1 & BE300_BTN_DOWN)) {
++		if (rocket) {
++			if (be300_state.pending_edit) {
++				be300_state.char_pos =
++				    (be300_state.char_pos + NUM_CHAR_KEYS - 1) %
++				    NUM_CHAR_KEYS;
++				be300_tap(input, KEY_BACKSPACE);
++			} else {
++				be300_state.char_pos = NUM_CHAR_KEYS - 1;
++				be300_state.pending_edit = true;
++			}
++			be300_tap(input, char_keys[be300_state.char_pos]);
++		} else {
++			be300_tap(input, KEY_DOWN);
++		}
++	}
++
++	if ((changed1 & BE300_BTN_RIGHT) && (set1 & BE300_BTN_RIGHT)) {
++		be300_state.pending_edit = false;
++		be300_tap(input, KEY_RIGHT);
++	}
++
++	if ((changed1 & BE300_BTN_LEFT) && (set1 & BE300_BTN_LEFT)) {
++		if (rocket) {
++			be300_state.pending_edit = false;
++			be300_tap(input, KEY_BACKSPACE);
++		} else {
++			be300_tap(input, KEY_LEFT);
++		}
++	}
++
++	if ((changed2 & BE300_BTN_POWER) && (set2 & BE300_BTN_POWER)) {
++		be300_state.pending_edit = false;
++		if (rocket)
++			be300_ctrl_c(input);
++		else
++			be300_tap(input, KEY_POWER);
++	}
++
++	/* Rocket released: commit any pending edit. */
++	if ((changed2 & BE300_BTN_ROCKET) && !(set2 & BE300_BTN_ROCKET))
++		be300_state.pending_edit = false;
++
++	be300_state.prev_set1 = set1;
++	be300_state.prev_set2 = set2;
++}
++
++static int __init be300_keys_init(void)
++{
++	struct input_polled_dev *poll_dev;
++	struct input_dev *input;
++	int i, err;
++
++	poll_dev = input_allocate_polled_device();
++	if (!poll_dev)
++		return -ENOMEM;
++
++	poll_dev->poll = be300_keys_poll;
++	poll_dev->poll_interval = BE300_KEYS_POLL_MS;
++
++	input = poll_dev->input;
++	input->name = "BE-300 Buttons";
++	input->phys = "be300/input0";
++	input->id.bustype = BUS_HOST;
++
++	__set_bit(EV_KEY, input->evbit);
++	__set_bit(KEY_ENTER, input->keybit);
++	__set_bit(KEY_TAB, input->keybit);
++	__set_bit(KEY_UP, input->keybit);
++	__set_bit(KEY_DOWN, input->keybit);
++	__set_bit(KEY_LEFT, input->keybit);
++	__set_bit(KEY_RIGHT, input->keybit);
++	__set_bit(KEY_POWER, input->keybit);
++	__set_bit(KEY_SPACE, input->keybit);
++	__set_bit(KEY_BACKSPACE, input->keybit);
++	__set_bit(KEY_LEFTCTRL, input->keybit);
++	for (i = 0; i < NUM_CHAR_KEYS; i++)
++		__set_bit(char_keys[i], input->keybit);
++
++	err = input_register_polled_device(poll_dev);
++	if (err) {
++		input_free_polled_device(poll_dev);
++		return err;
++	}
++
++	pr_info("BE-300 Buttons: polling at %dms (rocket-modifier text input)\n",
++		BE300_KEYS_POLL_MS);
++	return 0;
++}
++
++late_initcall(be300_keys_init);
+diff --git a/arch/mips/vr41xx/casio-be300/nand.c b/arch/mips/vr41xx/casio-be300/nand.c
+new file mode 100644
+index 0000000..e0b6aee
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/nand.c
+@@ -0,0 +1,446 @@
++/*
++ * arch/mips/vr41xx/casio-be300/nand.c
++ *
++ * NAND glue for the Casio BE-300. Drives the VRC4173 NAND controller's
++ * transfer engine instead of the legacy direct-I/O ports. The DIO ports live
++ * in the PCMCIA attribute-memory page and collide with NE2000 when the card
++ * window is enabled; the XFER engine does not.
++ *
++ * Hands the chip off to the in-tree plat_nand (drivers/mtd/nand/plat_nand.c)
++ * via platform_nand_data; we supply the command/address, byte/buffer I/O,
++ * readiness, chip geometry hints, and partition map.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/ioport.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/nand.h>
++#include <linux/mtd/partitions.h>
++#include <linux/platform_device.h>
++
++#define BE300_NAND_XFER_PA		0x0a00a400
++#define BE300_NAND_XFER_LEN		0x100
++#define BE300_NAND_STREAM_PA		0x0a00b000
++#define BE300_NAND_STREAM_LEN		4
++
++#define BE300_NAND_XFER_CMD		0x14
++#define BE300_NAND_XFER_ADDR		0x20
++#define BE300_NAND_XFER_ACK		0x30
++#define BE300_NAND_XFER_STATUS		0x40
++#define BE300_NAND_XFER_KICK		0x60
++#define BE300_NAND_XFER_MODE		0x64
++
++#define BE300_NAND_MODE_READ		0x05
++#define BE300_NAND_MODE_PROGRAM		0x07
++#define BE300_NAND_MODE_PROGRAM_OOB2	0x06
++
++#define BE300_NAND_PAGE_DATA		512
++#define BE300_NAND_PAGE_OOB		16
++#define BE300_NAND_PAGE_RAW		(BE300_NAND_PAGE_DATA + \
++					 BE300_NAND_PAGE_OOB)
++#define BE300_NAND_STATUS_READY		0xc0
++
++static void __iomem *be300_nand_xfer_io;
++static void __iomem *be300_nand_stream_io;
++
++static enum {
++	BE300_NAND_PHASE_NONE,
++	BE300_NAND_PHASE_ADDR,
++} be300_nand_phase;
++
++static u8 be300_nand_last_cmd;
++static u8 be300_nand_id_pos;
++static u8 be300_nand_addr_pos;
++static u16 be300_nand_area_base;
++static u16 be300_nand_read_skip;
++static bool be300_nand_read_skip_done;
++static bool be300_nand_stream_started;
++static u16 be300_nand_program_column;
++static u16 be300_nand_program_pos;
++static bool be300_nand_program_started;
++
++static inline void be300_nand_xfer_write(u32 off, u32 val)
++{
++	writel(val, be300_nand_xfer_io + off);
++}
++
++static inline u32 be300_nand_xfer_read(u32 off)
++{
++	return readl(be300_nand_xfer_io + off);
++}
++
++static void be300_nand_wait_xfer_ready(void)
++{
++	unsigned int timeout = 100000;
++
++	while (timeout-- &&
++	       !(be300_nand_xfer_read(BE300_NAND_XFER_STATUS) & 1))
++		;
++}
++
++static void be300_nand_finish_addr(void)
++{
++	if (be300_nand_phase != BE300_NAND_PHASE_ADDR)
++		return;
++
++	be300_nand_xfer_write(BE300_NAND_XFER_ACK, 0);
++	be300_nand_wait_xfer_ready();
++	be300_nand_phase = BE300_NAND_PHASE_NONE;
++}
++
++static void be300_nand_begin_addr(void)
++{
++	if (be300_nand_phase == BE300_NAND_PHASE_ADDR)
++		return;
++
++	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x06);
++	be300_nand_addr_pos = 0;
++	be300_nand_phase = BE300_NAND_PHASE_ADDR;
++}
++
++static void be300_nand_send_addr(int addr)
++{
++	u8 byte = addr;
++
++	be300_nand_begin_addr();
++	writeb(byte, be300_nand_xfer_io + BE300_NAND_XFER_ADDR);
++
++	if (be300_nand_addr_pos == 0 &&
++	    be300_nand_last_cmd == NAND_CMD_SEQIN)
++		be300_nand_program_column += byte;
++	be300_nand_addr_pos++;
++}
++
++static void be300_nand_send_command(u8 cmd)
++{
++	be300_nand_finish_addr();
++
++	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x03);
++	writeb(cmd, be300_nand_xfer_io + BE300_NAND_XFER_ADDR);
++	be300_nand_xfer_write(BE300_NAND_XFER_ACK, 0);
++	be300_nand_wait_xfer_ready();
++
++	be300_nand_last_cmd = cmd;
++	be300_nand_stream_started = false;
++	be300_nand_read_skip_done = false;
++
++	switch (cmd) {
++	case NAND_CMD_READ0:
++		be300_nand_area_base = 0;
++		be300_nand_read_skip = 0;
++		break;
++	case NAND_CMD_READ1:
++		be300_nand_area_base = 256;
++		be300_nand_read_skip = 256;
++		break;
++	case NAND_CMD_READOOB:
++		be300_nand_area_base = BE300_NAND_PAGE_DATA;
++		be300_nand_read_skip = BE300_NAND_PAGE_DATA;
++		break;
++	case NAND_CMD_SEQIN:
++		be300_nand_program_column = be300_nand_area_base;
++		be300_nand_program_pos = 0;
++		be300_nand_program_started = false;
++		break;
++	case NAND_CMD_READID:
++		be300_nand_id_pos = 0;
++		break;
++	case NAND_CMD_PAGEPROG:
++		be300_nand_program_started = false;
++		break;
++	default:
++		break;
++	}
++}
++
++static void be300_nand_cmd_ctrl(struct mtd_info *mtd, int cmd,
++				unsigned int ctrl)
++{
++	if (!be300_nand_xfer_io)
++		return;
++
++	if ((ctrl & NAND_CTRL_CHANGE) && !(ctrl & NAND_ALE))
++		be300_nand_finish_addr();
++
++	if (cmd == NAND_CMD_NONE)
++		return;
++
++	if (ctrl & NAND_ALE) {
++		be300_nand_send_addr(cmd);
++		return;
++	}
++
++	if (ctrl & NAND_CLE)
++		be300_nand_send_command(cmd);
++}
++
++static int be300_nand_dev_ready(struct mtd_info *mtd)
++{
++	return !!(be300_nand_xfer_read(BE300_NAND_XFER_STATUS) & 1);
++}
++
++static void be300_nand_start_read_stream(void)
++{
++	be300_nand_finish_addr();
++
++	if (!be300_nand_stream_started) {
++		be300_nand_xfer_write(BE300_NAND_XFER_KICK, 1);
++		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
++				       BE300_NAND_MODE_READ);
++		be300_nand_wait_xfer_ready();
++		be300_nand_stream_started = true;
++	}
++}
++
++static u8 be300_nand_stream_read_byte(void)
++{
++	return readb(be300_nand_stream_io);
++}
++
++static void be300_nand_discard_stream(unsigned int len)
++{
++	while (len >= 4) {
++		(void)readl(be300_nand_stream_io);
++		len -= 4;
++	}
++	while (len--)
++		(void)readb(be300_nand_stream_io);
++}
++
++static void be300_nand_read_buf(struct mtd_info *mtd, u8 *buf, int len)
++{
++	int i;
++
++	if (len <= 0)
++		return;
++
++	if (be300_nand_last_cmd == NAND_CMD_STATUS) {
++		memset(buf, BE300_NAND_STATUS_READY, len);
++		return;
++	}
++
++	if (be300_nand_last_cmd == NAND_CMD_READID) {
++		for (i = 0; i < len; i++) {
++			static const u8 id[] = {
++				0xec, 0x73, 0xff, 0xff,
++				0xff, 0xff, 0xff, 0xff,
++			};
++
++			if (be300_nand_id_pos < ARRAY_SIZE(id))
++				buf[i] = id[be300_nand_id_pos++];
++			else
++				buf[i] = 0xff;
++		}
++		return;
++	}
++
++	be300_nand_start_read_stream();
++	if (!be300_nand_read_skip_done) {
++		be300_nand_discard_stream(be300_nand_read_skip);
++		be300_nand_read_skip_done = true;
++	}
++
++	for (i = 0; i < len; i++)
++		buf[i] = be300_nand_stream_read_byte();
++}
++
++static unsigned char be300_nand_read_byte(struct mtd_info *mtd)
++{
++	u8 byte;
++
++	be300_nand_read_buf(mtd, &byte, 1);
++	return byte;
++}
++
++static void be300_nand_start_program_stream(void)
++{
++	if (!be300_nand_program_started) {
++		be300_nand_finish_addr();
++		be300_nand_xfer_write(BE300_NAND_XFER_KICK, 1);
++		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
++				       BE300_NAND_MODE_PROGRAM);
++		be300_nand_wait_xfer_ready();
++		be300_nand_program_started = true;
++		be300_nand_program_pos = 0;
++	}
++}
++
++static void be300_nand_stream_write_byte(u8 byte)
++{
++	if (be300_nand_program_pos >= BE300_NAND_PAGE_RAW)
++		return;
++
++	if (be300_nand_program_pos == BE300_NAND_PAGE_DATA + 8) {
++		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
++				       BE300_NAND_MODE_PROGRAM_OOB2);
++		be300_nand_wait_xfer_ready();
++	}
++
++	writeb(byte, be300_nand_stream_io);
++	be300_nand_program_pos++;
++}
++
++static void be300_nand_write_buf(struct mtd_info *mtd, const u8 *buf, int len)
++{
++	int i;
++
++	if (len <= 0 || be300_nand_last_cmd != NAND_CMD_SEQIN)
++		return;
++
++	be300_nand_start_program_stream();
++
++	while (be300_nand_program_pos < be300_nand_program_column)
++		be300_nand_stream_write_byte(0xff);
++
++	for (i = 0; i < len; i++)
++		be300_nand_stream_write_byte(buf[i]);
++}
++
++/*
++ * The emulator synthesizes OOB on the fly using Casio's NANDWRITER tag
++ * format (OOB[0..1]=0x55AA, OOB[5..6]=block_id, etc.) instead of the
++ * Linux/mainline bad-block-marker convention. With the default
++ * nand_block_bad() reading OOB[chip->badblockpos], every block reads as
++ * non-0xFF and is flagged bad, which makes JFFS2 skip the entire chip and
++ * mount an empty rootfs. Force "always good" — NAND_SKIP_BBTSCAN already
++ * suppresses the BBT build, this matches its intent for block lookups.
++ */
++static int be300_nand_block_bad(struct mtd_info *mtd, loff_t ofs, int getchip)
++{
++	return 0;
++}
++
++static int be300_nand_ctrl_probe(struct platform_device *pdev)
++{
++	/*
++	 * plat_nand sets pdev drvdata to its `struct plat_nand_data` (which
++	 * has `struct nand_chip chip` as its first member) BEFORE calling our
++	 * ctrl.probe. We exploit that to get a pointer to the nand_chip so
++	 * we can install block_bad before nand_scan() runs and walks every
++	 * block's OOB. Without this, the emulator's NANDWRITER-style synthetic
++	 * OOB makes every block look bad and JFFS2 sees an empty rootfs.
++	 */
++	struct nand_chip *chip = platform_get_drvdata(pdev);
++
++	if (chip) {
++		chip->block_bad = be300_nand_block_bad;
++		/*
++		 * plat_nand defaults ecc.mode = NAND_ECC_SOFT, which makes the
++		 * kernel verify OOB-resident parity bytes on every read. The
++		 * emulator's OOB carries NANDWRITER tags (not Hamming parity),
++		 * so every page read trips __nand_correct_data and JFFS2 sees
++		 * an unreadable chip. NAND_ECC_NONE skips the parity check; the
++		 * NAND image was built without ECC anyway.
++		 */
++		chip->ecc.mode = NAND_ECC_NONE;
++	}
++
++	be300_nand_stream_io = chip ? chip->IO_ADDR_W : NULL;
++	be300_nand_xfer_io = ioremap(BE300_NAND_XFER_PA,
++				     BE300_NAND_XFER_LEN);
++	if (!be300_nand_xfer_io)
++		return -ENOMEM;
++	return 0;
++}
++
++static void be300_nand_ctrl_remove(struct platform_device *pdev)
++{
++	if (be300_nand_xfer_io) {
++		iounmap(be300_nand_xfer_io);
++		be300_nand_xfer_io = NULL;
++	}
++	be300_nand_stream_io = NULL;
++}
++
++/*
++ * 16 MiB flash carved to mirror the layout written by tools/mk_be300_nand.py:
++ *   ptable  : the WinCE-style 8-entry partition table at NAND page 0
++ *   spl     : the stage-1 SPL B000FF container
++ *   kernel  : the flat kernel image consumed by the SPL
++ *   rootfs  : JFFS2 (the only writable region)
++ *
++ * Sizes are aligned to 16 KiB erase blocks (32 pages × 512 B).
++ */
++static struct mtd_partition be300_nand_partitions[] = {
++	{
++		.name		= "ptable",
++		.offset		= 0x000000,
++		.size		= 0x004000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "spl",
++		.offset		= 0x004000,
++		.size		= 0x010000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "kernel",
++		.offset		= 0x014000,
++		.size		= 0x4ec000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "rootfs",
++		.offset		= 0x500000,
++		.size		= 0xb00000,
++	},
++};
++
++static struct platform_nand_data be300_nand_data = {
++	.chip = {
++		.nr_chips	= 1,
++		.chip_delay	= 25,
++		.partitions	= be300_nand_partitions,
++		.nr_partitions	= ARRAY_SIZE(be300_nand_partitions),
++		/*
++		 * The emulator synthesizes OOB on the fly and doesn't
++		 * preserve the bad-block-marker convention (every block's
++		 * first OOB byte reads as something other than 0xFF), so
++		 * the kernel's bad-block scan would mark the entire chip
++		 * bad. Skip the scan; the BE-300 NAND in the emulator is
++		 * by definition perfect.
++		 */
++		.options	= NAND_SKIP_BBTSCAN,
++	},
++	.ctrl = {
++		.cmd_ctrl	= be300_nand_cmd_ctrl,
++		.dev_ready	= be300_nand_dev_ready,
++		.write_buf	= be300_nand_write_buf,
++		.read_buf	= be300_nand_read_buf,
++		.read_byte	= be300_nand_read_byte,
++		.probe		= be300_nand_ctrl_probe,
++		.remove		= be300_nand_ctrl_remove,
++	},
++};
++
++
++static struct resource be300_nand_resources[] = {
++	{
++		.start	= BE300_NAND_STREAM_PA,
++		.end	= BE300_NAND_STREAM_PA + BE300_NAND_STREAM_LEN - 1,
++		.flags	= IORESOURCE_MEM,
++	},
++};
++
++static struct platform_device be300_nand_device = {
++	.name		= "gen_nand",
++	.id		= 0,
++	.dev		= {
++		.platform_data = &be300_nand_data,
++	},
++	.num_resources	= ARRAY_SIZE(be300_nand_resources),
++	.resource	= be300_nand_resources,
++};
++
++static int __init be300_nand_init(void)
++{
++	return platform_device_register(&be300_nand_device);
++}
++arch_initcall(be300_nand_init);
+diff --git a/arch/mips/vr41xx/casio-be300/setup.c b/arch/mips/vr41xx/casio-be300/setup.c
+new file mode 100644
+index 0000000..00f43e0
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/setup.c
+@@ -0,0 +1,236 @@
++/*
++ * arch/mips/vr41xx/casio-be300/setup.c
++ *
++ * Setup for the Casio Cassiopeia BE-300.
++ *
++ * The BE-300 uses a NEC VR4131 CPU with a VRC4173 companion chip.
++ * Peripherals (serial, touchscreen, CF) are on the companion chip
++ * at 0xAA000000+, NOT on the VR4131's built-in controllers.
++ *
++ * Hardware references:
++ *   - NEC VR4131 User's Manual (uPD30131)
++ *   - NEC VRC4173 User's Manual (uPD31173)
++ *   - linux4.be project source overlays and hardware notes
++ *
++ * Copyright (C) 2002 Paul Mundt <lethal@chaoticdreams.org>
++ * Copyright (C) 2004 Linux4.BE
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/ata_platform.h>
++#include <linux/init.h>
++#include <linux/ioport.h>
++#include <linux/platform_device.h>
++
++#include <asm/io.h>
++#include <asm/idle.h>
++#include <asm/vr41xx/irq.h>
++
++/*
++ * The companion chip I/O region starts at physical 0x0A00C000.
++ * KSEG1ADDR maps it to the uncached virtual address 0xAA00C000.
++ */
++#define BE300_ISA_IO_BASE	0x0a00c000
++#define BE300_ISA_IO_SIZE	0x05ff4000
++#define BE300_ISA_IO_START	0
++#define BE300_ISA_IO_END	(BE300_ISA_IO_SIZE - 1)
++#define BE300_IO_PORT_BASE	KSEG1ADDR(BE300_ISA_IO_BASE)
++
++/*
++ * Companion chip UART at physical 0x0A008680 (virtual 0xAA008680).
++ * Register spacing is 4 bytes. This is a NEC D89041F1001, not an 8250.
++ * Used only for early printk output via prom_putchar().
++ */
++#define BE300_UART_BASE		0x0a008680
++#define BE300_UART_OFS_THR	0x00
++#define BE300_UART_OFS_LSR	0x14
++#define BE300_UART_LSR_THRE	0x20
++
++#define BE300_PCMCIA_BRIDGE_PA	0x0a00a01c
++#define BE300_PCMCIA_BRIDGE_EN	0x04
++
++static void casio_be300_wait(void)
++{
++	local_irq_enable();
++}
++
++static int __init casio_be300_setup(void)
++{
++	set_io_port_base(BE300_IO_PORT_BASE);
++	ioport_resource.start = BE300_ISA_IO_START;
++	ioport_resource.end = BE300_ISA_IO_END;
++
++	/*
++	 * Enable the VRC4173 PCMCIA bridge windows. NAND uses the XFER engine
++	 * at PA 0x0A00A4xx / 0x0A00B000, so the bridge may own the C000/D000
++	 * card windows needed by CF and NE2000 without stealing NAND I/O.
++	 */
++	{
++		void __iomem *bridge = ioremap(BE300_PCMCIA_BRIDGE_PA, 4);
++		if (bridge) {
++			writel(readl(bridge) | BE300_PCMCIA_BRIDGE_EN, bridge);
++			iounmap(bridge);
++		}
++	}
++
++	/*
++	 * Drain the VRC4173 GIRQ0 cascade source before IRQs come up.
++	 * cf_attach (--cf or --ne2000) sets state_change_pending and
++	 * irq_pending in the emulator, which would drive GIU pin 0 high
++	 * the moment local_irq_enable runs. Reading 0x0A00A03C clears
++	 * state_change_pending; writing to 0x0A000014 W1Cs the latch
++	 * and routes through cf_clear_irq() to drop irq_pending.
++	 */
++	{
++		void __iomem *cause = ioremap(0x0a00a03c, 4);
++		void __iomem *ack = ioremap(0x0a000014, 4);
++		if (cause)
++			(void)readl(cause);
++		if (ack)
++			writel(0xffffffffu, ack);
++		if (cause)
++			iounmap(cause);
++		if (ack)
++			iounmap(ack);
++	}
++
++	return 0;
++}
++
++arch_initcall(casio_be300_setup);
++
++/*
++ * The VR41xx PMU driver (subsys_initcall) sets cpu_wait to
++ * vr41xx_cpu_wait() which uses the VR41xx "standby" instruction.
++ * The BE-300 emulator doesn't wake from standby on interrupt,
++ * so override with a simple enable-and-return idle function.
++ * Must run after the PMU's subsys_initcall.
++ */
++static int __init casio_be300_idle_setup(void)
++{
++	cpu_wait = casio_be300_wait;
++	return 0;
++}
++
++device_initcall(casio_be300_idle_setup);
++
++/*
++ * Early console output via the companion chip UART.
++ * Called by the MIPS early_printk infrastructure when CONFIG_EARLY_PRINTK
++ * is enabled and "earlyprintk" is on the kernel command line.
++ */
++void prom_putchar(char c)
++{
++	volatile u8 *uart = (volatile u8 *)KSEG1ADDR(BE300_UART_BASE);
++	int timeout = 10000;
++
++	while ((uart[BE300_UART_OFS_LSR] & BE300_UART_LSR_THRE) == 0)
++		if (--timeout == 0)
++			return; /* bail if no serial cable connected */
++	uart[BE300_UART_OFS_THR] = c;
++}
++
++/*
++ * CompactFlash via pata_platform. The emulator exposes the CF taskfile
++ * registers at PA 0x0A00C170-7 with alternate-status at 0x0A00C376. The
++ * companion chip is hardwired so the data port is 8-bit and there is no
++ * register-shift; pata_platform's ioport_shift = 0 leaves the layout as
++ * cmd_addr + N for register N. Interrupt routes through GIRQ0 bit 0 ->
++ * GIU line 0 -> VRIP 8, demuxed by board/casio-be300/irq.c into
++ * VRC4173_IRQ(0). Probe will fail cleanly when the emulator is invoked
++ * without --cf (or with --ne2000, which steals the same window).
++ */
++#define BE300_CF_CMD_PA		0x0a00c170
++#define BE300_CF_CMD_LEN	8
++#define BE300_CF_CTL_PA		0x0a00c376
++#define BE300_CF_CTL_LEN	2
++
++/*
++ * No IORESOURCE_IRQ here on purpose — see casio_be300_register_devices
++ * comment. CF runs in polled mode so NE2000 can own VRC4173_IRQ(0).
++ */
++static struct resource be300_cf_resources[] = {
++	{
++		.start	= BE300_CF_CMD_PA,
++		.end	= BE300_CF_CMD_PA + BE300_CF_CMD_LEN - 1,
++		.flags	= IORESOURCE_MEM,
++	},
++	{
++		.start	= BE300_CF_CTL_PA,
++		.end	= BE300_CF_CTL_PA + BE300_CF_CTL_LEN - 1,
++		.flags	= IORESOURCE_MEM,
++	},
++};
++
++static struct pata_platform_info be300_cf_pdata = {
++	.ioport_shift	= 0,
++};
++
++static struct platform_device be300_cf_device = {
++	.name		= "pata_platform",
++	.id		= -1,
++	.num_resources	= ARRAY_SIZE(be300_cf_resources),
++	.resource	= be300_cf_resources,
++	.dev = {
++		.platform_data = &be300_cf_pdata,
++	},
++};
++
++/*
++ * NE2000 (NS8390) shares the VRC4173 PCMCIA window with CF; the emulator
++ * makes them mutually exclusive. The register file lands at port 0x300
++ * (MMIO 0xAA00C300) — the emulator routes 0xAA00C300..0xAA00C31F through
++ * ne2000_window_read/write(offset & 0x1F). We deliberately use port 0x300
++ * (and not 0x000) because do_ne_probe in drivers/net/ethernet/8390/ne.c
++ * rejects any base <= 0x1ff with -ENXIO and falls into a legacy ISA
++ * autoprobe at 0x300/0x280/0x320/0x340. With base > 0x1ff it takes the
++ * single-location fast path straight into ne_probe1.
++ */
++#define BE300_NE2000_IO_BASE	0x300
++#define BE300_NE2000_IO_LEN	0x20
++
++static struct resource be300_ne2000_resources[] = {
++	{
++		.start	= BE300_NE2000_IO_BASE,
++		.end	= BE300_NE2000_IO_BASE + BE300_NE2000_IO_LEN - 1,
++		.flags	= IORESOURCE_IO,
++	},
++	{
++		.start	= VRC4173_IRQ(0),
++		.end	= VRC4173_IRQ(0),
++		.flags	= IORESOURCE_IRQ,
++	},
++};
++
++static struct platform_device be300_ne2000_device = {
++	.name		= "ne",
++	.id		= -1,
++	.num_resources	= ARRAY_SIZE(be300_ne2000_resources),
++	.resource	= be300_ne2000_resources,
++};
++
++/*
++ * CF and NE2000 share VRC4173_IRQ(0); the emulator makes them mutually
++ * exclusive (--cf vs --ne2000). Register both pdevs unconditionally,
++ * but only NE2000 carries IORESOURCE_IRQ — pata_platform's resource
++ * list intentionally omits the IRQ so ata_host_activate goes through
++ * the polled-mode path (irq=0) and doesn't call request_irq(). That
++ * leaves IRQ 72 free for ne_probe1's exclusive request_irq() call.
++ *
++ * Trade-off: in --cf mode CF transfers are polled rather than
++ * interrupt-driven. pata_platform handles this fine (libata's
++ * ata_polling_mode kicks in when host->irq == 0).
++ */
++static struct platform_device *be300_devices[] __initdata = {
++	&be300_ne2000_device,
++	&be300_cf_device,
++};
++
++static int __init casio_be300_register_devices(void)
++{
++	return platform_add_devices(be300_devices, ARRAY_SIZE(be300_devices));
++}
++device_initcall(casio_be300_register_devices);
+diff --git a/arch/mips/vr41xx/casio-be300/sfb.c b/arch/mips/vr41xx/casio-be300/sfb.c
+new file mode 100644
+index 0000000..576b48e
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/sfb.c
+@@ -0,0 +1,345 @@
++/*
++ *  Simple frame buffer device for Casio Cassiopeia BE-300/BE-500
++ *  Copyright (C) 2004 Filip Onkelinx - Filip@linux4.be
++ *
++ *  based on linux/drivers/video/vfb.c -- Virtual frame buffer device
++ *      Copyright (C) 2002 James Simmons
++ *	Copyright (C) 1997 Geert Uytterhoeven
++ *
++ *  Ported to Linux 4.2.9 by removing soft_cursor, fixing fb_mmap
++ *  signature, and using FBINFO_DEFAULT.
++ *
++ *  This file is subject to the terms and conditions of the GNU General Public
++ *  License. See the file COPYING in the main directory of this archive for
++ *  more details.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++#include <linux/tty.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/fb.h>
++#include <linux/init.h>
++
++/*
++ * Video RAM at physical 0x0A200000 (KSEG1 virtual 0xAA200000).
++ * 240x320 display, xres_virtual=256, 16bpp.
++ * Stride = 256 * 2 = 512 bytes per line.
++ *
++ * Color format per hardware.txt: RGB565 (bits 15-11=R, 10-5=G, 4-0=B).
++ * The original sfb.c used 5-bit green (RGB555). We keep the original
++ * to match what is known to work with the emulator and real hardware.
++ * Use --sfb-5bit-green with the emulator for this format.
++ */
++#define VIDEORAM_BASE	0xaa200000
++#define VIDEOMEMSIZE	(320 * 256 * 16 / 8)
++
++static u_long videomemory;
++static u_long videomemory_phys = VIDEORAM_BASE;
++static u_long videomemorysize = VIDEOMEMSIZE;
++
++static struct fb_info fb_info;
++static u32 sfb_pseudo_palette[17];
++
++#define MAX_REGNO 15
++
++static struct fb_var_screeninfo sfb_default __initdata = {
++	.xres		= 240,
++	.yres		= 320,
++	.xres_virtual	= 256,
++	.yres_virtual	= 320,
++	.bits_per_pixel	= 16,
++	.red		= { .offset = 11, .length = 5, },
++	.green		= { .offset = 5,  .length = 6, },
++	.blue		= { .offset = 0,  .length = 5, },
++	.activate	= FB_ACTIVATE_NOW,
++	.height		= -1,
++	.width		= -1,
++	.pixclock	= 20000,
++	.left_margin	= 64,
++	.right_margin	= 64,
++	.upper_margin	= 32,
++	.lower_margin	= 32,
++	.hsync_len	= 64,
++	.vsync_len	= 2,
++	.vmode		= FB_VMODE_NONINTERLACED,
++};
++
++static struct fb_fix_screeninfo sfb_fix __initdata = {
++	.id		= "Casio BE-x00 FB",
++	.type		= FB_TYPE_PACKED_PIXELS,
++	.visual		= FB_VISUAL_TRUECOLOR,
++	.ypanstep	= 8,
++	.accel		= FB_ACCEL_NONE,
++};
++
++static int sfb_check_var(struct fb_var_screeninfo *var,
++			 struct fb_info *info);
++static int sfb_set_par(struct fb_info *info);
++static int sfb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
++			 u_int transp, struct fb_info *info);
++static int sfb_pan_display(struct fb_var_screeninfo *var,
++			   struct fb_info *info);
++static int sfb_mmap(struct fb_info *info,
++		    struct vm_area_struct *vma);
++
++static struct fb_ops sfb_ops = {
++	.owner		= THIS_MODULE,
++	.fb_check_var	= sfb_check_var,
++	.fb_set_par	= sfb_set_par,
++	.fb_setcolreg	= sfb_setcolreg,
++	.fb_pan_display	= sfb_pan_display,
++	.fb_fillrect	= cfb_fillrect,
++	.fb_copyarea	= cfb_copyarea,
++	.fb_imageblit	= cfb_imageblit,
++	.fb_mmap	= sfb_mmap,
++};
++
++static u_long get_line_length(int xres_virtual, int bpp)
++{
++	u_long length;
++
++	length = xres_virtual * bpp;
++	length = (length + 31) & ~31;
++	length >>= 3;
++	return (length);
++}
++
++static int sfb_check_var(struct fb_var_screeninfo *var,
++			 struct fb_info *info)
++{
++	u_long line_length;
++
++	if (var->vmode & FB_VMODE_CONUPDATE) {
++		var->vmode |= FB_VMODE_YWRAP;
++		var->xoffset = info->var.xoffset;
++		var->yoffset = info->var.yoffset;
++	}
++
++	if (!var->xres)
++		var->xres = 1;
++	if (!var->yres)
++		var->yres = 1;
++	if (var->xres > var->xres_virtual)
++		var->xres_virtual = var->xres;
++	if (var->yres > var->yres_virtual)
++		var->yres_virtual = var->yres;
++	if (var->bits_per_pixel <= 1)
++		var->bits_per_pixel = 1;
++	else if (var->bits_per_pixel <= 8)
++		var->bits_per_pixel = 8;
++	else if (var->bits_per_pixel <= 16)
++		var->bits_per_pixel = 16;
++	else if (var->bits_per_pixel <= 24)
++		var->bits_per_pixel = 24;
++	else if (var->bits_per_pixel <= 32)
++		var->bits_per_pixel = 32;
++	else
++		return -EINVAL;
++
++	if (var->xres_virtual < var->xoffset + var->xres)
++		var->xres_virtual = var->xoffset + var->xres;
++	if (var->yres_virtual < var->yoffset + var->yres)
++		var->yres_virtual = var->yoffset + var->yres;
++
++	line_length =
++	    get_line_length(var->xres_virtual, var->bits_per_pixel);
++	if (line_length * var->yres_virtual > videomemorysize)
++		return -ENOMEM;
++
++	switch (var->bits_per_pixel) {
++	case 1:
++	case 8:
++		var->red.offset = 0;
++		var->red.length = 8;
++		var->green.offset = 0;
++		var->green.length = 8;
++		var->blue.offset = 0;
++		var->blue.length = 8;
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		break;
++	case 16:		/* RGB 565 */
++		var->red.offset = 11;
++		var->red.length = 5;
++		var->green.offset = 5;
++		var->green.length = 6;
++		var->blue.offset = 0;
++		var->blue.length = 5;
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		break;
++	case 24:		/* RGB 888 */
++		var->red.offset = 0;
++		var->red.length = 8;
++		var->green.offset = 8;
++		var->green.length = 8;
++		var->blue.offset = 16;
++		var->blue.length = 8;
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		break;
++	case 32:		/* RGBA 8888 */
++		var->red.offset = 0;
++		var->red.length = 8;
++		var->green.offset = 8;
++		var->green.length = 8;
++		var->blue.offset = 16;
++		var->blue.length = 8;
++		var->transp.offset = 24;
++		var->transp.length = 8;
++		break;
++	}
++	var->red.msb_right = 0;
++	var->green.msb_right = 0;
++	var->blue.msb_right = 0;
++	var->transp.msb_right = 0;
++
++	return 0;
++}
++
++static int sfb_set_par(struct fb_info *info)
++{
++	info->fix.line_length = get_line_length(info->var.xres_virtual,
++						info->var.bits_per_pixel);
++	return 0;
++}
++
++static int sfb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
++			 u_int transp, struct fb_info *info)
++{
++	if (regno >= MAX_REGNO)
++		return 1;
++
++	if (info->var.grayscale) {
++		red = green = blue =
++		    (red * 77 + green * 151 + blue * 28) >> 8;
++	}
++
++#define CNVT_TOHW(val,width) ((((val)<<(width))+0x7FFF-(val))>>16)
++	switch (info->fix.visual) {
++	case FB_VISUAL_TRUECOLOR:
++	case FB_VISUAL_PSEUDOCOLOR:
++		red = CNVT_TOHW(red, info->var.red.length);
++		green = CNVT_TOHW(green, info->var.green.length);
++		blue = CNVT_TOHW(blue, info->var.blue.length);
++		transp = CNVT_TOHW(transp, info->var.transp.length);
++		break;
++	case FB_VISUAL_DIRECTCOLOR:
++		red = CNVT_TOHW(red, 8);
++		green = CNVT_TOHW(green, 8);
++		blue = CNVT_TOHW(blue, 8);
++		transp = CNVT_TOHW(transp, 8);
++		break;
++	}
++#undef CNVT_TOHW
++
++	if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
++		u32 v;
++
++		if (regno >= 16)
++			return 1;
++
++		v = (red << info->var.red.offset) |
++		    (green << info->var.green.offset) |
++		    (blue << info->var.blue.offset) |
++		    (transp << info->var.transp.offset);
++		switch (info->var.bits_per_pixel) {
++		case 8:
++			break;
++		case 16:
++		case 24:
++		case 32:
++			((u32 *) (info->pseudo_palette))[regno] = v;
++			break;
++		}
++		return 0;
++	}
++	return 0;
++}
++
++static int sfb_pan_display(struct fb_var_screeninfo *var,
++			   struct fb_info *info)
++{
++	if (var->vmode & FB_VMODE_YWRAP) {
++		if (var->yoffset < 0
++		    || var->yoffset >= info->var.yres_virtual
++		    || var->xoffset)
++			return -EINVAL;
++	} else {
++		if (var->xoffset + var->xres > info->var.xres_virtual ||
++		    var->yoffset + var->yres > info->var.yres_virtual)
++			return -EINVAL;
++	}
++	info->var.xoffset = var->xoffset;
++	info->var.yoffset = var->yoffset;
++	if (var->vmode & FB_VMODE_YWRAP)
++		info->var.vmode |= FB_VMODE_YWRAP;
++	else
++		info->var.vmode &= ~FB_VMODE_YWRAP;
++	return 0;
++}
++
++static int sfb_mmap(struct fb_info *info,
++		    struct vm_area_struct *vma)
++{
++	unsigned long len = vma->vm_end - vma->vm_start;
++	unsigned long pfn;
++
++	if (vma->vm_pgoff > (videomemorysize >> PAGE_SHIFT))
++		return -EINVAL;
++	if (len > videomemorysize - (vma->vm_pgoff << PAGE_SHIFT))
++		return -EINVAL;
++
++	/* videomemory_phys holds the KSEG1 virtual address (0xaa200000);
++	 * the physical base is the low 29 bits (0x0a200000). */
++	pfn = ((videomemory_phys & 0x1fffffff) >> PAGE_SHIFT) + vma->vm_pgoff;
++
++	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++	if (remap_pfn_range(vma, vma->vm_start, pfn, len, vma->vm_page_prot))
++		return -EAGAIN;
++
++	return 0;
++}
++
++static int __init sfb_init(void)
++{
++	fb_info.fbops = &sfb_ops;
++	videomemory = videomemory_phys;
++	fb_info.screen_base = (char *)videomemory;
++	fb_info.screen_size = videomemorysize;
++
++	fb_info.var = sfb_default;
++
++	fb_info.fix = sfb_fix;
++	fb_info.fix.smem_start = videomemory_phys;
++	fb_info.fix.smem_len = videomemorysize;
++	fb_info.fix.type_aux = 0;
++	sfb_set_par(&fb_info);
++
++	fb_info.pseudo_palette = &sfb_pseudo_palette;
++	fb_info.flags = FBINFO_DEFAULT;
++
++	fb_alloc_cmap(&fb_info.cmap, 256, 0);
++
++	if (register_framebuffer(&fb_info) < 0) {
++		printk(KERN_ERR "sfb: register_framebuffer failed\n");
++		return -EINVAL;
++	}
++
++	printk(KERN_INFO
++	       "fb%d: Casio BE-x00 frame buffer device, using %ldK of video memory\n",
++	       fb_info.node, videomemorysize >> 10);
++
++	return 0;
++}
++
++device_initcall(sfb_init);
++
++MODULE_LICENSE("GPL");
+diff --git a/arch/mips/vr41xx/casio-be300/stowaway_serio.c b/arch/mips/vr41xx/casio-be300/stowaway_serio.c
+new file mode 100644
+index 0000000..e434a57
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/stowaway_serio.c
+@@ -0,0 +1,229 @@
++/*
++ * arch/mips/vr41xx/casio-be300/stowaway_serio.c
++ *
++ * Polled serio port driver for the BE-300 emulator's --stowaway-keyboard
++ * Targus Stowaway keyboard emulation. Bridges the VRC4173 SIU at PA
++ * 0x0A008680 (16550-compatible, 4-byte register stride) to the serio bus,
++ * so the in-tree drivers/input/keyboard/stowaway.c serio_driver can decode
++ * keystrokes into input events.
++ *
++ * Wire protocol (see be300-framebuffer src/stowaway.c):
++ *   1. LCR write with bit 7 (DLAB) set      -> emulator resets state.
++ *   2. IER write with bit 3 (MSI enable)    -> emulator marks modem-wait.
++ *   3. MCR DTR=1 asserted                   -> emulator's poll loop bumps
++ *                                              modem_events_delivered.
++ *   4. MCR RTS rising edge while DTR=1 and
++ *      modem_events_delivered > 0           -> emulator queues 0xFA, 0xFD.
++ *   5. Driver consumes both bytes in order  -> emulator sets connected=true.
++ *   6. Keystrokes arrive as 8-bit scancodes; bit 7 = release.
++ *
++ * Polling cadence is 20 ms; the in-tree stowaway driver's serio_interrupt
++ * handles each scancode byte. This module owns no IRQs to keep it isolated
++ * from the VRC4173 IRQ cascade in board/casio-be300/irq.c.
++ *
++ * The same UART is used by prom_putchar in setup.c, but only for TX writes
++ * to THR. With --stowaway-keyboard the emulator's stowaway shim hijacks
++ * both directions of this port, so early-printk output is silently consumed
++ * while the keyboard is enabled. That is a deliberate trade-off; users who
++ * need serial debug should run without --stowaway-keyboard.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/serio.h>
++#include <linux/slab.h>
++#include <linux/workqueue.h>
++
++#define BE300_STOW_BASE		0x0a008680
++#define BE300_STOW_LEN		0x20	/* 8 regs * 4-byte stride */
++
++/* 16550 register offsets, scaled for 4-byte register stride. */
++#define STOW_OFS_RBR		0x00
++#define STOW_OFS_THR		0x00
++#define STOW_OFS_IER		0x04
++#define STOW_OFS_LCR		0x0c
++#define STOW_OFS_MCR		0x10
++#define STOW_OFS_LSR		0x14
++#define STOW_OFS_MSR		0x18
++
++#define STOW_LCR_8N1		0x03
++#define STOW_LCR_DLAB		0x80
++#define STOW_IER_MSI		0x08
++#define STOW_MCR_DTR		0x01
++#define STOW_MCR_RTS		0x02
++#define STOW_LSR_DR		0x01
++
++#define STOW_PROBE_ACK_0	0xfa
++#define STOW_PROBE_ACK_1	0xfd
++
++#define STOW_POLL_MS		20
++#define STOW_PROBE_GIVEUP	100	/* ticks ~ 2 s before giving up */
++
++enum stow_state {
++	STOW_INIT,
++	STOW_RTS_LOW,
++	STOW_RTS_HIGH,
++	STOW_AWAIT_ACK0,
++	STOW_AWAIT_ACK1,
++	STOW_CONNECTED,
++	STOW_GIVE_UP,
++};
++
++static void __iomem *stow_io;
++static struct serio *stow_serio;
++static struct delayed_work stow_work;
++static enum stow_state stow_state;
++static unsigned int stow_ticks;
++
++static u8 stow_readb(unsigned int ofs)
++{
++	return readb(stow_io + ofs);
++}
++
++static void stow_writeb(unsigned int ofs, u8 val)
++{
++	writeb(val, stow_io + ofs);
++}
++
++static void stow_drain_rx(void)
++{
++	while (stow_readb(STOW_OFS_LSR) & STOW_LSR_DR)
++		(void)stow_readb(STOW_OFS_RBR);
++}
++
++static void stow_reset_port(void)
++{
++	/*
++	 * DLAB=1 LCR write triggers stowaway_uart_note_port_config in the
++	 * emulator (clears connected, modem_events_delivered, RX queue).
++	 */
++	stow_writeb(STOW_OFS_LCR, STOW_LCR_8N1 | STOW_LCR_DLAB);
++	stow_writeb(STOW_OFS_LCR, STOW_LCR_8N1);
++	stow_writeb(STOW_OFS_IER, STOW_IER_MSI);
++	stow_writeb(STOW_OFS_MCR, STOW_MCR_DTR);
++	stow_drain_rx();
++}
++
++static void stow_step(struct work_struct *w)
++{
++	u8 byte;
++	bool requeue = true;
++
++	switch (stow_state) {
++	case STOW_INIT:
++		stow_reset_port();
++		stow_state = STOW_RTS_LOW;
++		stow_ticks = 0;
++		break;
++
++	case STOW_RTS_LOW:
++		stow_writeb(STOW_OFS_MCR, STOW_MCR_DTR);
++		stow_state = STOW_RTS_HIGH;
++		break;
++
++	case STOW_RTS_HIGH:
++		stow_writeb(STOW_OFS_MCR, STOW_MCR_DTR | STOW_MCR_RTS);
++		stow_state = STOW_AWAIT_ACK0;
++		break;
++
++	case STOW_AWAIT_ACK0:
++		if (stow_readb(STOW_OFS_LSR) & STOW_LSR_DR) {
++			byte = stow_readb(STOW_OFS_RBR);
++			if (byte == STOW_PROBE_ACK_0) {
++				stow_state = STOW_AWAIT_ACK1;
++			} else {
++				/* Out-of-sequence byte: try toggling again. */
++				stow_state = STOW_RTS_LOW;
++			}
++			break;
++		}
++		if (++stow_ticks >= STOW_PROBE_GIVEUP) {
++			pr_info("BE-300 Stowaway: no keyboard detected (run emulator with --stowaway-keyboard to enable)\n");
++			stow_state = STOW_GIVE_UP;
++			requeue = false;
++			break;
++		}
++		/* Re-toggle RTS until modem_events_delivered catches up. */
++		stow_state = STOW_RTS_LOW;
++		break;
++
++	case STOW_AWAIT_ACK1:
++		if (stow_readb(STOW_OFS_LSR) & STOW_LSR_DR) {
++			byte = stow_readb(STOW_OFS_RBR);
++			if (byte == STOW_PROBE_ACK_1) {
++				pr_info("BE-300 Stowaway: keyboard connected\n");
++				stow_state = STOW_CONNECTED;
++				stow_ticks = 0;
++			} else {
++				stow_state = STOW_RTS_LOW;
++			}
++			break;
++		}
++		if (++stow_ticks >= STOW_PROBE_GIVEUP) {
++			stow_state = STOW_RTS_LOW;
++			stow_ticks = 0;
++		}
++		break;
++
++	case STOW_CONNECTED:
++		while (stow_readb(STOW_OFS_LSR) & STOW_LSR_DR) {
++			byte = stow_readb(STOW_OFS_RBR);
++			serio_interrupt(stow_serio, byte, 0);
++		}
++		break;
++
++	case STOW_GIVE_UP:
++		requeue = false;
++		break;
++	}
++
++	if (requeue)
++		schedule_delayed_work(&stow_work,
++				      msecs_to_jiffies(STOW_POLL_MS));
++}
++
++static int __init be300_stowaway_init(void)
++{
++	struct serio *s;
++
++	stow_io = ioremap(BE300_STOW_BASE, BE300_STOW_LEN);
++	if (!stow_io) {
++		pr_err("BE-300 Stowaway: ioremap %#x failed\n",
++		       BE300_STOW_BASE);
++		return -ENOMEM;
++	}
++
++	s = kzalloc(sizeof(*s), GFP_KERNEL);
++	if (!s) {
++		iounmap(stow_io);
++		stow_io = NULL;
++		return -ENOMEM;
++	}
++
++	s->id.type  = SERIO_RS232;
++	s->id.proto = SERIO_STOWAWAY;
++	s->id.id    = SERIO_ANY;
++	s->id.extra = SERIO_ANY;
++	strlcpy(s->name, "BE-300 Stowaway port", sizeof(s->name));
++	strlcpy(s->phys, "vrc4173/siu0", sizeof(s->phys));
++
++	stow_serio = s;
++	stow_state = STOW_INIT;
++	stow_ticks = 0;
++
++	serio_register_port(s);
++
++	INIT_DELAYED_WORK(&stow_work, stow_step);
++	schedule_delayed_work(&stow_work, msecs_to_jiffies(STOW_POLL_MS));
++
++	pr_info("BE-300 Stowaway: probing SIU at %#x for keyboard\n",
++		BE300_STOW_BASE);
++	return 0;
++}
++late_initcall(be300_stowaway_init);
+diff --git a/arch/mips/vr41xx/casio-be300/touch_be300.c b/arch/mips/vr41xx/casio-be300/touch_be300.c
+new file mode 100644
+index 0000000..1ba9a81
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/touch_be300.c
+@@ -0,0 +1,294 @@
++/*
++ * arch/mips/vr41xx/casio-be300/touch_be300.c
++ *
++ * VRC4173 PIU (Pen Interface Unit) touchscreen driver for the Casio BE-300.
++ *
++ * Register protocol verified against the BE-300 emulator at
++ * ../be300-framebuffer/src/be300_devices.c (the DEVICE_ACCESS(be300_touch)
++ * dispatcher around line 3537 and the supporting state machine
++ * piu_update_state() / piu_latch_sample() / piu_store_page_sample()).
++ * The emulator is the authoritative protocol reference because the VRC4173
++ * UM leaves several edge cases under-specified (W1C-on-low-byte status,
++ * coordinate page valid latching, scan-restart on data-lost ack).
++ *
++ *   PIU MMIO base: PA 0x0A000300, size 0x60
++ *
++ *   +0x00 PIUCNTREG  (16-bit, RW with masks)
++ *      bits 9:0   writable control (mask 0x03FE on write; bit 0 self-clears
++ *                 as the scan-start command kick)
++ *      bits 12:10 PADSTATE (RO, scan sequencer state — see VRC4173 UM §9.2)
++ *      bit  13    pendown status (RO, reflects host pen-down OR latched
++ *                 PENSTC while PENCHGINTR is set)
++ *
++ *   +0x04 PIUINTREG  (16-bit)
++ *      bits 7:0   pending status (set by HW, W1C by driver)
++ *         bit 0  PENCHGINTR  — pen up/down change
++ *         bit 2  PADDLOSTINTR — coordinate buffer overrun
++ *         bit 3  PADPAGE0INTR — page 0 buffer ready
++ *         bit 4  PADPAGE1INTR — page 1 buffer ready
++ *      bits 15:8  interrupt mask (RW; 1 = unmasked)
++ *
++ *   +0x08..+0x18 PIU configuration registers (scan interval, stable count
++ *      etc.). We program them with VRC4173 UM defaults — the emulator
++ *      tolerates anything here, real hardware needs the documented values.
++ *
++ *   +0x20..+0x2C  page-0 ADC sample buffers (y+, y-, x-, x+, each u16)
++ *   +0x50..+0x5C  page-1 ADC sample buffers (same layout)
++ *
++ * IRQ cascade:
++ *   SYSINT1 bit 8 (GIU)                              [arch/mips/vr41xx/common/icu]
++ *      -> GIU pin 0 (GIU_IRQ(0))                     [arch/mips/vr41xx/common/giu]
++ *           -> VRC4173 GIRQ0 status @ PA 0x0A000004 bit 9   [board/casio-be300/irq.c]
++ *                -> VRC4173_IRQ_BASE + 9 = VRC4173_IRQ(9)
++ *
++ * Coordinate decoding:
++ *   The emulator maps host (x, y) into a fixed ADC range per channel:
++ *     y+ in [0x81E1, 0x8E30]  linear with y in [0, 358]
++ *     x+ in [0x8300, 0x8D1B]  linear with x in [0, 239]
++ *   We invert that here using y+ and x+ alone (channels 0 and 3); the
++ *   redundant y- / x- channels (1, 2) are ignored. On real hardware the
++ *   four-channel form would be y = (y+ - y-)/2-ish, but VRC4173 already
++ *   averages internally — taking one channel matches what the emulator
++ *   produces and what the touchscreen panel layout encodes.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/slab.h>
++
++#include <asm/vr41xx/irq.h>
++
++#define BE300_PIU_BASE_PA	0x0a000300
++#define BE300_PIU_SIZE		0x60
++
++#define PIU_CNTREG		0x00
++#define PIU_INTREG		0x04
++#define PIU_SIVL		0x08	/* scan interval */
++#define PIU_STBL		0x0c	/* stable count */
++#define PIU_CMD			0x10	/* sample command */
++#define PIU_ASCN		0x14
++#define PIU_CIVL		0x18	/* conversion interval */
++#define PIU_PB00		0x20	/* page 0 ADC: y+ */
++#define PIU_PB01		0x24	/* page 0 ADC: y- */
++#define PIU_PB02		0x28	/* page 0 ADC: x- */
++#define PIU_PB03		0x2c	/* page 0 ADC: x+ */
++#define PIU_PB10		0x50	/* page 1 ADC: y+ */
++#define PIU_PB11		0x54
++#define PIU_PB12		0x58
++#define PIU_PB13		0x5c
++
++/* PIUCNTREG control bits (VRC4173 UM §9.7). */
++#define PIUCNT_PIUSEN		0x0001	/* scan-start kick (self-clearing) */
++#define PIUCNT_PIUPWR		0x0002	/* power on */
++#define PIUCNT_PADATSTART	0x0004	/* enable data scan */
++#define PIUCNT_PADATSTOP	0x0008
++#define PIUCNT_PADWAITPEN	0x0010	/* wait-for-pen-touch state enable */
++#define PIUCNT_PEN_DETECTED	0x2000
++
++/* PIUINTREG pending bits (low byte). */
++#define PIUINT_PENCHGINTR	0x0001
++#define PIUINT_PADDLOSTINTR	0x0004
++#define PIUINT_PADPAGE0INTR	0x0008
++#define PIUINT_PADPAGE1INTR	0x0010
++#define PIUINT_TOUCH_DATA	(PIUINT_PADPAGE0INTR | PIUINT_PADPAGE1INTR)
++#define PIUINT_PENDING_ALL	(PIUINT_PENCHGINTR | PIUINT_PADDLOSTINTR | \
++				 PIUINT_TOUCH_DATA)
++
++/* ADC linear ranges from be300-framebuffer/src/be300_devices.c:3192. */
++#define PIU_ADC_Y_MIN		0x81E1u
++#define PIU_ADC_Y_MAX		0x8E30u
++#define PIU_ADC_X_MIN		0x8300u
++#define PIU_ADC_X_MAX		0x8D1Bu
++
++#define BE300_TOUCH_WIDTH	240
++#define BE300_TOUCH_HEIGHT	320
++
++struct be300_touch {
++	void __iomem *base;
++	struct input_dev *input;
++	int irq;
++	bool pen_down;
++};
++
++static struct be300_touch *be300_touch_dev;
++
++static u16 piu_read(struct be300_touch *t, unsigned off)
++{
++	return readw(t->base + off);
++}
++
++static void piu_write(struct be300_touch *t, unsigned off, u16 val)
++{
++	writew(val, t->base + off);
++}
++
++static void piu_decode_page(struct be300_touch *t, unsigned page_off,
++			    int *out_x, int *out_y)
++{
++	u16 yp = piu_read(t, page_off + 0x00);
++	u16 xp = piu_read(t, page_off + 0x0c);
++	int x, y;
++
++	if (yp < PIU_ADC_Y_MIN)
++		yp = PIU_ADC_Y_MIN;
++	if (yp > PIU_ADC_Y_MAX)
++		yp = PIU_ADC_Y_MAX;
++	if (xp < PIU_ADC_X_MIN)
++		xp = PIU_ADC_X_MIN;
++	if (xp > PIU_ADC_X_MAX)
++		xp = PIU_ADC_X_MAX;
++
++	y = ((int)(yp - PIU_ADC_Y_MIN) * (BE300_TOUCH_HEIGHT - 1))
++		/ (PIU_ADC_Y_MAX - PIU_ADC_Y_MIN);
++	x = ((int)(xp - PIU_ADC_X_MIN) * (BE300_TOUCH_WIDTH - 1))
++		/ (PIU_ADC_X_MAX - PIU_ADC_X_MIN);
++
++	if (x < 0)
++		x = 0;
++	if (x >= BE300_TOUCH_WIDTH)
++		x = BE300_TOUCH_WIDTH - 1;
++	if (y < 0)
++		y = 0;
++	if (y >= BE300_TOUCH_HEIGHT)
++		y = BE300_TOUCH_HEIGHT - 1;
++
++	*out_x = x;
++	*out_y = y;
++}
++
++static irqreturn_t be300_touch_isr(int irq, void *dev)
++{
++	struct be300_touch *t = dev;
++	u16 status = piu_read(t, PIU_INTREG);
++	u16 pending = status & 0xff;
++	u16 mask = status >> 8;
++	u16 effective = pending & mask;
++	u16 ack = 0;
++	int x, y;
++
++	if (!effective)
++		return IRQ_NONE;
++
++	if (effective & PIUINT_PENCHGINTR) {
++		bool down = !!(piu_read(t, PIU_CNTREG) & PIUCNT_PEN_DETECTED);
++		t->pen_down = down;
++		input_report_key(t->input, BTN_TOUCH, down ? 1 : 0);
++		if (!down) {
++			input_report_abs(t->input, ABS_PRESSURE, 0);
++		}
++		input_sync(t->input);
++		ack |= PIUINT_PENCHGINTR;
++	}
++
++	if (effective & PIUINT_PADPAGE0INTR) {
++		piu_decode_page(t, PIU_PB00, &x, &y);
++		input_report_abs(t->input, ABS_X, x);
++		input_report_abs(t->input, ABS_Y, y);
++		input_report_abs(t->input, ABS_PRESSURE, t->pen_down ? 1 : 0);
++		input_sync(t->input);
++		ack |= PIUINT_PADPAGE0INTR;
++	}
++
++	if (effective & PIUINT_PADPAGE1INTR) {
++		piu_decode_page(t, PIU_PB10, &x, &y);
++		input_report_abs(t->input, ABS_X, x);
++		input_report_abs(t->input, ABS_Y, y);
++		input_report_abs(t->input, ABS_PRESSURE, t->pen_down ? 1 : 0);
++		input_sync(t->input);
++		ack |= PIUINT_PADPAGE1INTR;
++	}
++
++	if (effective & PIUINT_PADDLOSTINTR) {
++		/* coordinate buffer overrun — ack and let the scan re-arm */
++		ack |= PIUINT_PADDLOSTINTR;
++	}
++
++	/* W1C the bits we serviced; preserve the high-byte mask. */
++	if (ack)
++		piu_write(t, PIU_INTREG, (mask << 8) | ack);
++
++	return IRQ_HANDLED;
++}
++
++static int __init be300_touch_init(void)
++{
++	struct be300_touch *t;
++	int err;
++
++	t = kzalloc(sizeof(*t), GFP_KERNEL);
++	if (!t)
++		return -ENOMEM;
++
++	t->base = ioremap_nocache(BE300_PIU_BASE_PA, BE300_PIU_SIZE);
++	if (!t->base) {
++		err = -ENOMEM;
++		goto fail_free;
++	}
++
++	t->input = input_allocate_device();
++	if (!t->input) {
++		err = -ENOMEM;
++		goto fail_unmap;
++	}
++
++	t->input->name = "BE-300 PIU touchscreen";
++	t->input->phys = "vrc4173-piu/input0";
++	t->input->id.bustype = BUS_HOST;
++	t->input->id.vendor = 0x1033;	/* NEC */
++	t->input->id.product = 0x4173;
++	t->input->id.version = 0x0001;
++
++	__set_bit(EV_KEY, t->input->evbit);
++	__set_bit(EV_ABS, t->input->evbit);
++	__set_bit(BTN_TOUCH, t->input->keybit);
++	input_set_abs_params(t->input, ABS_X, 0, BE300_TOUCH_WIDTH - 1, 0, 0);
++	input_set_abs_params(t->input, ABS_Y, 0, BE300_TOUCH_HEIGHT - 1, 0, 0);
++	input_set_abs_params(t->input, ABS_PRESSURE, 0, 1, 0, 0);
++
++	err = input_register_device(t->input);
++	if (err)
++		goto fail_input_free;
++
++	t->irq = VRC4173_IRQ_BASE + 9;
++	err = request_irq(t->irq, be300_touch_isr, 0, "be300-touch", t);
++	if (err)
++		goto fail_unregister;
++
++	/*
++	 * Configure PIU defaults from VRC4173 UM §9 idle dump
++	 * (docs/hardware/hw_dump_vrc4173.txt:983) and enable PENCHG +
++	 * page 0/1 + datalost interrupts. PIUSEN (bit 0) is the scan-start
++	 * kick — hardware self-clears it.
++	 */
++	piu_write(t, PIU_SIVL, 0x05DC);
++	piu_write(t, PIU_STBL, 0x00C8);
++	piu_write(t, PIU_INTREG, (PIUINT_PENDING_ALL << 8) | 0);
++	piu_write(t, PIU_CNTREG,
++		  PIUCNT_PIUSEN | PIUCNT_PIUPWR |
++		  PIUCNT_PADATSTART | PIUCNT_PADWAITPEN);
++
++	be300_touch_dev = t;
++	pr_info("be300-touch: registered, irq=%d, base=%pa\n",
++		t->irq, &t->base);
++	return 0;
++
++fail_unregister:
++	input_unregister_device(t->input);
++	t->input = NULL;
++fail_input_free:
++	if (t->input)
++		input_free_device(t->input);
++fail_unmap:
++	iounmap(t->base);
++fail_free:
++	kfree(t);
++	return err;
++}
++late_initcall(be300_touch_init);

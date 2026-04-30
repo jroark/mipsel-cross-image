@@ -95,3 +95,115 @@ DI __fixdfdi(double d)              { return (DI)d; }
 UDI __fixunsdfdi(double d)          { return (UDI)d; }
 double __floatdidf(DI i)            { return (double)i; }
 double __floatundidf(UDI i)         { return (double)i; }
+
+SI __clzsi2(USI x)
+{
+	SI n = 0;
+	USI bit = 0x80000000u;
+
+	if (!x)
+		return 32;
+	while (!(x & bit)) {
+		n++;
+		bit >>= 1;
+	}
+	return n;
+}
+
+SI __ctzsi2(USI x)
+{
+	SI n = 0;
+
+	if (!x)
+		return 32;
+	while (!(x & 1u)) {
+		n++;
+		x >>= 1;
+	}
+	return n;
+}
+
+SI __popcountsi2(USI x)
+{
+	SI n = 0;
+
+	while (x) {
+		n += x & 1u;
+		x >>= 1;
+	}
+	return n;
+}
+
+SI __paritysi2(USI x)
+{
+	return __popcountsi2(x) & 1;
+}
+
+SI __ffssi2(USI x)
+{
+	SI n = 1;
+
+	if (!x)
+		return 0;
+	while (!(x & 1u)) {
+		n++;
+		x >>= 1;
+	}
+	return n;
+}
+
+SI __clzdi2(UDI x)
+{
+	SI n = 0;
+	UDI bit = (UDI)1 << 63;
+
+	if (!x)
+		return 64;
+	while (!(x & bit)) {
+		n++;
+		bit >>= 1;
+	}
+	return n;
+}
+
+SI __ctzdi2(UDI x)
+{
+	SI n = 0;
+
+	if (!x)
+		return 64;
+	while (!(x & 1u)) {
+		n++;
+		x >>= 1;
+	}
+	return n;
+}
+
+SI __popcountdi2(UDI x)
+{
+	SI n = 0;
+
+	while (x) {
+		n += x & 1u;
+		x >>= 1;
+	}
+	return n;
+}
+
+SI __paritydi2(UDI x)
+{
+	return __popcountdi2(x) & 1;
+}
+
+SI __ffsdi2(UDI x)
+{
+	SI n = 1;
+
+	if (!x)
+		return 0;
+	while (!(x & 1u)) {
+		n++;
+		x >>= 1;
+	}
+	return n;
+}

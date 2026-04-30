@@ -3,6 +3,7 @@ set -e
 
 KERNEL_SOURCE_URL="http://distro.ibiblio.org/tinycorelinux/7.x/x86/release/src/kernel/linux-4.2.9-patched.tar.xz"
 BUSYBOX_VERSION="1.24.2"
+KERNEL_PATCH_SERIES="/work/patches/linux-4.2.9/be300/series"
 
 ###############################################################################
 # Phase 0a: Rebuild musl with -march=mips2 (no SPECIAL2 mul instruction)
@@ -14,16 +15,34 @@ BUSYBOX_VERSION="1.24.2"
 # Rebuild with -march=mips2 which uses only mult/mflo.
 
 MUSL_MIPS2="/work/musl-mipsel"
-if ! mipsel-linux-gnu-objdump -d "$MUSL_MIPS2/lib/libc.a" 2>/dev/null \
-        | grep -qE '^[[:space:]]+[0-9a-f]+:[[:space:]]+[0-9a-f]+[[:space:]]+mul[[:space:]]'; then
-    echo "--- musl-mipsel already mul-free, skipping rebuild ---"
+MUSL_SRC="/work/musl-1.2.5"
+
+unsupported_mips2_insn() {
+    mipsel-linux-gnu-objdump -d "$1" 2>/dev/null \
+        | awk '$3 ~ /^(mul|clz|clo|ext|ins|seb|seh|wsbh|rdhwr)$/ {print; exit}' || true
+}
+
+MUSL_BAD_INSN=""
+if [ -f "$MUSL_MIPS2/lib/libc.a" ]; then
+    MUSL_BAD_INSN=$(unsupported_mips2_insn "$MUSL_MIPS2/lib/libc.a")
+else
+    MUSL_BAD_INSN="missing libc.a"
+fi
+
+if [ -z "$MUSL_BAD_INSN" ] \
+        && [ -f "$MUSL_SRC/arch/mips/pthread_arch.h" ] \
+        && grep -q "__be300_mips_tp" "$MUSL_SRC/arch/mips/pthread_arch.h"; then
+    echo "--- musl-mipsel already MIPS2-compatible, skipping rebuild ---"
 else
     echo "=== Phase 0a: Rebuilding musl-mipsel with -march=mips2 ==="
-    MUSL_SRC="/work/musl-1.2.5"
     if [ ! -d "$MUSL_SRC" ]; then
         cd /work
         tar xf musl-1.2.5.tar.gz
     fi
+    cp /work/board/casio-be300/musl_mips_pthread_arch.h \
+        "$MUSL_SRC/arch/mips/pthread_arch.h"
+    cp /work/board/casio-be300/musl_mips_set_thread_area.c \
+        "$MUSL_SRC/src/thread/__set_thread_area.c"
     cd "$MUSL_SRC"
     make distclean 2>/dev/null || true
     # Explicitly set cross tools so musl doesn't try mipsel-linux-musl-*
@@ -52,17 +71,14 @@ if [ ! -d "$KHDRS/include/linux" ]; then
     echo "=== Phase 0: Installing sanitized kernel headers for musl ==="
     # Use a separate untar to avoid touching the kernel build tree we will
     # configure later (the kernel tree gets blown away in Phase 2).
-    mkdir -p /tmp/khdrs_src
-    if [ ! -d /tmp/khdrs_src/linux-4.2.9 ]; then
-        tar xf /work/linux-4.2.9-patched.tar.xz -C /tmp/khdrs_src
+    if [ ! -f /work/linux-4.2.9-patched.tar.xz ]; then
+        (cd /work && wget "$KERNEL_SOURCE_URL")
     fi
-    # libc-compat.h in 4.2.9 only handles __GLIBC__. Musl sets _NETINET_IN_H
-    # in its <netinet/in.h> too, so widen the outer guard so the inner
-    # _NETINET_IN_H check applies for any libc. Without this, including
-    # both musl's netinet/in.h and linux/in.h conflicts on sockaddr_in,
-    # in_addr, etc. — which is what blocks BusyBox networking applets.
-    sed -i 's@^#if defined(__GLIBC__)$@#if defined(__GLIBC__) || defined(_NETINET_IN_H)@' \
-        /tmp/khdrs_src/linux-4.2.9/include/uapi/linux/libc-compat.h
+    mkdir -p /tmp/khdrs_src
+    rm -rf /tmp/khdrs_src/linux-4.2.9
+    tar xf /work/linux-4.2.9-patched.tar.xz -C /tmp/khdrs_src
+    /work/scripts/apply_patch_series.sh "$KERNEL_PATCH_SERIES" \
+        /tmp/khdrs_src/linux-4.2.9
     rm -rf "$KHDRS"
     mkdir -p "$KHDRS"
     make -C /tmp/khdrs_src/linux-4.2.9 \
@@ -95,6 +111,16 @@ enable_busybox_config() {
         sed -i "s/^${cfg}=n/${cfg}=y/" .config
     elif ! grep -q "^${cfg}=" .config; then
         echo "${cfg}=y" >> .config
+    fi
+}
+
+set_busybox_string_config() {
+    cfg="$1"
+    val="$2"
+    if grep -q "^${cfg}=" .config; then
+        sed -i "s@^${cfg}=.*@${cfg}=\"${val}\"@" .config
+    else
+        echo "${cfg}=\"${val}\"" >> .config
     fi
 }
 
@@ -132,12 +158,16 @@ for cfg in CONFIG_BRCTL CONFIG_DNSD CONFIG_FAKEIDENTD CONFIG_FTPD \
     sed -i "s/^${cfg}=y/${cfg}=n/" .config
 done
 
+MUSL_SPECS="/work/musl-mipsel/lib/musl-gcc.specs"
+set_busybox_string_config CONFIG_EXTRA_CFLAGS "-march=mips2 -specs $MUSL_SPECS -isystem $KHDRS/include"
+set_busybox_string_config CONFIG_EXTRA_LDFLAGS "-B/tmp/libgcc_patched -L/tmp/libgcc_patched"
+set_busybox_string_config CONFIG_EXTRA_LDLIBS ""
+
 yes "" | make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- oldconfig
 
 # Build with musl + mips32 (no r2 instructions). Use musl-gcc wrapper
 # via -specs. -nostdinc on the existing headers is not needed since musl
 # specs handle include paths.
-MUSL_SPECS="/work/musl-mipsel/lib/musl-gcc.specs"
 # musl doesn't ship Linux UAPI headers (linux/*.h); use sanitized headers
 # from linux-4.2.9 via `make headers_install` (see Phase 0 above).
 # Patched libgcc.a: the stock libgcc (from the mips32r2 cross toolchain)
@@ -152,17 +182,25 @@ cp "$LIBGCC_ORIG" /tmp/libgcc_patched/libgcc.a
 mipsel-linux-gnu-ar d /tmp/libgcc_patched/libgcc.a \
     _divdi3.o _moddi3.o _udivdi3.o _umoddi3.o \
     _fixdfdi.o _fixunsdfdi.o _floatdidf.o _floatundidf.o \
-    _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o \
-    2>/dev/null || true
+	    _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o \
+	    _clzsi2.o _clzdi2.o _ctzsi2.o _ctzdi2.o \
+	    _popcountsi2.o _popcountdi2.o _paritysi2.o _paritydi2.o \
+	    _ffssi2.o _ffsdi2.o \
+	    2>/dev/null || true
 # Compile our replacements with -march=mips2 and add them to the patched archive
 mipsel-linux-gnu-gcc -march=mips2 -O2 -c -o /tmp/libgcc_helpers.o \
     /work/board/casio-be300/libgcc_helpers.c
 mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libgcc.a /tmp/libgcc_helpers.o
+mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libbe300gcc.a /tmp/libgcc_helpers.o
 
-make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- \
-    EXTRA_CFLAGS="-march=mips2 -specs $MUSL_SPECS -isystem $KHDRS/include" \
-    EXTRA_LDFLAGS="-specs $MUSL_SPECS -B/tmp/libgcc_patched" \
-    busybox -j$(nproc) 2>&1 | tail -5
+if ! grep -q 'BE300_FORCE_OBJECTS' scripts/trylink; then
+    sed -i '/\$START_GROUP \$O_FILES \$A_FILES \$END_GROUP \\/a\
+		$BE300_FORCE_OBJECTS \\' scripts/trylink
+fi
+
+export BE300_FORCE_OBJECTS="/tmp/libgcc_helpers.o"
+make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- busybox -j$(nproc) 2>&1 | tail -5
+unset BE300_FORCE_OBJECTS
 ls -l busybox
 mipsel-linux-gnu-strip busybox
 
@@ -180,6 +218,7 @@ mipsel-linux-gnu-gcc -march=mips2 -O2 -static \
     -specs "$MUSL_SPECS" -isystem "$KHDRS/include" \
     -B/tmp/libgcc_patched \
     /work/board/casio-be300/fb_mmap_test.c \
+    /tmp/libgcc_helpers.o \
     -o /tmp/fb_mmap_test
 mipsel-linux-gnu-strip /tmp/fb_mmap_test
 cp /tmp/fb_mmap_test "$ROOTFS/bin/fb_mmap_test"
@@ -190,6 +229,7 @@ mipsel-linux-gnu-gcc -march=mips2 -O2 -static \
     -specs "$MUSL_SPECS" -isystem "$KHDRS/include" \
     -B/tmp/libgcc_patched \
     /work/board/casio-be300/touch_query_test.c \
+    /tmp/libgcc_helpers.o \
     -o /tmp/touch_query_test
 mipsel-linux-gnu-strip /tmp/touch_query_test
 cp /tmp/touch_query_test "$ROOTFS/bin/touch_query_test"
@@ -243,13 +283,18 @@ cd /work/microwindows/src
 cp Configs/config.be300 config
 make clean >/dev/null 2>&1 || true
 MW_CC="mipsel-linux-gnu-gcc -march=mips2 -mfpxx -specs $MUSL_SPECS -isystem $KHDRS/include -B/tmp/libgcc_patched"
-make -j$(nproc) MIPSTOOLSPREFIX="" \
-    COMPILER=gcc \
-    CC="$MW_CC" \
-    AR="mipsel-linux-gnu-ar" \
-    LDFLAGS="-static" \
-    EXTRAFLAGS="" \
-    2>&1 | tail -3 || true
+MW_BUILD_LOG=/tmp/microwindows_be300_build.log
+if ! make -j$(nproc) MIPSTOOLSPREFIX="" \
+        COMPILER=gcc \
+        CC="$MW_CC" \
+        AR="mipsel-linux-gnu-ar" \
+        LDFLAGS="-static" \
+        EXTRAFLAGS="" \
+        >"$MW_BUILD_LOG" 2>&1; then
+    tail -40 "$MW_BUILD_LOG"
+    exit 1
+fi
+tail -3 "$MW_BUILD_LOG"
 echo "--- Microwindows artifacts ---"
 ls -la /work/microwindows/src/lib/libnano-X.a /work/microwindows/src/bin/demo-hello 2>/dev/null
 # Stage demo-hello into rootfs (stripped, ~400 KB)
@@ -282,7 +327,8 @@ done
 mipsel-linux-gnu-gcc -march=mips2 -Os -static \
     -specs "$MUSL_SPECS" -isystem "$KHDRS/include" \
     -B/tmp/libgcc_patched \
-    -o /tmp/be300-wget /work/board/casio-be300/be300_wget.c
+    -o /tmp/be300-wget /work/board/casio-be300/be300_wget.c \
+    /tmp/libgcc_helpers.o
 mipsel-linux-gnu-strip /tmp/be300-wget
 /bin/rm -f "$ROOTFS/bin/wget"
 cp /tmp/be300-wget "$ROOTFS/bin/wget"
@@ -745,272 +791,17 @@ tar xf linux-4.2.9-patched.tar.xz
 cd linux-4.2.9
 
 ###############################################################################
-# Phase 3: Apply GCC 10+/11+ compatibility fixes
+# Phase 3: Apply BE-300 kernel patch series
 ###############################################################################
 
-echo "=== Phase 3: Applying GCC compatibility fixes ==="
-
-# FIX 1: multiple definition of 'yylloc' (GCC 10+)
-if [ -f scripts/dtc/dtc-lexer.lex.c_shipped ]; then
-    sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.lex.c_shipped
-fi
-
-# FIX 2: GCC 11+ noreturn/const conflict in log2.h
-find . -name "log2.h" -exec sed -i \
-    's/____ilog2_NaN(void) __attribute__((noreturn, const))/____ilog2_NaN(void) __attribute__((noreturn))/g' {} +
-
-# FIX 3: Disable -Werror
-grep -rl "\-Werror" . | xargs sed -i 's/\-Werror\([[:space:]]\|$\)/ /g' || true
-grep -rl "\-Werror" . | xargs sed -i 's/=\-Werror/=/g' || true
-
-###############################################################################
-# Phase 4: Inject BE300 board support
-###############################################################################
-
-echo "=== Phase 4: Injecting BE300 board support ==="
-
-# Copy board support files (setup.c, sfb.c framebuffer, nand.c MTD glue,
-# irq.c GIRQ0 demuxer, keys.c button driver, Makefile)
-mkdir -p arch/mips/vr41xx/casio-be300
-cp /work/board/casio-be300/setup.c arch/mips/vr41xx/casio-be300/
-cp /work/board/casio-be300/sfb.c arch/mips/vr41xx/casio-be300/
-cp /work/board/casio-be300/keys.c arch/mips/vr41xx/casio-be300/
-cp /work/board/casio-be300/nand.c arch/mips/vr41xx/casio-be300/
-cp /work/board/casio-be300/irq.c arch/mips/vr41xx/casio-be300/
-cp /work/board/casio-be300/stowaway_serio.c arch/mips/vr41xx/casio-be300/
-cp /work/board/casio-be300/touch_be300.c arch/mips/vr41xx/casio-be300/
-cp /work/board/casio-be300/Makefile arch/mips/vr41xx/casio-be300/
-
-# Slow down kernel auto-repeat for the in-tree Stowaway keyboard driver.
-# Defaults are REP_DELAY=250ms / REP_PERIOD=33ms (~30 Hz), which feels
-# runaway-fast on the BE-300's slow framebuffer console. Set 400ms delay
-# and 100ms period (10 Hz) on the input device right after EV_REP is
-# advertised in skbd_connect.
-sed -i 's@input_dev->evbit\[0\] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP);@&\n\tinput_dev->rep[REP_DELAY] = 400;\n\tinput_dev->rep[REP_PERIOD] = 100;@' \
-    drivers/input/keyboard/stowaway.c
-
-# Patch Kconfig: add CASIO_BE300 entry before endchoice
-if ! grep -q "CASIO_BE300" arch/mips/vr41xx/Kconfig; then
-    sed -i '/^endchoice$/i\
-config CASIO_BE300\
-\tbool "CASIO CASSIOPEIA BE-300"\
-\tselect CEVT_R4K\
-\tselect CSRC_R4K\
-\tselect DMA_NONCOHERENT\
-\tselect IRQ_MIPS_CPU\
-\tselect ISA\
-\tselect HAVE_PATA_PLATFORM\
-\tselect SYS_SUPPORTS_32BIT_KERNEL\
-\tselect SYS_SUPPORTS_LITTLE_ENDIAN\
-\tselect SYS_HAS_EARLY_PRINTK\
-\tselect FB_CFB_FILLRECT if FB\
-\tselect FB_CFB_COPYAREA if FB\
-\tselect FB_CFB_IMAGEBLIT if FB\
-\tselect INPUT_POLLDEV\
-' arch/mips/vr41xx/Kconfig
-fi
-
-# Add BE300 memory region in prom_init (common/init.c doesn't add memory,
-# and mem= on command line seems to cause the kernel to allocate pages
-# beyond physical RAM). Add explicit add_memory_region call.
-# Register 16MB RAM.
-sed -i '/^void __init prom_init(void)$/,/^}$/{
-  /^}$/i\
-\tadd_memory_region(0, 16 << 20, BOOT_MEM_RAM);
-}' arch/mips/vr41xx/common/init.c
-
-# The ~20 "Bad page state" pages have nonzero mapcount from an unknown
-# source. Rather than hiding the symptom, reserve them so they're never
-# allocated. Mark them as reserved during mem_init so the buddy allocator
-# skips them entirely.
-#
-# Root cause: unknown. The corrupted PFNs scale with registered memory
-# size (always the top ~2MB). Needs further investigation but reserving
-# them prevents corrupted pages from being handed to userspace.
-cat >> arch/mips/mm/init.c << 'BADPAGE_FIX'
-
-/* BE300: Reserve pages with corrupted state so buddy allocator skips them */
-#include <linux/mm.h>
-static void __init be300_reserve_bad_pages(void)
-{
-	unsigned long pfn;
-	int count = 0;
-
-	for (pfn = 0; pfn < max_mapnr; pfn++) {
-		struct page *page = pfn_to_page(pfn);
-		if (page_mapcount(page) != 0) {
-			SetPageReserved(page);
-			init_page_count(page);
-			page_mapcount_reset(page);
-			count++;
-		}
-	}
-	if (count)
-		pr_info("BE300: reserved %d pages with bad mapcount\n", count);
-}
-BADPAGE_FIX
-
-# Add forward declaration and call before free_all_bootmem
-sed -i '/free_all_bootmem/{
-  i\
-\t{ extern void be300_reserve_bad_pages(void); be300_reserve_bad_pages(); }
-}' arch/mips/mm/init.c
-# Remove 'static' from the function definition
-sed -i 's/static void __init be300_reserve_bad_pages/void __init be300_reserve_bad_pages/' arch/mips/mm/init.c
-
-# Force clear_page and copy_page to use 32-bit stores (sw) instead of
-# 64-bit stores (sd). The VR4131 is a 64-bit CPU but the emulator
-# only runs 32-bit code (verified: known-good kernels have zero 64-bit instrs).
-sed -i 's/if (cpu_has_64bit_gp_regs || cpu_has_64bit_zero_reg)/if (0)/' arch/mips/mm/page.c
-sed -i 's/if (cpu_has_64bit_gp_regs)/if (0)/' arch/mips/mm/page.c
-
-# Also disable the 64-bit pg_addiu path (daddu) — use 32-bit addiu only
-sed -i 's/if (cpu_has_64bit_gp_regs && DADDI_WAR && r4k_daddiu_bug())/if (0)/' arch/mips/mm/page.c
-
-# Replace dynamically generated clear_page with a simple C function.
-# The dynamic code generation writes to __clear_page_start which may
-# interact badly with the emulator. The C version is safer.
-cat >> arch/mips/mm/page.c <<'CLEAR_PAGE_PATCH'
-
-/* BE300: Simple C clear_page replacement */
-void clear_page_simple(void *page)
-{
-	unsigned int *p = (unsigned int *)page;
-	unsigned int *end = (unsigned int *)((char *)page + PAGE_SIZE);
-	while (p < end) {
-		*p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
-	}
-}
-CLEAR_PAGE_PATCH
-
-# Patch build_clear_page ONLY (not build_copy_page!) to install a jump to
-# the C clear_page_simple. Using sed range to limit to build_clear_page.
-# BUG FIX 2026-04-11: Previously the sed pattern was applied to BOTH
-# build_clear_page AND build_copy_page (because memset(labels,...) appears
-# in both), causing copy_page to zero destination pages instead of copying.
-# This broke COW for MAP_PRIVATE file mappings — data segment pages read
-# as zeros in userspace because the COW copy zeroed the new page.
-sed -i '/^void build_clear_page/,/^void build_copy_page/{
-  /memset(labels, 0, sizeof(labels));/i\
-\t/* BE300: use C clear_page instead of dynamic code */\n\t{\n\t\textern void clear_page_simple(void *);\n\t\tunsigned long fn = (unsigned long)clear_page_simple;\n\t\tbuf[0] = 0x08000000 | ((fn >> 2) \& 0x03ffffff);\n\t\tbuf[1] = 0x00000000;\n\t\treturn;\n\t}
-}' arch/mips/mm/page.c
-
-# NOTE: copy_page left as dynamically generated (C replacement broke test2 on real HW)
-
-# Disable VDSO — uses vmap (KSEG2/TLB-mapped)
-sed -i '/^int arch_setup_additional_pages/,/^}/c\
-int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)\n{\n\treturn 0;\n}' arch/mips/kernel/vdso.c
-
-# Add NOPs after tlbwr for VR4131 (hazard between tlbwr and eret)
-sed -i '/case CPU_VR4131:/,/break;/{
-  s/tlbw(p);/tlbw(p);\n\t\tuasm_i_nop(p);\n\t\tuasm_i_nop(p);/
-}' arch/mips/mm/tlbex.c
-
-# VR4131 cache bug fix: split Hit_Writeback_Inv_D into separate
-# Hit_Writeback_D + Hit_Invalidate_D. Required for real VR4131 silicon
-# (combined op has a hardware bug). Also works on the emulator.
-sed -i '/^static inline void flush_dcache_line/,/^}/ {
-  s/cache_op(Hit_Writeback_Inv_D, addr);/cache_op(Hit_Writeback_D, addr);\n\tcache_op(Hit_Invalidate_D, addr);/
-}' arch/mips/include/asm/r4kcache.h
-
-sed -i '/^static inline void protected_writeback_dcache_line/,/^}/ {
-  s/protected_cachee_op(Hit_Writeback_Inv_D, addr);/protected_cachee_op(Hit_Writeback_D, addr);\n\tprotected_cachee_op(Hit_Invalidate_D, addr);/
-  s/protected_cache_op(Hit_Writeback_Inv_D, addr);/protected_cache_op(Hit_Writeback_D, addr);\n\tprotected_cache_op(Hit_Invalidate_D, addr);/
-}' arch/mips/include/asm/r4kcache.h
-
-# NOTE: EntryLo1 workaround for emulator removed - testing on real HW first
-
-# NOTE: __update_cache left as stock behavior (exec || pages_do_alias).
-# An earlier attempt at unconditional `if (1)` per-page D-cache flush
-# was not what fixed the data-page-zeros bug — that turned out to be
-# the build_copy_page / clear_page_simple sed mishap (COW zeroing the
-# destination). Per-page flush here is also known to break real HW
-# (the kernel hangs at "Calibrating delay loop..." / timer-interrupt
-# path, see CLAUDE.md and git history).
-
-# FIX: Force _PAGE_VALID in set_pte for VR41xx.
-# The lazy-VALID mechanism relies on TLB Invalid exceptions (handle_tlbl)
-# to set VALID on first access. The BE-300 emulator doesn't properly
-# generate TLB Invalid exceptions, so the TLB refill handler always loads
-# PTEs with Valid=0, causing infinite faults. Fix: set _PAGE_VALID in
-# the PTE whenever _PAGE_PRESENT is set, so the TLB refill handler always
-# installs valid TLB entries. This disables ACCESSED-bit tracking but
-# that's acceptable for this platform.
-sed -i '0,/\*ptep = pteval;/{s/\*ptep = pteval;/if (pte_val(pteval) \& _PAGE_PRESENT) pte_val(pteval) |= _PAGE_VALID | _PAGE_ACCESSED;\n\t\*ptep = pteval;/}' arch/mips/include/asm/pgtable.h
-# Apply to the second set_pte as well (32-bit path)
-sed -i '0,/\*ptep = pteval;/{s/\*ptep = pteval;/if (pte_val(pteval) \& _PAGE_PRESENT) pte_val(pteval) |= _PAGE_VALID | _PAGE_ACCESSED;\n\t\*ptep = pteval;/}' arch/mips/include/asm/pgtable.h
-
-# FIX: vr41xx/common/irq.c::irq_dispatch unconditionally calls
-# chip->irq_ack() on the cascade path. The SYSINT1 / SYSINT2 chips defined
-# right next door (icu.c) only provide irq_mask/irq_unmask — they have no
-# irq_ack — so this NULL-derefs the moment a *cascaded* SYSINT1 IRQ fires
-# (notably SYSINT1_IRQ(8), the GIU summary). Make the call conditional.
-sed -i 's|^\t\t\tchip->irq_ack(idata);$|\t\t\tif (chip->irq_ack) chip->irq_ack(idata);|' \
-    arch/mips/vr41xx/common/irq.c
-
-# FIX: gpio-vr41xx.c giu_probe has an inverted error check around
-# gpiochip_add() — the `if (!ret)` branch tears down and returns -ENODEV
-# when the call SUCCEEDED. The intent was clearly `if (ret)`. Without
-# this fix, the GIU IRQ chips never get installed, and any chained
-# handler attached to GIU_IRQ(0) sees no_irq_chip and warns.
-sed -i 's|ret = gpiochip_add(&vr41xx_gpio_chip);\n\tif (!ret) {|ret = gpiochip_add(\&vr41xx_gpio_chip);\n\tif (ret) {|' \
-    drivers/gpio/gpio-vr41xx.c
-# sed doesn't handle multiline easily; do it as two sequential pattern matches:
-sed -i '/ret = gpiochip_add(&vr41xx_gpio_chip);/{n;s|^\tif (!ret) {|\tif (ret) {|}' \
-    drivers/gpio/gpio-vr41xx.c
-
-# FIX: Adjust VR41xx pfn_pte/pte_pfn shift in pgtable-32.h.
-# The VR41xx EntryLo has PFN starting at bit 8 (not bit 6 like standard
-# R4000), matching its 1KB-granularity TLB. In 2.4 Linux, _PAGE_GLOBAL
-# was at bit 6, and pfn_pte at PAGE_SHIFT+2=14 produced correct EntryLo:
-#   PFN at PTE bit 14, SRL by 6 → PFN at EntryLo bit 8 ✓
-# In 4.2.9, _PAGE_GLOBAL moved to bit 5 (no _PAGE_FILE between MODIFIED
-# and GLOBAL), so SRL is now by 5. With PFN still at bit 14:
-#   PFN at PTE bit 14, SRL by 5 → PFN at EntryLo bit 9 ✗ (1 bit too high)
-# Fix: change PAGE_SHIFT+2 to PAGE_SHIFT+1 (bit 13), so after SRL by 5:
-#   PFN at PTE bit 13, SRL by 5 → PFN at EntryLo bit 8 ✓
-sed -i 's/PAGE_SHIFT + 2/PAGE_SHIFT + 1/g' arch/mips/include/asm/pgtable-32.h
-
-# Patch Platform: add build rules
-if ! grep -q "CASIO_BE300" arch/mips/vr41xx/Platform; then
-    cat >> arch/mips/vr41xx/Platform <<'PLATFORM'
-
-#
-# CASIO CASSIOPEIA BE-300 (VR4131)
-#
-platform-$(CONFIG_CASIO_BE300)	+= vr41xx/casio-be300/
-# Load above the BE-300 boot ROM's RAM scratch zone. The ROM's MIPS16
-# record walker keeps state in 0x80010000-0x80010300 and reads from the
-# stack at 0x80003800. Loading the kernel at 0x80020000 (PA 0x20000,
-# 128 KiB into SDRAM) leaves both regions untouched while the walker is
-# copying records into RAM, so the walker can finish and write the
-# 0x24FC mailbox correctly.
-load-$(CONFIG_CASIO_BE300)	+= 0xffffffff80020000
-PLATFORM
-fi
-
-# Suppress the legacy ISA NE2000 autoprobe path in drivers/net/Space.c.
-# Space.c::net_olddevs_init -> ethif_probe2 -> ne_probe(unit) iterates units
-# 0..7 and registers MAX_NE_CARDS=4 dummy ne.0..ne.3 platform devices with
-# no IRQ resource. ne_drv_probe then runs probe_irq_on/probe_irq_off against
-# each dummy, which on the BE-300 emulator briefly sets the NE2000 IMR=0x50
-# and triggers a remote-DMA read (RREAD). The 10ms mdelay during this probe
-# is what causes the storm: cf_giu_source_bits keeps GIRQ0 bit 0 high while
-# (isr & imr) != 0, the cascade fires, and our chained handler in
-# board/casio-be300/irq.c isn't installed until late_initcall. Killing the
-# legacy entry leaves our own platform_device (id=-1, with IORESOURCE_IRQ)
-# as the only path into ne_drv_probe — single-shot at 0x300, no autoprobe.
-sed -i 's@^\(\s*\){ne_probe, 0},@\1/* {ne_probe, 0}, removed for BE-300 */@' \
-    drivers/net/Space.c
+echo "=== Phase 3: Applying BE-300 kernel patch series ==="
+/work/scripts/apply_patch_series.sh "$KERNEL_PATCH_SERIES" /work/linux-4.2.9
 
 ###############################################################################
 # Phase 5: Configure kernel
 ###############################################################################
 
 echo "=== Phase 5: Configuring kernel ==="
-
-# Copy defconfig
-cp /work/configs/be300_defconfig arch/mips/configs/be300_defconfig
 
 # Generate .config
 make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- be300_defconfig

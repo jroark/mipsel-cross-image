@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     python3 \
     rsync \
+    e2fsprogs \
     unzip \
     vim \
     libsdl2-dev \

@@ -12,8 +12,8 @@ For deep hardware / porting notes see [`CLAUDE.md`](CLAUDE.md).
 - Linux 4.2.9 boots to userspace on the BE-300 emulator and reaches a
   BusyBox `/bin/sh` prompt on the framebuffer console (tty0).
 - Real hardware (VR4131 silicon) has booted to userspace with a minimal
-  assembly init in earlier work; the BusyBox initramfs has not yet been
-  exercised on real HW in this tree.
+  assembly init in earlier work; the current JFFS2/NAND rootfs path has not
+  yet been exercised on real HW in this tree.
 - Framebuffer, polled keyboard, early printk over the companion-chip UART,
   and devtmpfs all work.
 
@@ -26,7 +26,7 @@ docker-compose build
 The container provides the `mipsel-linux-gnu` cross toolchain plus the
 utilities needed to build the kernel, musl, and BusyBox.
 
-### 2. Build the BE-300 kernel and initramfs
+### 2. Build the BE-300 NAND image
 ```bash
 docker-compose run --rm mips-dev bash -c "./build_be300_kernel.sh"
 ```
@@ -58,10 +58,26 @@ with `--ne2000` attached:
     --net-mac 02:de:ad:be:ef:01 --speed 0
 ```
 
+### 4. Build a CompactFlash recovery image
+After the NAND build has populated `linux-4.2.9/` and `rootfs_be300/`:
+```bash
+docker-compose run --rm mips-dev bash -c "./build_be300_cf_image.sh"
+```
+This produces `linux-4.2.9/linux_cf.img`, a CF disk image with the stock
+recovery filenames in the FAT16 boot partition and an ext2 Linux root
+partition.
+
+Boot it through the BE-300 recovery path:
+```bash
+./bin/be300 --restore --cf linux-4.2.9/linux_cf.img --speed 0
+```
+
 ## Build Pipeline (`build_be300_kernel.sh`)
 
-The build script does a lot of sed-driven kernel patching and cross-toolchain
-trickery — see `CLAUDE.md` for the full story. At a high level:
+The kernel port is carried as a traditional patch series in
+`patches/linux-4.2.9/be300/series`. The build script downloads/extracts the
+Tiny Core Linux 4.2.9 source, applies that series, then configures and builds.
+At a high level:
 
 - **Phase 0a** — Rebuild musl with `-march=mips2` if `musl-mipsel/lib/libc.a`
   still contains MIPS32 SPECIAL2 `mul` instructions. VR4131 is MIPS III and
@@ -85,21 +101,25 @@ trickery — see `CLAUDE.md` for the full story. At a high level:
   3. `make busybox EXTRA_CFLAGS="-march=mips2 ..." EXTRA_LDFLAGS="... -B/tmp/libgcc_patched"`.
   4. Populate `$ROOTFS` (`bin/busybox`, applet symlinks, `/init → /bin/busybox`,
      `/etc/inittab` that mounts proc/sys/dev and spawns a shell on tty0).
-- **Phase 2–4** — Extract linux-4.2.9, apply GCC 10+ compat fixes
-  (`yylloc` extern, `log2.h` noreturn/const, `-Werror` removal), inject
-  BE-300 board support and a pile of kernel sed patches (VR41xx TLB
-  compatibility fixes, VR4131 cache-bug split, 64-bit disabling, COW-safe
-  `build_clear_page` replacement, etc.).
+- **Phase 2–3** — Extract linux-4.2.9 and apply
+  `patches/linux-4.2.9/be300/series`. The series contains the GCC/UAPI
+  compatibility fixes, BE-300 board support, VR41xx TLB/PTE fixes, VR4131
+  cache-bug split, 32-bit page-operation forcing, VDSO disable,
+  interrupt/GPIO fixes, NE2000 autoprobe suppression, and `be300_defconfig`.
 - **Phase 5–6** — Configure with `configs/be300_defconfig`
-  (`CONFIG_INITRAMFS_SOURCE` points at `$ROOTFS`) and build `vmlinux`.
-  The initramfs is embedded because the emulator has no `--initrd` flag.
+  from the applied patch series and build `vmlinux`. The kernel mounts the
+  JFFS2 root filesystem from NAND mtd3 directly.
 
 ## Repository Layout
 
 ```
 build_be300_kernel.sh        Full BE-300 build (kernel + musl + BusyBox)
+build_be300_cf_image.sh      CompactFlash recovery image build
 configs/be300_defconfig      Kernel defconfig
-board/casio-be300/           Board support injected into the kernel tree
+configs/be300_cf.config      CF boot config overlay
+patches/linux-4.2.9/be300/   Canonical numbered kernel patch series
+scripts/apply_patch_series.sh Applies a series file to an extracted tree
+board/casio-be300/           SPL, CF loader, and userspace helper sources
   setup.c                    arch_initcall, idle override, prom_putchar
   sfb.c                      Framebuffer driver (KSEG1 0xAA200000)
   keys.c                     Polled hardware buttons
@@ -115,6 +135,10 @@ docs/                        VR4131 / VRC4173 manuals, hardware notes
 CLAUDE.md                    Deep technical notes and gotchas
 ```
 
+Generated and vendored build trees such as `linux-4.2.9/`, `rootfs_be300/`,
+`musl-*`, `busybox-1.24.2/`, and `microwindows/` are ignored locally. Edit the
+source inputs and patch series instead of generated outputs.
+
 ## Key Toolchain Constraints
 
 All quickly explained; full detail in `CLAUDE.md`:
@@ -128,8 +152,8 @@ All quickly explained; full detail in `CLAUDE.md`:
 - **No multilib** for mips2; `gcc -print-multi-lib` only lists n32/n64.
   Rebuilding gcc from source would be the only alternative.
 - **VR41xx TLB is not standard R4000** — PageMask, Context BadVPN2 position,
-  and EntryLo PFN position all differ. Kernel patches in `build_be300_kernel.sh`
-  keep these compatible for both the emulator and real hardware.
+  and EntryLo PFN position all differ. The kernel patch series keeps these
+  compatible for both the emulator and real hardware.
 
 ## Reference Material
 

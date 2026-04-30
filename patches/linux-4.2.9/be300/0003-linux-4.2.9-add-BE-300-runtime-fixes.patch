@@ -1,0 +1,301 @@
+From 941098700da8116b4ce714ae2805702142a0e4c3 Mon Sep 17 00:00:00 2001
+From: BE300 Patch Generator <be300@example.invalid>
+Date: Wed, 29 Apr 2026 21:18:06 -0700
+Subject: [PATCH 3/4] linux-4.2.9: add BE-300 runtime fixes
+
+
+diff --git a/arch/mips/include/asm/pgtable-32.h b/arch/mips/include/asm/pgtable-32.h
+index 832e216..e69dd09 100644
+--- a/arch/mips/include/asm/pgtable-32.h
++++ b/arch/mips/include/asm/pgtable-32.h
+@@ -123,8 +123,8 @@ pfn_pte(unsigned long pfn, pgprot_t prot)
+ #define pte_page(x)		pfn_to_page(pte_pfn(x))
+ 
+ #ifdef CONFIG_CPU_VR41XX
+-#define pte_pfn(x)		((unsigned long)((x).pte >> (PAGE_SHIFT + 2)))
+-#define pfn_pte(pfn, prot)	__pte(((pfn) << (PAGE_SHIFT + 2)) | pgprot_val(prot))
++#define pte_pfn(x)		((unsigned long)((x).pte >> (PAGE_SHIFT + 1)))
++#define pfn_pte(pfn, prot)	__pte(((pfn) << (PAGE_SHIFT + 1)) | pgprot_val(prot))
+ #else
+ #define pte_pfn(x)		((unsigned long)((x).pte >> _PFN_SHIFT))
+ #define pfn_pte(pfn, prot)	__pte(((unsigned long long)(pfn) << _PFN_SHIFT) | pgprot_val(prot))
+diff --git a/arch/mips/include/asm/pgtable.h b/arch/mips/include/asm/pgtable.h
+index ae85694..822b909 100644
+--- a/arch/mips/include/asm/pgtable.h
++++ b/arch/mips/include/asm/pgtable.h
+@@ -174,6 +174,8 @@ static inline void pte_clear(struct mm_struct *mm, unsigned long addr, pte_t *pt
+  */
+ static inline void set_pte(pte_t *ptep, pte_t pteval)
+ {
++	if (pte_val(pteval) & _PAGE_PRESENT)
++		pte_val(pteval) |= _PAGE_VALID | _PAGE_ACCESSED;
+ 	*ptep = pteval;
+ #if !defined(CONFIG_CPU_R3000) && !defined(CONFIG_CPU_TX39XX)
+ 	if (pte_val(pteval) & _PAGE_GLOBAL) {
+diff --git a/arch/mips/include/asm/r4kcache.h b/arch/mips/include/asm/r4kcache.h
+index 38902bf..f74f059 100644
+--- a/arch/mips/include/asm/r4kcache.h
++++ b/arch/mips/include/asm/r4kcache.h
+@@ -125,7 +125,8 @@ static inline void flush_icache_line(unsigned long addr)
+ static inline void flush_dcache_line(unsigned long addr)
+ {
+ 	__dflush_prologue
+-	cache_op(Hit_Writeback_Inv_D, addr);
++	cache_op(Hit_Writeback_D, addr);
++	cache_op(Hit_Invalidate_D, addr);
+ 	__dflush_epilogue
+ }
+ 
+@@ -202,9 +203,11 @@ static inline void protected_flush_icache_line(unsigned long addr)
+ static inline void protected_writeback_dcache_line(unsigned long addr)
+ {
+ #ifdef CONFIG_EVA
+-	protected_cachee_op(Hit_Writeback_Inv_D, addr);
++	protected_cachee_op(Hit_Writeback_D, addr);
++	protected_cachee_op(Hit_Invalidate_D, addr);
+ #else
+-	protected_cache_op(Hit_Writeback_Inv_D, addr);
++	protected_cache_op(Hit_Writeback_D, addr);
++	protected_cache_op(Hit_Invalidate_D, addr);
+ #endif
+ }
+ 
+diff --git a/arch/mips/kernel/vdso.c b/arch/mips/kernel/vdso.c
+index ed2a278..e3d2ef1 100644
+--- a/arch/mips/kernel/vdso.c
++++ b/arch/mips/kernel/vdso.c
+@@ -85,35 +85,8 @@ static unsigned long vdso_addr(unsigned long start)
+ 
+ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ {
+-	int ret;
+-	unsigned long addr;
+-	struct mm_struct *mm = current->mm;
+-
+-	down_write(&mm->mmap_sem);
+-
+-	addr = vdso_addr(mm->start_stack);
+-
+-	addr = get_unmapped_area(NULL, addr, PAGE_SIZE, 0, 0);
+-	if (IS_ERR_VALUE(addr)) {
+-		ret = addr;
+-		goto up_fail;
+-	}
+-
+-	ret = install_special_mapping(mm, addr, PAGE_SIZE,
+-				      VM_READ|VM_EXEC|
+-				      VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
+-				      &vdso_page);
+-
+-	if (ret)
+-		goto up_fail;
+-
+-	mm->context.vdso = (void *)addr;
+-
+-up_fail:
+-	up_write(&mm->mmap_sem);
+-	return ret;
++	return 0;
+ }
+-
+ const char *arch_vma_name(struct vm_area_struct *vma)
+ {
+ 	if (vma->vm_mm && vma->vm_start == (long)vma->vm_mm->context.vdso)
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+index 198a314..2ea2874 100644
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -378,6 +378,7 @@ void __init mem_init(void)
+ 	high_memory = (void *) __va(max_low_pfn << PAGE_SHIFT);
+ 
+ 	maar_init();
++	{ extern void be300_reserve_bad_pages(void); be300_reserve_bad_pages(); }
+ 	free_all_bootmem();
+ 	setup_zero_pages();	/* Setup zeroed pages.  */
+ 	mem_init_free_highmem();
+@@ -451,3 +452,23 @@ pgd_t swapper_pg_dir[_PTRS_PER_PGD] __section(.bss..swapper_pg_dir);
+ pmd_t invalid_pmd_table[PTRS_PER_PMD] __page_aligned_bss;
+ #endif
+ pte_t invalid_pte_table[PTRS_PER_PTE] __page_aligned_bss;
++
++/* BE300: Reserve pages with corrupted state so buddy allocator skips them */
++#include <linux/mm.h>
++void __init be300_reserve_bad_pages(void)
++{
++	unsigned long pfn;
++	int count = 0;
++
++	for (pfn = 0; pfn < max_mapnr; pfn++) {
++		struct page *page = pfn_to_page(pfn);
++		if (page_mapcount(page) != 0) {
++			SetPageReserved(page);
++			init_page_count(page);
++			page_mapcount_reset(page);
++			count++;
++		}
++	}
++	if (count)
++		pr_info("BE300: reserved %d pages with bad mapcount\n", count);
++}
+diff --git a/arch/mips/mm/page.c b/arch/mips/mm/page.c
+index 885d73f..cc40f05 100644
+--- a/arch/mips/mm/page.c
++++ b/arch/mips/mm/page.c
+@@ -105,7 +105,7 @@ static int cache_line_size;
+ static inline void
+ pg_addiu(u32 **buf, unsigned int reg1, unsigned int reg2, unsigned int off)
+ {
+-	if (cpu_has_64bit_gp_regs && DADDI_WAR && r4k_daddiu_bug()) {
++	if (0) {
+ 		if (off > 0x7fff) {
+ 			uasm_i_lui(buf, T9, uasm_rel_hi(off));
+ 			uasm_i_addiu(buf, T9, T9, uasm_rel_lo(off));
+@@ -124,12 +124,12 @@ pg_addiu(u32 **buf, unsigned int reg1, unsigned int reg2, unsigned int off)
+ 
+ static void set_prefetch_parameters(void)
+ {
+-	if (cpu_has_64bit_gp_regs || cpu_has_64bit_zero_reg)
++	if (0)
+ 		clear_word_size = 8;
+ 	else
+ 		clear_word_size = 4;
+ 
+-	if (cpu_has_64bit_gp_regs)
++	if (0)
+ 		copy_word_size = 8;
+ 	else
+ 		copy_word_size = 4;
+@@ -224,7 +224,7 @@ static void set_prefetch_parameters(void)
+ 
+ static void build_clear_store(u32 **buf, int off)
+ {
+-	if (cpu_has_64bit_gp_regs || cpu_has_64bit_zero_reg) {
++	if (0) {
+ 		uasm_i_sd(buf, ZERO, off, A0);
+ 	} else {
+ 		uasm_i_sw(buf, ZERO, off, A0);
+@@ -276,6 +276,14 @@ void build_clear_page(void)
+ 		return;
+ 	}
+ 
++	/* BE300: use C clear_page instead of dynamic code */
++	{
++		extern void clear_page_simple(void *);
++		unsigned long fn = (unsigned long)clear_page_simple;
++		buf[0] = 0x08000000 | ((fn >> 2) & 0x03ffffff);
++		buf[1] = 0x00000000;
++		return;
++	}
+ 	memset(labels, 0, sizeof(labels));
+ 	memset(relocs, 0, sizeof(relocs));
+ 
+@@ -358,7 +366,7 @@ void build_clear_page(void)
+ 
+ static void build_copy_load(u32 **buf, int reg, int off)
+ {
+-	if (cpu_has_64bit_gp_regs) {
++	if (0) {
+ 		uasm_i_ld(buf, reg, off, A1);
+ 	} else {
+ 		uasm_i_lw(buf, reg, off, A1);
+@@ -367,7 +375,7 @@ static void build_copy_load(u32 **buf, int reg, int off)
+ 
+ static void build_copy_store(u32 **buf, int reg, int off)
+ {
+-	if (cpu_has_64bit_gp_regs) {
++	if (0) {
+ 		uasm_i_sd(buf, reg, off, A0);
+ 	} else {
+ 		uasm_i_sw(buf, reg, off, A0);
+@@ -681,3 +689,13 @@ void copy_page(void *to, void *from)
+ }
+ 
+ #endif /* CONFIG_SIBYTE_DMA_PAGEOPS */
++
++/* BE300: Simple C clear_page replacement */
++void clear_page_simple(void *page)
++{
++	unsigned int *p = (unsigned int *)page;
++	unsigned int *end = (unsigned int *)((char *)page + PAGE_SIZE);
++	while (p < end) {
++		*p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
++	}
++}
+diff --git a/arch/mips/mm/tlbex.c b/arch/mips/mm/tlbex.c
+index 323d1d3..679d2b6 100644
+--- a/arch/mips/mm/tlbex.c
++++ b/arch/mips/mm/tlbex.c
+@@ -613,6 +613,8 @@ static void build_tlb_write_entry(u32 **p, struct uasm_label **l,
+ 		uasm_i_nop(p);
+ 		uasm_i_nop(p);
+ 		tlbw(p);
++		uasm_i_nop(p);
++		uasm_i_nop(p);
+ 		break;
+ 
+ 	case CPU_JZRISC:
+diff --git a/arch/mips/vr41xx/common/init.c b/arch/mips/vr41xx/common/init.c
+index 2391632..e0fb1e5 100644
+--- a/arch/mips/vr41xx/common/init.c
++++ b/arch/mips/vr41xx/common/init.c
+@@ -70,6 +70,7 @@ void __init prom_init(void)
+ 		if (i < (argc - 1))
+ 			strlcat(arcs_cmdline, " ", COMMAND_LINE_SIZE);
+ 	}
++	add_memory_region(0, 16 << 20, BOOT_MEM_RAM);
+ }
+ 
+ void __init prom_free_prom_memory(void)
+diff --git a/arch/mips/vr41xx/common/irq.c b/arch/mips/vr41xx/common/irq.c
+index ae0e4ee..d4c1487 100644
+--- a/arch/mips/vr41xx/common/irq.c
++++ b/arch/mips/vr41xx/common/irq.c
+@@ -79,7 +79,8 @@ static void irq_dispatch(unsigned int irq)
+ 			chip->irq_mask_ack(idata);
+ 		else {
+ 			chip->irq_mask(idata);
+-			chip->irq_ack(idata);
++			if (chip->irq_ack)
++				chip->irq_ack(idata);
+ 		}
+ 		ret = cascade->get_irq(irq);
+ 		irq = ret;
+diff --git a/drivers/gpio/gpio-vr41xx.c b/drivers/gpio/gpio-vr41xx.c
+index c1caa45..edf923c 100644
+--- a/drivers/gpio/gpio-vr41xx.c
++++ b/drivers/gpio/gpio-vr41xx.c
+@@ -545,7 +545,7 @@ static int giu_probe(struct platform_device *pdev)
+ 	vr41xx_gpio_chip.dev = &pdev->dev;
+ 
+ 	ret = gpiochip_add(&vr41xx_gpio_chip);
+-	if (!ret) {
++	if (ret) {
+ 		iounmap(giu_base);
+ 		return -ENODEV;
+ 	}
+diff --git a/drivers/input/keyboard/stowaway.c b/drivers/input/keyboard/stowaway.c
+index a6e0d56..b7efc52 100644
+--- a/drivers/input/keyboard/stowaway.c
++++ b/drivers/input/keyboard/stowaway.c
+@@ -110,6 +110,8 @@ static int skbd_connect(struct serio *serio, struct serio_driver *drv)
+ 	input_dev->dev.parent = &serio->dev;
+ 
+ 	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP);
++	input_dev->rep[REP_DELAY] = 400;
++	input_dev->rep[REP_PERIOD] = 100;
+ 	input_dev->keycode = skbd->keycode;
+ 	input_dev->keycodesize = sizeof(unsigned char);
+ 	input_dev->keycodemax = ARRAY_SIZE(skbd_keycode);
+diff --git a/drivers/net/Space.c b/drivers/net/Space.c
+index 67977f1..d020fd2 100644
+--- a/drivers/net/Space.c
++++ b/drivers/net/Space.c
+@@ -76,7 +76,7 @@ static struct devprobe2 isa_probes[] __initdata = {
+ 	{wd_probe, 0},
+ #endif
+ #if defined(CONFIG_NE2000) /* ISA (use ne2k-pci for PCI cards) */
+-	{ne_probe, 0},
++	/* {ne_probe, 0}, removed for BE-300 */
+ #endif
+ #ifdef CONFIG_LANCE		/* ISA/VLB (use pcnet32 for PCI cards) */
+ 	{lance_probe, 0},

@@ -1,0 +1,59 @@
+.DS_Store
+
+# Local agent/tool state
+.claude/
+
+# Downloaded source archives
+/archives/
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tgz
+*.tgz.gz
+*.zip
+
+# Extracted or generated build trees
+/linux-4.2.9/
+/busybox-1.24.2/
+/musl-1.2.5/
+/musl-khdrs/
+/musl-mipsel/
+/microwindows/
+/rootfs_be300/
+/rootfs_ramdisk/
+/rootfs_cf/
+/busybox_ramdisk/
+/ramdisk_extracted/
+/uclibc-kernel-headers/
+/uclibc-mipsel/
+/uclibc-sysroot/
+/uClibc-ng-*/
+
+# Local reference or binary artifacts
+/bin/
+/kernels/
+/src/
+/mipsel-uclibc-gcc
+/uclibc-gcc.specs
+/ramdisk-pgui-full.gz
+
+# Generated images, logs, screenshots, and scratch files
+*.nand
+*.img
+*.jffs2
+*.ext2
+*.log
+*.err
+screenshot_*.bmp
+stuck_*_page_*.bin
+initramfs*.txt
+ramdisk_init.sh
+serene-booping-truffle.md
+
+# Python/cache/build products
+__pycache__/
+*.pyc
+*.o
+*.a
+*.elf
