@@ -239,8 +239,6 @@ static int __init be300_keys_init(void)
 		return err;
 	}
 
-	pr_info("BE-300 Buttons: polling at %dms (rocket-modifier text input)\n",
-		BE300_KEYS_POLL_MS);
 	return 0;
 }
 

@@ -108,7 +108,6 @@
 #define BE300_TOUCH_WIDTH	240
 #define BE300_TOUCH_HEIGHT	320
 #define BE300_TOUCH_PANEL_HEIGHT	359
-#define BE300_TOUCH_TRACE_LIMIT	64
 
 struct be300_touch {
 	void __iomem *base;
@@ -118,10 +117,6 @@ struct be300_touch {
 };
 
 static struct be300_touch *be300_touch_dev;
-static unsigned int be300_touch_irq_traces;
-static unsigned int be300_touch_page_traces;
-static unsigned int be300_touch_pen_traces;
-static unsigned int be300_touch_lost_traces;
 
 static u16 piu_read(struct be300_touch *t, unsigned off)
 {
@@ -202,16 +197,9 @@ static void piu_decode_page(struct be300_touch *t, unsigned page_off,
 
 static void be300_touch_report_page(struct be300_touch *t, unsigned page_off)
 {
-	u16 yp = piu_read(t, page_off + 0x00);
-	u16 ym = piu_read(t, page_off + 0x04);
-	u16 xm = piu_read(t, page_off + 0x08);
-	u16 xp = piu_read(t, page_off + 0x0c);
 	int x, y;
 
 	piu_decode_page(t, page_off, &x, &y);
-	if (be300_touch_page_traces++ < BE300_TOUCH_TRACE_LIMIT)
-		pr_info("be300-touch: page%u raw yp=%04x ym=%04x xm=%04x xp=%04x -> x=%d y=%d\n",
-			page_off == PIU_PB10 ? 1 : 0, yp, ym, xm, xp, x, y);
 	t->pen_down = true;
 	input_report_key(t->input, BTN_TOUCH, 1);
 	input_report_abs(t->input, ABS_X, x);
@@ -232,10 +220,6 @@ static irqreturn_t be300_touch_isr(int irq, void *dev)
 	if (!effective)
 		return IRQ_NONE;
 
-	if (be300_touch_irq_traces++ < BE300_TOUCH_TRACE_LIMIT)
-		pr_info("be300-touch: irq status=%04x pending=%02x mask=%02x effective=%02x cnt=%04x\n",
-			status, pending, mask, effective, piu_read(t, PIU_CNTREG));
-
 	/*
 	 * A short tap can coalesce page-ready and pen-up in one IRQ. Page data
 	 * was captured while the pen was down, so publish it before PENCHG.
@@ -253,9 +237,6 @@ static irqreturn_t be300_touch_isr(int irq, void *dev)
 	if (effective & PIUINT_PENCHGINTR) {
 		bool down = !!(piu_read(t, PIU_CNTREG) & PIUCNT_PEN_DETECTED);
 		t->pen_down = down;
-		if (be300_touch_pen_traces++ < BE300_TOUCH_TRACE_LIMIT)
-			pr_info("be300-touch: penchg down=%d cnt=%04x\n",
-				down ? 1 : 0, piu_read(t, PIU_CNTREG));
 		input_report_key(t->input, BTN_TOUCH, down ? 1 : 0);
 		if (!down) {
 			input_report_abs(t->input, ABS_PRESSURE, 0);
@@ -266,8 +247,6 @@ static irqreturn_t be300_touch_isr(int irq, void *dev)
 
 	if (effective & PIUINT_PADDLOSTINTR) {
 		/* coordinate buffer overrun — ack and let the scan re-arm */
-		if (be300_touch_lost_traces++ < BE300_TOUCH_TRACE_LIMIT)
-			pr_info("be300-touch: datalost status=%04x\n", status);
 		ack |= PIUINT_PADDLOSTINTR;
 	}
 
@@ -336,9 +315,6 @@ static int __init be300_touch_init(void)
 		  PIUCNT_PADATSTART);
 
 	be300_touch_dev = t;
-	pr_info("be300-touch: registered, irq=%d, base=%pa cnt=%04x int=%04x\n",
-		t->irq, &t->base, piu_read(t, PIU_CNTREG),
-		piu_read(t, PIU_INTREG));
 	return 0;
 
 fail_unregister:

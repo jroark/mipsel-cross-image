@@ -245,7 +245,7 @@ new file mode 100644
 index 0000000..3d0d267
 --- /dev/null
 +++ b/arch/mips/vr41xx/casio-be300/keys.c
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,245 @@
 +/*
 + * arch/mips/vr41xx/casio-be300/keys.c
 + *
@@ -487,8 +487,6 @@ index 0000000..3d0d267
 +		return err;
 +	}
 +
-+	pr_info("BE-300 Buttons: polling at %dms (rocket-modifier text input)\n",
-+		BE300_KEYS_POLL_MS);
 +	return 0;
 +}
 +
@@ -1543,7 +1541,7 @@ new file mode 100644
 index 0000000..e434a57
 --- /dev/null
 +++ b/arch/mips/vr41xx/casio-be300/stowaway_serio.c
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,225 @@
 +/*
 + * arch/mips/vr41xx/casio-be300/stowaway_serio.c
 + *
@@ -1690,7 +1688,6 @@ index 0000000..e434a57
 +			break;
 +		}
 +		if (++stow_ticks >= STOW_PROBE_GIVEUP) {
-+			pr_info("BE-300 Stowaway: no keyboard detected (run emulator with --stowaway-keyboard to enable)\n");
 +			stow_state = STOW_GIVE_UP;
 +			requeue = false;
 +			break;
@@ -1703,7 +1700,6 @@ index 0000000..e434a57
 +		if (stow_readb(STOW_OFS_LSR) & STOW_LSR_DR) {
 +			byte = stow_readb(STOW_OFS_RBR);
 +			if (byte == STOW_PROBE_ACK_1) {
-+				pr_info("BE-300 Stowaway: keyboard connected\n");
 +				stow_state = STOW_CONNECTED;
 +				stow_ticks = 0;
 +			} else {
@@ -1768,8 +1764,6 @@ index 0000000..e434a57
 +	INIT_DELAYED_WORK(&stow_work, stow_step);
 +	schedule_delayed_work(&stow_work, msecs_to_jiffies(STOW_POLL_MS));
 +
-+	pr_info("BE-300 Stowaway: probing SIU at %#x for keyboard\n",
-+		BE300_STOW_BASE);
 +	return 0;
 +}
 +late_initcall(be300_stowaway_init);
@@ -1778,7 +1772,7 @@ new file mode 100644
 index 0000000..1ba9a81
 --- /dev/null
 +++ b/arch/mips/vr41xx/casio-be300/touch_be300.c
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,332 @@
 +/*
 + * arch/mips/vr41xx/casio-be300/touch_be300.c
 + *
@@ -2096,8 +2090,6 @@ index 0000000..1ba9a81
 +		  PIUCNT_PADATSTART);
 +
 +	be300_touch_dev = t;
-+	pr_info("be300-touch: registered, irq=%d, base=%pa\n",
-+		t->irq, &t->base);
 +	return 0;
 +
 +fail_unregister:

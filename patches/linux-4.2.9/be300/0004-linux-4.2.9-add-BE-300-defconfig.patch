@@ -1,7 +1,7 @@
 From 2a64be3e2e917e7536527bab1be16545a9db77df Mon Sep 17 00:00:00 2001
 From: BE300 Patch Generator <be300@example.invalid>
 Date: Wed, 29 Apr 2026 21:18:06 -0700
-Subject: [PATCH 4/4] linux-4.2.9: add BE-300 defconfig
+Subject: [PATCH 4/5] linux-4.2.9: add BE-300 defconfig
 
 
 diff --git a/arch/mips/configs/be300_defconfig b/arch/mips/configs/be300_defconfig
@@ -9,7 +9,7 @@ new file mode 100644
 index 0000000..84700ee
 --- /dev/null
 +++ b/arch/mips/configs/be300_defconfig
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,176 @@
 +#
 +# Linux 4.2.9 minimal defconfig for Casio Cassiopeia BE-300 (VR4131)
 +# Stripped to match the minimal hw support of the known-good 2.4/2.6 kernels.
@@ -158,7 +158,15 @@ index 0000000..84700ee
 +# CONFIG_MISC_DEVICES is not set
 +# CONFIG_INPUT_MISC is not set
 +# CONFIG_NEW_LEDS is not set
-+# CONFIG_RTC_CLASS is not set
++CONFIG_RTC_CLASS=y
++CONFIG_RTC_HCTOSYS=y
++CONFIG_RTC_HCTOSYS_DEVICE="rtc0"
++CONFIG_RTC_SYSTOHC=y
++CONFIG_RTC_SYSTOHC_DEVICE="rtc0"
++CONFIG_RTC_INTF_SYSFS=y
++CONFIG_RTC_INTF_PROC=y
++CONFIG_RTC_INTF_DEV=y
++CONFIG_RTC_DRV_VR41XX=y
 +# CONFIG_DMADEVICES is not set
 +# CONFIG_STAGING is not set
 +# CONFIG_THERMAL is not set

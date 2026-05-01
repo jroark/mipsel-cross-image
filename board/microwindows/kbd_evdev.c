@@ -9,7 +9,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -24,7 +23,6 @@
 
 #define	EVDEV_EVENT_FMT		"/dev/input/event%d"
 #define	EVDEV_MAX_EVENTS	8
-#define	EVDEV_TRACE_LIMIT	96
 #define	EVDEV_NAME_STOWAWAY	"Stowaway Keyboard"
 #define	EVDEV_NAME_BUTTONS	"BE-300 Buttons"
 
@@ -53,8 +51,6 @@ static int		wake_fd = -1;
 static int		next_kbd;
 static MWKEYMOD		mod_state;
 static int		caps_lock;
-static int		log_fd = -1;
-static int		event_traces;
 
 /*
  * Linux 4.2 on 32-bit MIPS returns the original 16-byte evdev record.
@@ -70,31 +66,6 @@ struct evdev_wire_event {
 	int32_t		value;
 };
 
-static void
-evdev_log(const char *fmt, ...)
-{
-	char msg[192];
-	char body[160];
-	va_list ap;
-	int n;
-
-	va_start(ap, fmt);
-	vsnprintf(body, sizeof(body), fmt, ap);
-	va_end(ap);
-
-	n = snprintf(msg, sizeof(msg), "kbd_evdev: %s\n", body);
-	if (n <= 0)
-		return;
-	if (n > (int)sizeof(msg))
-		n = sizeof(msg);
-
-	if (log_fd < 0)
-		log_fd = open("/dev/kmsg", O_WRONLY | O_NONBLOCK);
-	if (log_fd >= 0)
-		write(log_fd, msg, (size_t)n);
-	fprintf(stderr, "%s", msg);
-}
-
 static int
 add_keyboard_fd(int tfd, const char *path, const char *name)
 {
@@ -106,7 +77,6 @@ add_keyboard_fd(int tfd, const char *path, const char *name)
 	kbd[nkbd].fd = tfd;
 	snprintf(kbd[nkbd].path, sizeof(kbd[nkbd].path), "%s", path);
 	snprintf(kbd[nkbd].name, sizeof(kbd[nkbd].name), "%s", name);
-	evdev_log("opened %s name=\"%s\"", kbd[nkbd].path, kbd[nkbd].name);
 	nkbd++;
 	return 0;
 }
@@ -285,13 +255,10 @@ EVDEV_Open(KBDDEVICE *pkd)
 	int i;
 
 	wake_fd = open_evdev_keyboards(dev);
-	if (wake_fd < 0) {
-		evdev_log("open failed for BE-300 keyboard devices");
+	if (wake_fd < 0)
 		return DRIVER_FAIL;
-	}
 	for (i = 0; i < nkbd; i++)
-		evdev_log("EVIOCGRAB %s rc=%d", kbd[i].path,
-			  ioctl(kbd[i].fd, EVIOCGRAB, 1));
+		ioctl(kbd[i].fd, EVIOCGRAB, 1);
 	mod_state = 0;
 	caps_lock = 0;
 	return DRIVER_OKFILEDESC(wake_fd);
@@ -311,10 +278,6 @@ EVDEV_Close(void)
 	}
 	nkbd = 0;
 	wake_fd = -1;
-	if (log_fd >= 0) {
-		close(log_fd);
-		log_fd = -1;
-	}
 }
 
 static void
@@ -365,10 +328,6 @@ EVDEV_Read(MWKEY *kbuf, MWKEYMOD *modifiers, MWSCANCODE *scancode)
 			continue;
 
 		checked = 0;
-		if (event_traces++ < EVDEV_TRACE_LIMIT)
-			evdev_log("%s event type=%u code=%u value=%d",
-				  kbd[idx].name, ev.type, ev.code, ev.value);
-
 		if (ev.type != EV_KEY)
 			continue;
 

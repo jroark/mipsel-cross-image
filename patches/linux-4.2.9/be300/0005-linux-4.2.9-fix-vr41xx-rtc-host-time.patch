@@ -1,0 +1,128 @@
+From 4bd9c357a90c27d9cc91dfceaa6e91a6e4b0a8bd Mon Sep 17 00:00:00 2001
+From: BE300 Patch Generator <be300@example.invalid>
+Date: Thu, 30 Apr 2026 18:00:00 -0700
+Subject: [PATCH 5/5] linux-4.2.9: fix VR41xx RTC host time
+
+The BE-300 RTC state used by WinCE and the emulator stores ETIME as
+32768 Hz ticks elapsed since 1850-01-01. The mainline VR41xx RTC driver
+used a 1970 epoch and 32-bit elapsed seconds, so enabling it would either
+ignore the emulator's --rtc-host-time value or convert it to the wrong
+date on 32-bit MIPS.
+
+Use time64_t for the elapsed-second path and default the VR41xx epoch to
+1850 so CONFIG_RTC_HCTOSYS can seed Linux time from the guest RTC.
+
+diff --git a/drivers/rtc/rtc-vr41xx.c b/drivers/rtc/rtc-vr41xx.c
+index 6eb19a0..2f3438f 100644
+--- a/drivers/rtc/rtc-vr41xx.c
++++ b/drivers/rtc/rtc-vr41xx.c
+@@ -28,6 +28,7 @@
+ #include <linux/rtc.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
++#include <linux/time.h>
+ #include <linux/uaccess.h>
+ #include <linux/log2.h>
+ 
+@@ -79,7 +80,11 @@
+ #define rtc2_read(offset)		readw(rtc2_base + (offset))
+ #define rtc2_write(offset, value)	writew((value), rtc2_base + (offset))
+ 
+-static unsigned long epoch = 1970;	/* Jan 1 1970 00:00:00 */
++/*
++ * BE-300 WinCE images and the emulator store ETIME as elapsed ticks since
++ * Jan 1 1850 00:00:00.
++ */
++static unsigned long epoch = 1850;
+ 
+ static DEFINE_SPINLOCK(rtc_lock);
+ static char rtc_name[] = "RTC";
+@@ -88,12 +93,12 @@
+ static int aie_irq;
+ static int pie_irq;
+ 
+-static inline unsigned long read_elapsed_second(void)
++static inline time64_t read_elapsed_second(void)
+ {
+ 
+-	unsigned long first_low, first_mid, first_high;
++	u16 first_low, first_mid, first_high;
+ 
+-	unsigned long second_low, second_mid, second_high;
++	u16 second_low, second_mid, second_high;
+ 
+ 	do {
+ 		first_low = rtc1_read(ETIMELREG);
+@@ -105,16 +110,20 @@
+ 	} while (first_low != second_low || first_mid != second_mid ||
+ 		 first_high != second_high);
+ 
+-	return (first_high << 17) | (first_mid << 1) | (first_low >> 15);
++	return ((time64_t)first_high << 17) |
++	       ((time64_t)first_mid << 1) |
++	       ((time64_t)first_low >> 15);
+ }
+ 
+-static inline void write_elapsed_second(unsigned long sec)
++static inline void write_elapsed_second(time64_t sec)
+ {
++	u64 elapsed = sec;
++
+ 	spin_lock_irq(&rtc_lock);
+ 
+-	rtc1_write(ETIMELREG, (uint16_t)(sec << 15));
+-	rtc1_write(ETIMEMREG, (uint16_t)(sec >> 1));
+-	rtc1_write(ETIMEHREG, (uint16_t)(sec >> 17));
++	rtc1_write(ETIMELREG, (uint16_t)(elapsed << 15));
++	rtc1_write(ETIMEMREG, (uint16_t)(elapsed >> 1));
++	rtc1_write(ETIMEHREG, (uint16_t)(elapsed >> 17));
+ 
+ 	spin_unlock_irq(&rtc_lock);
+ }
+@@ -138,25 +147,27 @@
+ 
+ static int vr41xx_rtc_read_time(struct device *dev, struct rtc_time *time)
+ {
+-	unsigned long epoch_sec, elapsed_sec;
++	time64_t epoch_sec, elapsed_sec;
+ 
+-	epoch_sec = mktime(epoch, 1, 1, 0, 0, 0);
++	epoch_sec = mktime64(epoch, 1, 1, 0, 0, 0);
+ 	elapsed_sec = read_elapsed_second();
+ 
+-	rtc_time_to_tm(epoch_sec + elapsed_sec, time);
++	rtc_time64_to_tm(epoch_sec + elapsed_sec, time);
+ 
+ 	return 0;
+ }
+ 
+ static int vr41xx_rtc_set_time(struct device *dev, struct rtc_time *time)
+ {
+-	unsigned long epoch_sec, current_sec;
++	time64_t epoch_sec, current_sec, elapsed_sec;
+ 
+-	epoch_sec = mktime(epoch, 1, 1, 0, 0, 0);
+-	current_sec = mktime(time->tm_year + 1900, time->tm_mon + 1, time->tm_mday,
+-			     time->tm_hour, time->tm_min, time->tm_sec);
++	epoch_sec = mktime64(epoch, 1, 1, 0, 0, 0);
++	current_sec = rtc_tm_to_time64(time);
++	elapsed_sec = current_sec - epoch_sec;
++	if (elapsed_sec < 0)
++		return -EINVAL;
+ 
+-	write_elapsed_second(current_sec - epoch_sec);
++	write_elapsed_second(elapsed_sec);
+ 
+ 	return 0;
+ }
+@@ -213,8 +224,8 @@
+ 	case RTC_EPOCH_READ:
+ 		return put_user(epoch, (unsigned long __user *)arg);
+ 	case RTC_EPOCH_SET:
+-		/* Doesn't support before 1900 */
+-		if (arg < 1900)
++		/* The BE-300 epoch is 1850; earlier values are not supported. */
++		if (arg < 1850)
+ 			return -EINVAL;
+ 		epoch = arg;
+ 		break;

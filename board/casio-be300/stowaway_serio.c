@@ -144,7 +144,6 @@ static void stow_step(struct work_struct *w)
 			break;
 		}
 		if (++stow_ticks >= STOW_PROBE_GIVEUP) {
-			pr_info("BE-300 Stowaway: no keyboard detected (run emulator with --stowaway-keyboard to enable)\n");
 			stow_state = STOW_GIVE_UP;
 			requeue = false;
 			break;
@@ -157,7 +156,6 @@ static void stow_step(struct work_struct *w)
 		if (stow_readb(STOW_OFS_LSR) & STOW_LSR_DR) {
 			byte = stow_readb(STOW_OFS_RBR);
 			if (byte == STOW_PROBE_ACK_1) {
-				pr_info("BE-300 Stowaway: keyboard connected\n");
 				stow_state = STOW_CONNECTED;
 				stow_ticks = 0;
 			} else {
@@ -222,8 +220,6 @@ static int __init be300_stowaway_init(void)
 	INIT_DELAYED_WORK(&stow_work, stow_step);
 	schedule_delayed_work(&stow_work, msecs_to_jiffies(STOW_POLL_MS));
 
-	pr_info("BE-300 Stowaway: probing SIU at %#x for keyboard\n",
-		BE300_STOW_BASE);
 	return 0;
 }
 late_initcall(be300_stowaway_init);

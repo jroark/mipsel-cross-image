@@ -9,7 +9,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -25,7 +24,6 @@
 #define	EVDEV_TOUCH_NAME	"BE-300 PIU touchscreen"
 #define	EVDEV_EVENT_FMT		"/dev/input/event%d"
 #define	EVDEV_MAX_EVENTS	8
-#define	EVDEV_TRACE_LIMIT	64
 
 #define	SCALE			3
 #define	THRESH			5
@@ -53,9 +51,6 @@ static MWCOORD		last_x;
 static MWCOORD		last_y;
 static int		buttons;	/* MWBUTTON_L bit set when pen down */
 static int		have_pos;	/* true after first touchscreen sample */
-static int		log_fd = -1;
-static int		event_traces;
-static int		sample_traces;
 
 /*
  * Linux 4.2 on 32-bit MIPS returns the original 16-byte evdev record.
@@ -71,31 +66,6 @@ struct evdev_wire_event {
 	int32_t		value;
 };
 
-static void
-evdev_log(const char *fmt, ...)
-{
-	char msg[192];
-	char body[160];
-	va_list ap;
-	int n;
-
-	va_start(ap, fmt);
-	vsnprintf(body, sizeof(body), fmt, ap);
-	va_end(ap);
-
-	n = snprintf(msg, sizeof(msg), "mou_evdev: %s\n", body);
-	if (n <= 0)
-		return;
-	if (n > (int)sizeof(msg))
-		n = sizeof(msg);
-
-	if (log_fd < 0)
-		log_fd = open("/dev/kmsg", O_WRONLY | O_NONBLOCK);
-	if (log_fd >= 0)
-		write(log_fd, msg, (size_t)n);
-	fprintf(stderr, "%s", msg);
-}
-
 static int
 open_evdev_by_name(const char *override, const char *want_name)
 {
@@ -103,10 +73,8 @@ open_evdev_by_name(const char *override, const char *want_name)
 	char name[80];
 	int i, tfd;
 
-	if (override && override[0]) {
-		evdev_log("opening override %s", override);
+	if (override && override[0])
 		return open(override, O_RDONLY | O_NONBLOCK);
-	}
 
 	for (i = 0; i < EVDEV_MAX_EVENTS; i++) {
 		snprintf(path, sizeof(path), EVDEV_EVENT_FMT, i);
@@ -116,10 +84,8 @@ open_evdev_by_name(const char *override, const char *want_name)
 
 		memset(name, 0, sizeof(name));
 		if (ioctl(tfd, EVIOCGNAME(sizeof(name) - 1), name) >= 0 &&
-		    strcmp(name, want_name) == 0) {
-			evdev_log("opened %s name=\"%s\"", path, name);
+		    strcmp(name, want_name) == 0)
 			return tfd;
-		}
 
 		close(tfd);
 	}
@@ -133,11 +99,9 @@ EVDEV_Open(MOUSEDEVICE *pmd)
 	const char *dev = getenv("MWMOUSE") ? getenv("MWMOUSE") : EVDEV_TOUCH_DEV;
 
 	fd = open_evdev_by_name(dev, EVDEV_TOUCH_NAME);
-	if (fd < 0) {
-		evdev_log("open failed for %s", EVDEV_TOUCH_NAME);
+	if (fd < 0)
 		return DRIVER_FAIL;
-	}
-	evdev_log("EVIOCGRAB rc=%d", ioctl(fd, EVIOCGRAB, 1));
+	ioctl(fd, EVIOCGRAB, 1);
 	last_x = last_y = 0;
 	buttons = 0;
 	have_pos = 0;
@@ -152,10 +116,6 @@ EVDEV_Close(void)
 		ioctl(fd, EVIOCGRAB, 0);
 		close(fd);
 		fd = -1;
-	}
-	if (log_fd >= 0) {
-		close(log_fd);
-		log_fd = -1;
 	}
 }
 
@@ -195,10 +155,6 @@ EVDEV_Read(MWCOORD *dx, MWCOORD *dy, MWCOORD *dz, int *bp)
 		}
 		if (n != sizeof(ev))
 			break;
-
-		if (event_traces++ < EVDEV_TRACE_LIMIT)
-			evdev_log("event type=%u code=%u value=%d",
-				  ev.type, ev.code, ev.value);
 
 		if (ev.type == EV_ABS) {
 			if (ev.code == ABS_X) {
@@ -248,8 +204,5 @@ EVDEV_Read(MWCOORD *dx, MWCOORD *dy, MWCOORD *dz, int *bp)
 	*dy = last_y;
 	*dz = 0;
 	*bp = buttons;
-	if (sample_traces++ < EVDEV_TRACE_LIMIT)
-		evdev_log("sample x=%d y=%d buttons=0x%x",
-			  (int)last_x, (int)last_y, buttons);
 	return MOUSE_ABSPOS;
 }

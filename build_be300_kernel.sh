@@ -414,8 +414,7 @@ if ! grep -q "BE300_TOUCHSCREEN keeps Nano-X cursor hidden" /work/microwindows/s
 #endif
 }' /work/microwindows/src/engine/devmouse.c
 fi
-if ! grep -q "BE300 active evdev polling" /work/microwindows/src/nanox/srvmain.c; then
-    python3 - <<'PY'
+python3 - <<'PY'
 from pathlib import Path
 
 path = Path("/work/microwindows/src/nanox/srvmain.c")
@@ -448,26 +447,16 @@ old_timeout_marker = """\
 """
 text = text.replace(old_poll_marker, "")
 text = text.replace(old_timeout_marker, "")
-
-if "#include <fcntl.h>" not in text:
-    text = text.replace("#include <errno.h>\n", "#include <errno.h>\n#include <fcntl.h>\n", 1)
+logged_start = "\t/* BE300 active evdev polling: drain input even if select() misses readiness. */\n\t{\n\t\tstatic int be300_poll_logged;"
+logged_end = "\twhile (GsCheckKeyboardEvent())\n\t\tcontinue;\n\n"
+logged_pos = text.find(logged_start)
+if logged_pos >= 0:
+    logged_end_pos = text.find(logged_end, logged_pos)
+    if logged_end_pos >= 0:
+        text = text[:logged_pos] + text[logged_end_pos + len(logged_end):]
 
 poll_marker = """\
 \t/* BE300 active evdev polling: drain input even if select() misses readiness. */
-\t{
-\t\tstatic int be300_poll_logged;
-
-\t\tif (!be300_poll_logged) {
-\t\t\tstatic const char msg[] = "nano-X: BE300 evdev polling active\\n";
-\t\t\tint kfd = open("/dev/kmsg", O_WRONLY | O_NONBLOCK);
-
-\t\t\tif (kfd >= 0) {
-\t\t\t\twrite(kfd, msg, sizeof(msg) - 1);
-\t\t\t\tclose(kfd);
-\t\t\t}
-\t\t\tbe300_poll_logged = 1;
-\t\t}
-\t}
 \twhile (GsCheckMouseEvent())
 \t\tcontinue;
 \twhile (GsCheckKeyboardEvent())
@@ -497,7 +486,6 @@ if timeout_marker not in text:
 
 path.write_text(text)
 PY
-fi
 if ! grep -q "nxweb" /work/microwindows/src/demos/nanox/Makefile; then
     sed -i '/$(MW_DIR_BIN)\/nxev \\/a\
 \t$(MW_DIR_BIN)/nxweb \\
