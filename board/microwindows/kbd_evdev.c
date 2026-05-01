@@ -1,24 +1,32 @@
 /*
  * Linux evdev keyboard driver for Microwindows / Nano-X.
  *
- * Opens /dev/input/event0 (the BE-300 buttons / Stowaway keyboard registered
- * by board/casio-be300/keys.c and stowaway_serio.c) and translates evdev
- * KEY_* codes to MWKEY_* codes.
+ * Opens the BE-300 buttons or optional Stowaway keyboard evdev node and
+ * translates evdev KEY_* codes to MWKEY_* codes.
  *
  * Copyright (C) 2026 John Roark
  */
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/ioctl.h>
 #include <linux/input.h>
 #include "device.h"
 
 #ifndef EVDEV_KEYBOARD_DEV
-#define EVDEV_KEYBOARD_DEV	"/dev/input/event0"
+#define EVDEV_KEYBOARD_DEV	NULL
 #endif
+
+#define	EVDEV_EVENT_FMT		"/dev/input/event%d"
+#define	EVDEV_MAX_EVENTS	8
+#define	EVDEV_TRACE_LIMIT	96
+#define	EVDEV_NAME_STOWAWAY	"Stowaway Keyboard"
+#define	EVDEV_NAME_BUTTONS	"BE-300 Buttons"
 
 static int  EVDEV_Open(KBDDEVICE *pkd);
 static void EVDEV_Close(void);
@@ -33,8 +41,132 @@ KBDDEVICE kbddev = {
 	NULL,
 };
 
-static int		fd = -1;
+struct evdev_kbd {
+	int		fd;
+	char		path[32];
+	char		name[80];
+};
+
+static struct evdev_kbd	kbd[EVDEV_MAX_EVENTS];
+static int		nkbd;
+static int		wake_fd = -1;
+static int		next_kbd;
 static MWKEYMOD		mod_state;
+static int		caps_lock;
+static int		log_fd = -1;
+static int		event_traces;
+
+/*
+ * Linux 4.2 on 32-bit MIPS returns the original 16-byte evdev record.
+ * Modern musl headers use a 64-bit time_t, making struct input_event larger;
+ * reading sizeof(struct input_event) would see every kernel packet as short
+ * and drop it.
+ */
+struct evdev_wire_event {
+	int32_t		tv_sec;
+	int32_t		tv_usec;
+	uint16_t	type;
+	uint16_t	code;
+	int32_t		value;
+};
+
+static void
+evdev_log(const char *fmt, ...)
+{
+	char msg[192];
+	char body[160];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	vsnprintf(body, sizeof(body), fmt, ap);
+	va_end(ap);
+
+	n = snprintf(msg, sizeof(msg), "kbd_evdev: %s\n", body);
+	if (n <= 0)
+		return;
+	if (n > (int)sizeof(msg))
+		n = sizeof(msg);
+
+	if (log_fd < 0)
+		log_fd = open("/dev/kmsg", O_WRONLY | O_NONBLOCK);
+	if (log_fd >= 0)
+		write(log_fd, msg, (size_t)n);
+	fprintf(stderr, "%s", msg);
+}
+
+static int
+add_keyboard_fd(int tfd, const char *path, const char *name)
+{
+	if (nkbd >= EVDEV_MAX_EVENTS) {
+		close(tfd);
+		return -1;
+	}
+
+	kbd[nkbd].fd = tfd;
+	snprintf(kbd[nkbd].path, sizeof(kbd[nkbd].path), "%s", path);
+	snprintf(kbd[nkbd].name, sizeof(kbd[nkbd].name), "%s", name);
+	evdev_log("opened %s name=\"%s\"", kbd[nkbd].path, kbd[nkbd].name);
+	nkbd++;
+	return 0;
+}
+
+static int
+open_evdev_keyboards(const char *override)
+{
+	static const char * const preferred_names[] = {
+		EVDEV_NAME_STOWAWAY,
+		EVDEV_NAME_BUTTONS,
+		NULL,
+	};
+	char path[sizeof(EVDEV_EVENT_FMT) + 3];
+	char name[80];
+	int want, i, tfd;
+
+	nkbd = 0;
+	next_kbd = 0;
+
+	if (override && override[0]) {
+		tfd = open(override, O_RDONLY | O_NONBLOCK);
+		if (tfd >= 0)
+			add_keyboard_fd(tfd, override, "override");
+		return tfd;
+	}
+
+	for (want = 0; preferred_names[want]; want++) {
+		for (i = 0; i < EVDEV_MAX_EVENTS; i++) {
+			snprintf(path, sizeof(path), EVDEV_EVENT_FMT, i);
+			tfd = open(path, O_RDONLY | O_NONBLOCK);
+			if (tfd < 0)
+				continue;
+
+			memset(name, 0, sizeof(name));
+			if (ioctl(tfd, EVIOCGNAME(sizeof(name) - 1), name) >= 0 &&
+			    strcmp(name, preferred_names[want]) == 0) {
+				add_keyboard_fd(tfd, path, name);
+				continue;
+			}
+
+			close(tfd);
+		}
+	}
+
+	if (nkbd == 0)
+		return -1;
+
+	/*
+	 * Return the buttons fd to Nano-X when present, since the Stowaway input
+	 * device is registered even when the emulator dock is not connected. The
+	 * BE-300 Nano-X loop also polls periodically, so all open fds are drained
+	 * even if select() wakes on only this descriptor.
+	 */
+	for (i = nkbd - 1; i >= 0; i--) {
+		if (strcmp(kbd[i].name, EVDEV_NAME_BUTTONS) == 0)
+			return kbd[i].fd;
+	}
+
+	return kbd[0].fd;
+}
 
 static MWKEY
 evdev_to_mwkey(unsigned code)
@@ -103,24 +235,85 @@ evdev_to_mwkey(unsigned code)
 	}
 }
 
+static MWKEY
+apply_printable_modifiers(unsigned code, MWKEY mw)
+{
+	int shift = (mod_state & (MWKMOD_LSHIFT | MWKMOD_RSHIFT)) != 0;
+	int ctrl = (mod_state & (MWKMOD_LCTRL | MWKMOD_RCTRL)) != 0;
+
+	if (mw >= 'a' && mw <= 'z') {
+		if (ctrl)
+			return (MWKEY)(mw - 'a' + 1);
+		if (shift ^ caps_lock)
+			return (MWKEY)(mw - 'a' + 'A');
+		return mw;
+	}
+
+	if (!shift)
+		return mw;
+
+	switch (code) {
+	case KEY_1: return '!';
+	case KEY_2: return '@';
+	case KEY_3: return '#';
+	case KEY_4: return '$';
+	case KEY_5: return '%';
+	case KEY_6: return '^';
+	case KEY_7: return '&';
+	case KEY_8: return '*';
+	case KEY_9: return '(';
+	case KEY_0: return ')';
+	case KEY_MINUS: return '_';
+	case KEY_EQUAL: return '+';
+	case KEY_LEFTBRACE: return '{';
+	case KEY_RIGHTBRACE: return '}';
+	case KEY_SEMICOLON: return ':';
+	case KEY_APOSTROPHE: return '"';
+	case KEY_GRAVE: return '~';
+	case KEY_BACKSLASH: return '|';
+	case KEY_COMMA: return '<';
+	case KEY_DOT: return '>';
+	case KEY_SLASH: return '?';
+	default: return mw;
+	}
+}
+
 static int
 EVDEV_Open(KBDDEVICE *pkd)
 {
 	const char *dev = getenv("MWKBD") ? getenv("MWKBD") : EVDEV_KEYBOARD_DEV;
+	int i;
 
-	fd = open(dev, O_RDONLY | O_NONBLOCK);
-	if (fd < 0)
+	wake_fd = open_evdev_keyboards(dev);
+	if (wake_fd < 0) {
+		evdev_log("open failed for BE-300 keyboard devices");
 		return DRIVER_FAIL;
+	}
+	for (i = 0; i < nkbd; i++)
+		evdev_log("EVIOCGRAB %s rc=%d", kbd[i].path,
+			  ioctl(kbd[i].fd, EVIOCGRAB, 1));
 	mod_state = 0;
-	return DRIVER_OKFILEDESC(fd);
+	caps_lock = 0;
+	return DRIVER_OKFILEDESC(wake_fd);
 }
 
 static void
 EVDEV_Close(void)
 {
-	if (fd >= 0) {
-		close(fd);
-		fd = -1;
+	int i;
+
+	for (i = 0; i < nkbd; i++) {
+		if (kbd[i].fd >= 0) {
+			ioctl(kbd[i].fd, EVIOCGRAB, 0);
+			close(kbd[i].fd);
+			kbd[i].fd = -1;
+		}
+	}
+	nkbd = 0;
+	wake_fd = -1;
+	if (log_fd >= 0) {
+		close(log_fd);
+		log_fd = -1;
 	}
 }
 
@@ -152,18 +345,29 @@ mod_bit_for(MWKEY mw)
 static int
 EVDEV_Read(MWKEY *kbuf, MWKEYMOD *modifiers, MWSCANCODE *scancode)
 {
-	struct input_event ev;
+	struct evdev_wire_event ev;
 	ssize_t n;
+	int checked = 0;
+	int idx;
 
-	for (;;) {
-		n = read(fd, &ev, sizeof(ev));
+	while (checked < nkbd) {
+		idx = next_kbd;
+		next_kbd = (next_kbd + 1) % nkbd;
+		checked++;
+
+		n = read(kbd[idx].fd, &ev, sizeof(ev));
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EINTR)
-				return KBD_NODATA;
+				continue;
 			return KBD_FAIL;
 		}
 		if (n != sizeof(ev))
-			return KBD_NODATA;
+			continue;
+
+		checked = 0;
+		if (event_traces++ < EVDEV_TRACE_LIMIT)
+			evdev_log("%s event type=%u code=%u value=%d",
+				  kbd[idx].name, ev.type, ev.code, ev.value);
 
 		if (ev.type != EV_KEY)
 			continue;
@@ -179,7 +383,12 @@ EVDEV_Read(MWKEY *kbuf, MWKEYMOD *modifiers, MWSCANCODE *scancode)
 				mod_state |= bit;
 			else
 				mod_state &= ~bit;
+		} else if (mw == MWKEY_CAPSLOCK && ev.value == 1) {
+			caps_lock = !caps_lock;
 		}
+
+		if (!bit)
+			mw = apply_printable_modifiers(ev.code, mw);
 
 		*kbuf = mw;
 		*modifiers = mod_state;
@@ -189,4 +398,6 @@ EVDEV_Read(MWKEY *kbuf, MWKEYMOD *modifiers, MWSCANCODE *scancode)
 		else
 			return KBD_KEYRELEASE;
 	}
+
+	return KBD_NODATA;
 }

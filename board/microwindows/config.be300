@@ -4,9 +4,8 @@
 # Cross-built with mipsel-linux-gnu-g{cc,++} -march=mips2 + musl
 # (matching the BusyBox build path in build_be300_kernel.sh).
 #
-# Single-binary mode (LINK_APP_INTO_SERVER=Y) to avoid Nano-X's UNIX
-# socket server/client model on a 12 MB-RAM device. Each demo statically
-# embeds the server.
+# Shared Nano-X server mode so launcher, terminal, browser, and soft keyboard
+# can run together as separate client apps.
 #
 # No libpng/libjpeg/libfreetype dependencies (we have not cross-built
 # them yet) — only built-in BMP/GIF/PCF/FNT support.
@@ -51,9 +50,9 @@ NANOXDEMO                = Y
 HAVE_VNCSERVER_SUPPORT   = N
 
 ####################################################################
-# Single-binary: server linked into each app
+# Shared Nano-X server plus client apps
 ####################################################################
-LINK_APP_INTO_SERVER     = Y
+LINK_APP_INTO_SERVER     = N
 NANOWM                   = Y
 HAVE_SHAREDMEM_SUPPORT   = N
 HAVE_FILEIO              = Y
@@ -97,6 +96,7 @@ HOSTCC                   = gcc
 ####################################################################
 # Pass our musl/mips2 flags via EXTRAFLAGS. -mfpxx overrides Arch.rules's
 # default `-msoft-float` for LINUX-MIPS so we match musl's hard-float ABI
-# (no actual FPU instructions used; mfpxx is float-ABI-flexible).
+# (no actual FPU instructions used; mfpxx is float-ABI-flexible). The BE-300
+# touchscreen reports native framebuffer coordinates, so leave them unrotated.
 ####################################################################
-EXTRAFLAGS               = -march=mips2 -mfpxx -isystem /work/musl-khdrs/include
+EXTRAFLAGS               = -march=mips2 -mfpxx -isystem /work/musl-khdrs/include -DBE300_TOUCHSCREEN=1 -DFLIP_MOUSE_IN_PORTRAIT_MODE=0

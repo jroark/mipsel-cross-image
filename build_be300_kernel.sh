@@ -236,10 +236,10 @@ cp /tmp/touch_query_test "$ROOTFS/bin/touch_query_test"
 chmod +x "$ROOTFS/bin/touch_query_test"
 
 # Phase C' — Microwindows / Nano-X (pure C, builds against musl + mips2,
-# no libstdc++ needed). Builds the libnano-X.a static lib and a small set
-# of demos with the server linked into each binary (LINK_APP_INTO_SERVER=Y),
-# so each demo is a self-contained executable. Input devices wire through
-# evdev: /dev/input/event0 (BE-300 buttons) and event1 (PIU touchscreen).
+# no libstdc++ needed). Builds the nano-X server plus a small client app set
+# (launcher, terminal, browser, soft keyboard, and diagnostics). Input devices
+# are discovered by evdev device name so optional keyboards do not change the
+# touchscreen event path.
 #
 # Source tree layout: microwindows/ is a fresh extraction of
 # ghaerr/microwindows; our overlays live at /work/board/microwindows/ and
@@ -260,6 +260,114 @@ cp /work/board/microwindows/kbd_evdev.c \
    /work/microwindows/src/drivers/kbd_evdev.c
 cp /work/board/microwindows/mou_evdev.c \
    /work/microwindows/src/drivers/mou_evdev.c
+cp /work/board/microwindows/nxweb.c \
+   /work/microwindows/src/demos/nanox/nxweb.c
+python3 - <<'PY'
+from pathlib import Path
+
+root = Path("/work/microwindows/src/demos/nanox")
+
+path = root / "nxlaunch.h"
+text = path.read_text()
+text = text.replace("#define ITEM_WIDTH 100\n", "#define ITEM_WIDTH 112\n")
+text = text.replace("#define ITEM_HEIGHT 60\n", "#define ITEM_HEIGHT 58\n")
+text = text.replace("#define TEXT_Y_POSITION (ITEM_HEIGHT - 6)\n",
+                    "#define TEXT_Y_POSITION (ITEM_HEIGHT - 8)\n")
+path.write_text(text)
+
+path = root / "nxlaunch.c"
+text = path.read_text()
+text = text.replace("""\
+void reaper(int signum) {
+\tpid_t pid;
+
+\tsignal(SIGCHLD, &reaper);
+\twhile((pid = waitpid(-1, NULL, WNOHANG) > 0))
+\t\tif(pid == sspid) sspid = -1;
+}
+""", """\
+void reaper(int signum) {
+\tpid_t pid;
+
+\t(void)signum;
+\twhile((pid = waitpid(-1, NULL, WNOHANG)) > 0)
+\t\tif(pid == sspid) sspid = -1;
+}
+""")
+text = text.replace("case GR_EVENT_TYPE_BUTTON_DOWN:\n\t\t\thandle_mouse_event(state);\n\t\t\tbreak;",
+                    "case GR_EVENT_TYPE_BUTTON_UP:\n\t\t\thandle_mouse_event(state);\n\t\t\tbreak;")
+text = text.replace("GrSelectEvents(i->wid, GR_EVENT_MASK_EXPOSURE | GR_EVENT_MASK_BUTTON_DOWN);",
+                    "GrSelectEvents(i->wid, GR_EVENT_MASK_EXPOSURE | GR_EVENT_MASK_BUTTON_UP);")
+text = text.replace("\tsignal(SIGCHLD, &reaper);\n", "\tsignal(SIGCHLD, SIG_IGN);\n")
+path.write_text(text)
+
+path = root / "nxterm.c"
+text = path.read_text()
+old = """\
+    col = stdcol;
+    row = stdrow;
+    scrolltop=0;
+    scrollbottom = row;
+
+    regFont = GrCreateFontEx(GR_FONT_SYSTEM_FIXED, 0, 0, NULL);
+    /*regFont = GrCreateFontEx(GR_FONT_OEM_FIXED, 0, 0, NULL);*/
+    /*boldFont = GrCreateFontEx(GR_FONT_SYSTEM_FIXED, 0, 0, NULL);*/
+    GrGetFontInfo(regFont, &fi);
+    winw = col*fi.maxwidth;
+    winh = row*fi.height;
+    w1 = GrNewWindowEx(GR_WM_PROPS_APPWINDOW, TITLE, GR_ROOT_WINDOW_ID, -1,-1,winw,winh,
+\t\tstdbackground);
+"""
+new = """\
+    col = stdcol;
+    row = stdrow;
+    scrolltop=0;
+
+    regFont = GrCreateFontEx(GR_FONT_SYSTEM_FIXED, 0, 0, NULL);
+    /*regFont = GrCreateFontEx(GR_FONT_OEM_FIXED, 0, 0, NULL);*/
+    /*boldFont = GrCreateFontEx(GR_FONT_SYSTEM_FIXED, 0, 0, NULL);*/
+    GrGetFontInfo(regFont, &fi);
+#if BE300_TOUCHSCREEN
+    {
+        int fw = fi.maxwidth ? fi.maxwidth : 6;
+        int fh = fi.height ? fi.height : 13;
+        int maxcol = (si.cols - 12) / fw;
+        int maxrow = (si.rows - 56) / fh;
+
+        if (maxcol < 20)
+            maxcol = 20;
+        if (maxrow < 8)
+            maxrow = 8;
+        if (maxcol < col)
+            col = maxcol;
+        if (maxrow < row)
+            row = maxrow;
+    }
+#endif
+    scrollbottom = row;
+    winw = col*fi.maxwidth;
+    winh = row*fi.height;
+    w1 = GrNewWindowEx(GR_WM_PROPS_APPWINDOW, TITLE, GR_ROOT_WINDOW_ID, 0, 0, winw, winh,
+\t\tstdbackground);
+"""
+if old in text:
+    text = text.replace(old, new)
+path.write_text(text)
+
+path = root / "nxclock.c"
+text = path.read_text()
+text = text.replace("#define CWIDTH\t\t200\n", "#define CWIDTH\t\t180\n")
+text = text.replace("#define CHEIGHT\t\t200\n", "#define CHEIGHT\t\t180\n")
+text = text.replace('GR_ROOT_WINDOW_ID,\n\t\t-1, -1, CWIDTH, CHEIGHT',
+                    'GR_ROOT_WINDOW_ID,\n\t\t0, 0, CWIDTH, CHEIGHT')
+path.write_text(text)
+
+path = root / "nxcalc.c"
+text = path.read_text()
+text = text.replace('GR_ROOT_WINDOW_ID,\n                        10, 10, WIN_W, WIN_H',
+                    'GR_ROOT_WINDOW_ID,\n                        0, 0, WIN_W, WIN_H')
+path.write_text(text)
+PY
 # Patch Objects.rules to register EVDEVKBD and EVDEVMOUSE driver hooks
 # (idempotent — only inserts when the marker line is absent)
 if ! grep -q "MOUSE.*EVDEVMOUSE" /work/microwindows/src/drivers/Objects.rules; then
@@ -278,33 +386,294 @@ MW_CORE_OBJS += $(MW_DIR_OBJ)/drivers/kbd_evdev.o\
 endif\
 ' /work/microwindows/src/drivers/Objects.rules
 fi
+if ! grep -q "BE300_TOUCHSCREEN hides the software cursor" /work/microwindows/src/nanox/srvmain.c; then
+    sed -i '/^	GsRedrawScreen();$/a\
+#if BE300_TOUCHSCREEN\
+\t/* BE300_TOUCHSCREEN hides the software cursor for touch-only input. */\
+\tGdHideCursor(psd);\
+#endif\
+' /work/microwindows/src/nanox/srvmain.c
+fi
+if ! grep -q "BE300_TOUCHSCREEN keeps Nano-X cursor hidden" /work/microwindows/src/engine/devmouse.c; then
+    sed -i '/^GdShowCursor(PSD psd)$/,/^{$/{
+/^{$/a\
+#if BE300_TOUCHSCREEN\
+\t/* BE300_TOUCHSCREEN keeps Nano-X cursor hidden for absolute touch. */\
+\tcurvisible = 0;\
+\tcurneedsrestore = FALSE;\
+\treturn 0;\
+#endif
+}' /work/microwindows/src/engine/devmouse.c
+    sed -i '/^GdHideCursor(PSD psd)$/,/^{$/{
+/^{$/a\
+#if BE300_TOUCHSCREEN\
+\t/* BE300_TOUCHSCREEN keeps Nano-X cursor hidden for absolute touch. */\
+\tcurvisible = 0;\
+\tcurneedsrestore = FALSE;\
+\treturn 0;\
+#endif
+}' /work/microwindows/src/engine/devmouse.c
+fi
+if ! grep -q "BE300 active evdev polling" /work/microwindows/src/nanox/srvmain.c; then
+    python3 - <<'PY'
+from pathlib import Path
+
+path = Path("/work/microwindows/src/nanox/srvmain.c")
+text = path.read_text()
+
+old_poll_marker = """\
+#if BE300_TOUCHSCREEN
+\t/* BE300_TOUCHSCREEN polls evdev input even if select() misses readiness. */
+\twhile (GsCheckMouseEvent())
+\t\tcontinue;
+\twhile (GsCheckKeyboardEvent())
+\t\tcontinue;
+#endif
+
+"""
+old_timeout_marker = """\
+#if BE300_TOUCHSCREEN
+\t/*
+\t * The BE-300 evdev input nodes can miss select() wakeups under this
+\t * vintage kernel/emulator combination. Keep the server loop periodic so
+\t * the polling block above drains touch and keyboard events.
+\t */
+\tif (to == NULL || tout.tv_sec != 0 || tout.tv_usec > 10000) {
+\t\tto = &tout;
+\t\ttout.tv_sec = 0;
+\t\ttout.tv_usec = 10000;
+\t}
+#endif
+
+"""
+text = text.replace(old_poll_marker, "")
+text = text.replace(old_timeout_marker, "")
+
+if "#include <fcntl.h>" not in text:
+    text = text.replace("#include <errno.h>\n", "#include <errno.h>\n#include <fcntl.h>\n", 1)
+
+poll_marker = """\
+\t/* BE300 active evdev polling: drain input even if select() misses readiness. */
+\t{
+\t\tstatic int be300_poll_logged;
+
+\t\tif (!be300_poll_logged) {
+\t\t\tstatic const char msg[] = "nano-X: BE300 evdev polling active\\n";
+\t\t\tint kfd = open("/dev/kmsg", O_WRONLY | O_NONBLOCK);
+
+\t\t\tif (kfd >= 0) {
+\t\t\t\twrite(kfd, msg, sizeof(msg) - 1);
+\t\t\t\tclose(kfd);
+\t\t\t}
+\t\t\tbe300_poll_logged = 1;
+\t\t}
+\t}
+\twhile (GsCheckMouseEvent())
+\t\tcontinue;
+\twhile (GsCheckKeyboardEvent())
+\t\tcontinue;
+
+"""
+needle = "\t/* Set up the FDs for use in the main select(): */\n"
+if poll_marker not in text:
+    text = text.replace(needle, poll_marker + needle, 1)
+
+timeout_marker = """\
+\t/*
+\t * The BE-300 evdev input nodes can miss select() wakeups under this
+\t * vintage kernel/emulator combination. Keep the server loop periodic so
+\t * the polling block above drains touch and keyboard events.
+\t */
+\tif (to == NULL || tout.tv_sec != 0 || tout.tv_usec > 10000) {
+\t\tto = &tout;
+\t\ttout.tv_sec = 0;
+\t\ttout.tv_usec = 10000;
+\t}
+
+"""
+needle = "\tif (updatecount) --updatecount;\n\n\t/* Wait for some input on any of the fds in the set or a timeout*/\n"
+if timeout_marker not in text:
+    text = text.replace(needle, timeout_marker + needle, 1)
+
+path.write_text(text)
+PY
+fi
+if ! grep -q "nxweb" /work/microwindows/src/demos/nanox/Makefile; then
+    sed -i '/$(MW_DIR_BIN)\/nxev \\/a\
+\t$(MW_DIR_BIN)/nxweb \\
+' /work/microwindows/src/demos/nanox/Makefile
+fi
 
 cd /work/microwindows/src
 cp Configs/config.be300 config
 make clean >/dev/null 2>&1 || true
+make -C demos/nanox MW_DIR_SRC=/work/microwindows/src clean >/dev/null 2>&1 || true
 MW_CC="mipsel-linux-gnu-gcc -march=mips2 -mfpxx -specs $MUSL_SPECS -isystem $KHDRS/include -B/tmp/libgcc_patched"
+MW_EXTRAFLAGS="-DBE300_TOUCHSCREEN=1 -DFLIP_MOUSE_IN_PORTRAIT_MODE=0"
 MW_BUILD_LOG=/tmp/microwindows_be300_build.log
-if ! make -j$(nproc) MIPSTOOLSPREFIX="" \
+if ! make -j$(nproc) default MIPSTOOLSPREFIX="" \
         COMPILER=gcc \
         CC="$MW_CC" \
         AR="mipsel-linux-gnu-ar" \
         LDFLAGS="-static" \
-        EXTRAFLAGS="" \
+        EXTRAFLAGS="$MW_EXTRAFLAGS" \
         >"$MW_BUILD_LOG" 2>&1; then
+    tail -40 "$MW_BUILD_LOG"
+    exit 1
+fi
+MW_APPS="nano-X demo-hello nxev nxlaunch nxterm nxkbd nxweb nxclock nxcalc"
+MW_NANOX_TARGETS=""
+for app in $MW_APPS; do
+    if [ "$app" != "nano-X" ]; then
+        MW_NANOX_TARGETS="$MW_NANOX_TARGETS /work/microwindows/src/bin/$app"
+    fi
+done
+if ! make -C demos/nanox -j$(nproc) $MW_NANOX_TARGETS MIPSTOOLSPREFIX="" \
+        MW_DIR_SRC=/work/microwindows/src \
+        COMPILER=gcc \
+        CC="$MW_CC" \
+        AR="mipsel-linux-gnu-ar" \
+        LDFLAGS="-static" \
+        EXTRAFLAGS="$MW_EXTRAFLAGS" \
+        >>"$MW_BUILD_LOG" 2>&1; then
     tail -40 "$MW_BUILD_LOG"
     exit 1
 fi
 tail -3 "$MW_BUILD_LOG"
 echo "--- Microwindows artifacts ---"
-ls -la /work/microwindows/src/lib/libnano-X.a /work/microwindows/src/bin/demo-hello 2>/dev/null
-# Stage demo-hello into rootfs (stripped, ~400 KB)
-mipsel-linux-gnu-strip /work/microwindows/src/bin/demo-hello
-cp /work/microwindows/src/bin/demo-hello "$ROOTFS/bin/demo-hello"
-chmod +x "$ROOTFS/bin/demo-hello"
+for app in $MW_APPS; do
+    ls -la "/work/microwindows/src/bin/$app"
+    mipsel-linux-gnu-strip "/work/microwindows/src/bin/$app"
+    cp "/work/microwindows/src/bin/$app" "$ROOTFS/bin/$app"
+    chmod +x "$ROOTFS/bin/$app"
+done
 # Stage a minimal font set so MWFONTDIR-less demos can fall back to disk if
 # the built-in font picker misses.
 mkdir -p "$ROOTFS/usr/share/microwindows/pcf"
 cp /work/microwindows/src/fonts/pcf/*.pcf.gz "$ROOTFS/usr/share/microwindows/pcf/" 2>/dev/null || true
+
+cat > "$ROOTFS/etc/nxlaunch.cnf" << 'NXLAUNCH_CNF'
+# BE-300 Nano-X launcher. Use '-' for iconless buttons to save rootfs space.
+$window_background_colour BLACK
+Terminal - /bin/mw-terminal
+Browser - /bin/mw-browser http://example.com/
+Keyboard - /bin/mw-keyboard
+Events - /bin/mw-events
+Clock - /bin/mw-clock
+Calc - /bin/mw-calc
+NXLAUNCH_CNF
+
+cat > "$ROOTFS/bin/mw-terminal" << 'MW_TERMINAL'
+#!/bin/sh
+exec /bin/nxterm "$@"
+MW_TERMINAL
+chmod +x "$ROOTFS/bin/mw-terminal"
+
+cat > "$ROOTFS/bin/mw-browser" << 'MW_BROWSER'
+#!/bin/sh
+url="${1:-http://example.com/}"
+exec /bin/nxweb "$url"
+MW_BROWSER
+chmod +x "$ROOTFS/bin/mw-browser"
+
+cat > "$ROOTFS/bin/mw-keyboard" << 'MW_KEYBOARD'
+#!/bin/sh
+exec /bin/nxkbd "$@"
+MW_KEYBOARD
+chmod +x "$ROOTFS/bin/mw-keyboard"
+
+cat > "$ROOTFS/bin/mw-events" << 'MW_EVENTS'
+#!/bin/sh
+exec /bin/nxev "$@"
+MW_EVENTS
+chmod +x "$ROOTFS/bin/mw-events"
+
+cat > "$ROOTFS/bin/mw-clock" << 'MW_CLOCK'
+#!/bin/sh
+exec /bin/nxclock "$@"
+MW_CLOCK
+chmod +x "$ROOTFS/bin/mw-clock"
+
+cat > "$ROOTFS/bin/mw-calc" << 'MW_CALC'
+#!/bin/sh
+exec /bin/nxcalc "$@"
+MW_CALC
+chmod +x "$ROOTFS/bin/mw-calc"
+
+cat > "$ROOTFS/bin/start-microwindows" << 'MW_START'
+#!/bin/sh
+export HOME=/root
+export MWFONTDIR=/usr/share/microwindows/pcf
+
+printf '\033[?25l' >/dev/tty0 2>/dev/null || true
+exec </dev/null >/tmp/microwindows.log 2>&1
+/bin/rm -f /tmp/.nano-X
+
+/bin/nano-X &
+server_pid=$!
+client_pids=
+
+cleanup() {
+    for pid in $client_pids; do
+        kill "$pid" 2>/dev/null
+    done
+    kill "$server_pid" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+wait_server() {
+    count=0
+    while [ ! -e /tmp/.nano-X ]; do
+        kill -0 "$server_pid" 2>/dev/null || return 1
+        count=$((count + 1))
+        [ "$count" -lt 2000000 ] || return 1
+    done
+    return 0
+}
+
+if ! wait_server; then
+    echo "nano-X did not create /tmp/.nano-X" >&2
+    exit 1
+fi
+
+case "$1" in
+terminal)
+    /bin/nxterm
+    ;;
+browser)
+    /bin/nxkbd &
+    client_pids="$client_pids $!"
+    /bin/nxweb "${2:-http://example.com/}"
+    ;;
+keyboard)
+    /bin/nxkbd
+    ;;
+all)
+    /bin/nxkbd &
+    kb_pid=$!
+    client_pids="$client_pids $kb_pid"
+    /bin/nxweb "${2:-http://example.com/}" &
+    web_pid=$!
+    client_pids="$client_pids $web_pid"
+    /bin/nxterm &
+    term_pid=$!
+    client_pids="$client_pids $term_pid"
+    wait "$web_pid" "$term_pid"
+    kill "$kb_pid" 2>/dev/null
+    ;;
+launcher|"")
+    while :; do
+        /bin/nxlaunch /etc/nxlaunch.cnf
+        echo "nxlaunch exited; restarting"
+    done
+    ;;
+*)
+    echo "usage: start-microwindows [launcher|terminal|browser [url]|keyboard|all [url]]" >&2
+    exit 2
+    ;;
+esac
+MW_START
+chmod +x "$ROOTFS/bin/start-microwindows"
 cd /work
 
 # Create standard busybox symlinks. We can't run ./busybox on the host
@@ -386,6 +755,49 @@ esac
 UDHCPC_SCRIPT
 chmod +x "$ROOTFS/usr/share/udhcpc/default.script"
 
+cat > "$ROOTFS/bin/start-network" << 'NET_START'
+#!/bin/sh
+
+LOG=/tmp/network.log
+
+log() {
+    echo "[net] $*"
+    echo "[net] $*" >>"$LOG"
+    echo "[net] $*" >/dev/kmsg 2>/dev/null || true
+}
+
+: >"$LOG"
+/bin/ifconfig lo 127.0.0.1 up 2>>"$LOG" || true
+
+if [ ! -d /sys/class/net/eth0 ]; then
+    log "eth0 not present; boot with --ne2000 to enable networking"
+    exit 0
+fi
+
+log "bringing up eth0"
+if ! /bin/ifconfig eth0 up >>"$LOG" 2>&1; then
+    log "could not bring eth0 up"
+    exit 0
+fi
+
+log "starting DHCP on eth0"
+(
+    /bin/udhcpc -i eth0 -s /usr/share/udhcpc/default.script \
+        -p /tmp/udhcpc.eth0.pid -q -t 5 -T 3
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "[net] DHCP configured eth0" >>"$LOG"
+        echo "[net] DHCP configured eth0" >/dev/kmsg 2>/dev/null || true
+    else
+        echo "[net] DHCP failed on eth0 rc=$rc" >>"$LOG"
+        echo "[net] DHCP failed on eth0 rc=$rc" >/dev/kmsg 2>/dev/null || true
+    fi
+) &
+
+exit 0
+NET_START
+chmod +x "$ROOTFS/bin/start-network"
+
 cat > "$ROOTFS/bin/ne2000-net-test" << 'NET_TEST'
 #!/bin/sh
 
@@ -431,11 +843,13 @@ chmod +x "$ROOTFS/bin/ne2000-net-test"
 cat > "$ROOTFS/etc/inittab" << 'INITTAB'
 ::sysinit:/bin/mount -t proc proc /proc
 ::sysinit:/bin/mount -t sysfs sysfs /sys
+::sysinit:/bin/mkdir -p /dev/pts
+::sysinit:/bin/mount -t devpts devpts /dev/pts
 ::sysinit:/bin/mount -t tmpfs tmpfs /tmp
 ::sysinit:/bin/echo "=== Casio BE-300 Linux 4.2.9 (BusyBox + Nano-X) ==="
-::sysinit:/bin/echo "  Run /bin/demo-hello to launch a Nano-X demo."
-::sysinit:/bin/ne2000-net-test
-tty0::respawn:/bin/sh
+::sysinit:/bin/echo "  Microwindows starts on tty0; serial shell is ttyVR0."
+::sysinit:/bin/start-network
+tty0::respawn:/bin/start-microwindows
 ttyVR0::respawn:/bin/sh
 ::ctrlaltdel:/bin/umount -a -r
 ::shutdown:/bin/umount -a -r
@@ -796,6 +1210,8 @@ cd linux-4.2.9
 
 echo "=== Phase 3: Applying BE-300 kernel patch series ==="
 /work/scripts/apply_patch_series.sh "$KERNEL_PATCH_SERIES" /work/linux-4.2.9
+cp /work/board/casio-be300/touch_be300.c \
+   /work/linux-4.2.9/arch/mips/vr41xx/casio-be300/touch_be300.c
 
 ###############################################################################
 # Phase 5: Configure kernel

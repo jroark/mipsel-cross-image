@@ -44,12 +44,10 @@ the kernel); subsequent runs reuse the musl/headers caches.
 Emulator keys: `Q` quit, `S` screenshot (saved as `screenshot_*.bmp`),
 `M` help. Useful flags: `--log-mmio`, `--trace`, `--speed 0` (unthrottled).
 The kernel command line baked into the NAND image carries
-`console=tty0 console=ttyVR0,115200 root=/dev/mtdblock3 rootfstype=jffs2`.
+`console=ttyVR0,115200 consoleblank=0 root=/dev/mtdblock3 rootfstype=jffs2`.
 
-The early kernel messages go to both the companion-chip serial UART and
-the framebuffer console. After `Console: switching to colour frame buffer
-device` everything continues to both — `keep_bootcon` is appended to the
-cmdline so the kernel printks stay on serial as well.
+Kernel messages stay on the companion-chip serial UART so Microwindows can
+own the framebuffer without fbcon text overwriting the UI.
 
 To exercise the NE2000 networking smoke test (DHCP + DNS + wget), boot
 with `--ne2000` attached:
@@ -57,6 +55,9 @@ with `--ne2000` attached:
 ./bin/be300 --nand linux-4.2.9/be300.nand --ne2000 \
     --net-mac 02:de:ad:be:ef:01 --speed 0
 ```
+When `--ne2000` is present, `/bin/start-network` brings `eth0` up during
+boot and starts DHCP in the background. Run `/bin/ne2000-net-test` from the
+serial shell for the blocking DHCP/DNS/HTTP smoke test.
 
 ### 4. Build a CompactFlash recovery image
 After the NAND build has populated `linux-4.2.9/` and `rootfs_be300/`:

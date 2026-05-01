@@ -45,13 +45,10 @@ CONFIG_UNIX98_PTYS=y
 # Early printk
 CONFIG_EARLY_PRINTK=y
 
-# Built-in kernel command line. Two consoles:
-#   tty0       — framebuffer console (visible on the LCD).
-#   ttyVR0     — VR4131 SIU at 0x0F000800; emulator pipes TX to its stdout.
-# printk goes to both. ttyVR0 is RX-only on the host stdin if the emulator
-# is invoked with the right flag; without it, ttyVR0 is TX-only.
+# Built-in kernel command line. Keep printk on serial only so Microwindows
+# owns the framebuffer without fbcon text or console blanking races.
 CONFIG_CMDLINE_BOOL=y
-CONFIG_CMDLINE="earlyprintk console=tty0 console=ttyVR0,115200 root=/dev/mtdblock3 rootfstype=jffs2 rootwait"
+CONFIG_CMDLINE="earlyprintk console=ttyVR0,115200 consoleblank=0 root=/dev/mtdblock3 rootfstype=jffs2 rootwait"
 
 # Framebuffer — minimal (sfb built into board support)
 CONFIG_FB=y

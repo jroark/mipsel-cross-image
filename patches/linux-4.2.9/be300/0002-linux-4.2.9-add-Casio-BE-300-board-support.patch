@@ -1778,7 +1778,7 @@ new file mode 100644
 index 0000000..1ba9a81
 --- /dev/null
 +++ b/arch/mips/vr41xx/casio-be300/touch_be300.c
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,334 @@
 +/*
 + * arch/mips/vr41xx/casio-be300/touch_be300.c
 + *
@@ -1826,11 +1826,9 @@ index 0000000..1ba9a81
 + *   The emulator maps host (x, y) into a fixed ADC range per channel:
 + *     y+ in [0x81E1, 0x8E30]  linear with y in [0, 358]
 + *     x+ in [0x8300, 0x8D1B]  linear with x in [0, 239]
-+ *   We invert that here using y+ and x+ alone (channels 0 and 3); the
-+ *   redundant y- / x- channels (1, 2) are ignored. On real hardware the
-+ *   four-channel form would be y = (y+ - y-)/2-ish, but VRC4173 already
-+ *   averages internally — taking one channel matches what the emulator
-+ *   produces and what the touchscreen panel layout encodes.
++ *   Decode all four channels when present. The touch panel includes the
++ *   320-line LCD plus a 40-ish line icon strip below it, so raw Y is first
++ *   mapped to panel space and then clamped to the Linux framebuffer height.
 + *
 + * Copyright (C) 2026 John Roark
 + *
@@ -1866,11 +1864,11 @@ index 0000000..1ba9a81
 +#define PIU_PB13		0x5c
 +
 +/* PIUCNTREG control bits (VRC4173 UM §9.7). */
-+#define PIUCNT_PIUSEN		0x0001	/* scan-start kick (self-clearing) */
-+#define PIUCNT_PIUPWR		0x0002	/* power on */
++#define PIUCNT_SCAN_KICK	0x0001	/* scan-start kick (self-clearing) */
 +#define PIUCNT_PADATSTART	0x0004	/* enable data scan */
 +#define PIUCNT_PADATSTOP	0x0008
-+#define PIUCNT_PADWAITPEN	0x0010	/* wait-for-pen-touch state enable */
++#define PIUCNT_PIUSEQEN		0x0100	/* enable scan sequencer */
++#define PIUCNT_PIUPWR		0x0200	/* power on */
 +#define PIUCNT_PEN_DETECTED	0x2000
 +
 +/* PIUINTREG pending bits (low byte). */
@@ -1890,6 +1888,7 @@ index 0000000..1ba9a81
 +
 +#define BE300_TOUCH_WIDTH	240
 +#define BE300_TOUCH_HEIGHT	320
++#define BE300_TOUCH_PANEL_HEIGHT	359
 +
 +struct be300_touch {
 +	void __iomem *base;
@@ -1910,38 +1909,84 @@ index 0000000..1ba9a81
 +	writew(val, t->base + off);
 +}
 +
++static bool piu_adc_valid(u16 value, u16 min, u16 max)
++{
++	return value >= min && value <= max;
++}
++
++static int piu_adc_to_pos(u16 value, u16 min, u16 max, int span)
++{
++	if (value < min)
++		value = min;
++	if (value > max)
++		value = max;
++
++	return ((int)(value - min) * (span - 1)) / (max - min);
++}
++
++static int piu_adc_to_pos_inv(u16 value, u16 min, u16 max, int span)
++{
++	if (value < min)
++		value = min;
++	if (value > max)
++		value = max;
++
++	return ((int)(max - value) * (span - 1)) / (max - min);
++}
++
 +static void piu_decode_page(struct be300_touch *t, unsigned page_off,
 +			    int *out_x, int *out_y)
 +{
 +	u16 yp = piu_read(t, page_off + 0x00);
++	u16 ym = piu_read(t, page_off + 0x04);
++	u16 xm = piu_read(t, page_off + 0x08);
 +	u16 xp = piu_read(t, page_off + 0x0c);
-+	int x, y;
++	int x = 0, y = 0, n = 0;
 +
-+	if (yp < PIU_ADC_Y_MIN)
-+		yp = PIU_ADC_Y_MIN;
-+	if (yp > PIU_ADC_Y_MAX)
-+		yp = PIU_ADC_Y_MAX;
-+	if (xp < PIU_ADC_X_MIN)
-+		xp = PIU_ADC_X_MIN;
-+	if (xp > PIU_ADC_X_MAX)
-+		xp = PIU_ADC_X_MAX;
++	if (piu_adc_valid(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX)) {
++		x += piu_adc_to_pos(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++				    BE300_TOUCH_WIDTH);
++		n++;
++	}
++	if (piu_adc_valid(xm, PIU_ADC_X_MIN, PIU_ADC_X_MAX)) {
++		x += piu_adc_to_pos_inv(xm, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++					BE300_TOUCH_WIDTH);
++		n++;
++	}
++	x = n ? x / n : piu_adc_to_pos(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++				       BE300_TOUCH_WIDTH);
 +
-+	y = ((int)(yp - PIU_ADC_Y_MIN) * (BE300_TOUCH_HEIGHT - 1))
-+		/ (PIU_ADC_Y_MAX - PIU_ADC_Y_MIN);
-+	x = ((int)(xp - PIU_ADC_X_MIN) * (BE300_TOUCH_WIDTH - 1))
-+		/ (PIU_ADC_X_MAX - PIU_ADC_X_MIN);
-+
-+	if (x < 0)
-+		x = 0;
-+	if (x >= BE300_TOUCH_WIDTH)
-+		x = BE300_TOUCH_WIDTH - 1;
-+	if (y < 0)
-+		y = 0;
++	n = 0;
++	if (piu_adc_valid(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX)) {
++		y += piu_adc_to_pos(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++				    BE300_TOUCH_PANEL_HEIGHT);
++		n++;
++	}
++	if (piu_adc_valid(ym, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX)) {
++		y += piu_adc_to_pos_inv(ym, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++					BE300_TOUCH_PANEL_HEIGHT);
++		n++;
++	}
++	y = n ? y / n : piu_adc_to_pos(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++				       BE300_TOUCH_PANEL_HEIGHT);
 +	if (y >= BE300_TOUCH_HEIGHT)
 +		y = BE300_TOUCH_HEIGHT - 1;
 +
 +	*out_x = x;
 +	*out_y = y;
++}
++
++static void be300_touch_report_page(struct be300_touch *t, unsigned page_off)
++{
++	int x, y;
++
++	piu_decode_page(t, page_off, &x, &y);
++	t->pen_down = true;
++	input_report_key(t->input, BTN_TOUCH, 1);
++	input_report_abs(t->input, ABS_X, x);
++	input_report_abs(t->input, ABS_Y, y);
++	input_report_abs(t->input, ABS_PRESSURE, 1);
++	input_sync(t->input);
 +}
 +
 +static irqreturn_t be300_touch_isr(int irq, void *dev)
@@ -1952,10 +1997,23 @@ index 0000000..1ba9a81
 +	u16 mask = status >> 8;
 +	u16 effective = pending & mask;
 +	u16 ack = 0;
-+	int x, y;
 +
 +	if (!effective)
 +		return IRQ_NONE;
++
++	/*
++	 * A short tap can coalesce page-ready and pen-up in one IRQ. Page data
++	 * was captured while the pen was down, so publish it before PENCHG.
++	 */
++	if (effective & PIUINT_PADPAGE0INTR) {
++		be300_touch_report_page(t, PIU_PB00);
++		ack |= PIUINT_PADPAGE0INTR;
++	}
++
++	if (effective & PIUINT_PADPAGE1INTR) {
++		be300_touch_report_page(t, PIU_PB10);
++		ack |= PIUINT_PADPAGE1INTR;
++	}
 +
 +	if (effective & PIUINT_PENCHGINTR) {
 +		bool down = !!(piu_read(t, PIU_CNTREG) & PIUCNT_PEN_DETECTED);
@@ -1966,24 +2024,6 @@ index 0000000..1ba9a81
 +		}
 +		input_sync(t->input);
 +		ack |= PIUINT_PENCHGINTR;
-+	}
-+
-+	if (effective & PIUINT_PADPAGE0INTR) {
-+		piu_decode_page(t, PIU_PB00, &x, &y);
-+		input_report_abs(t->input, ABS_X, x);
-+		input_report_abs(t->input, ABS_Y, y);
-+		input_report_abs(t->input, ABS_PRESSURE, t->pen_down ? 1 : 0);
-+		input_sync(t->input);
-+		ack |= PIUINT_PADPAGE0INTR;
-+	}
-+
-+	if (effective & PIUINT_PADPAGE1INTR) {
-+		piu_decode_page(t, PIU_PB10, &x, &y);
-+		input_report_abs(t->input, ABS_X, x);
-+		input_report_abs(t->input, ABS_Y, y);
-+		input_report_abs(t->input, ABS_PRESSURE, t->pen_down ? 1 : 0);
-+		input_sync(t->input);
-+		ack |= PIUINT_PADPAGE1INTR;
 +	}
 +
 +	if (effective & PIUINT_PADDLOSTINTR) {
@@ -2045,15 +2085,15 @@ index 0000000..1ba9a81
 +	/*
 +	 * Configure PIU defaults from VRC4173 UM §9 idle dump
 +	 * (docs/hardware/hw_dump_vrc4173.txt:983) and enable PENCHG +
-+	 * page 0/1 + datalost interrupts. PIUSEN (bit 0) is the scan-start
-+	 * kick — hardware self-clears it.
++	 * page 0/1 + datalost interrupts. The 0x0304-style control word
++	 * enables PIUPWR + PIUSEQEN + PADATSTART with mode 00 WaitPenTouch.
 +	 */
 +	piu_write(t, PIU_SIVL, 0x05DC);
 +	piu_write(t, PIU_STBL, 0x00C8);
 +	piu_write(t, PIU_INTREG, (PIUINT_PENDING_ALL << 8) | 0);
 +	piu_write(t, PIU_CNTREG,
-+		  PIUCNT_PIUSEN | PIUCNT_PIUPWR |
-+		  PIUCNT_PADATSTART | PIUCNT_PADWAITPEN);
++		  PIUCNT_PIUPWR | PIUCNT_PIUSEQEN |
++		  PIUCNT_PADATSTART);
 +
 +	be300_touch_dev = t;
 +	pr_info("be300-touch: registered, irq=%d, base=%pa\n",
