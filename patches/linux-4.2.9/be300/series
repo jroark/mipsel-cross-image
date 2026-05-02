@@ -3,3 +3,4 @@
 0003-linux-4.2.9-add-BE-300-runtime-fixes.patch
 0004-linux-4.2.9-add-BE-300-defconfig.patch
 0005-linux-4.2.9-fix-vr41xx-rtc-host-time.patch
+0006-linux-4.2.9-add-linux4be-fbcon-logo.patch

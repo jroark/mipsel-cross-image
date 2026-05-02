@@ -43,11 +43,18 @@ the kernel); subsequent runs reuse the musl/headers caches.
 ```
 Emulator keys: `Q` quit, `S` screenshot (saved as `screenshot_*.bmp`),
 `M` help. Useful flags: `--log-mmio`, `--trace`, `--speed 0` (unthrottled).
-The kernel command line baked into the NAND image carries
-`console=ttyVR0,115200 consoleblank=0 root=/dev/mtdblock3 rootfstype=jffs2`.
+The kernel command line baked into the NAND image carries `console=tty0`,
+`console=ttyVR0,115200`, `consoleblank=0`, `vt.global_cursor_default=0`, and
+the NAND rootfs arguments.
 
-Kernel messages stay on the companion-chip serial UART so Microwindows can
-own the framebuffer without fbcon text overwriting the UI.
+Kernel messages mirror to both the framebuffer console and the companion-chip
+serial UART, and fbcon displays the 2.6-era Linux4BE 240x80 boot banner before
+userspace starts. The banner is reconstructed from the old 2.6 framebuffer
+capture with its green-channel cast corrected. Serial is listed last, so
+`/dev/console` remains the UART.
+The GUI launchers switch tty0 to `KD_GRAPHICS` before opening `/dev/fb0`, which
+keeps fbcon available for boot/crash text without repainting over the running
+Microwindows or OPIE UI.
 
 To exercise the NE2000 networking smoke test (DHCP + DNS + wget), boot
 with `--ne2000` attached:
@@ -137,7 +144,10 @@ At a high level:
   `patches/linux-4.2.9/be300/series`. The series contains the GCC/UAPI
   compatibility fixes, BE-300 board support, VR41xx TLB/PTE fixes, VR4131
   cache-bug split, 32-bit page-operation forcing, VDSO disable,
-  interrupt/GPIO fixes, NE2000 autoprobe suppression, and `be300_defconfig`.
+  interrupt/GPIO fixes, NE2000 autoprobe suppression, the Linux4BE fbcon logo
+  selection, and `be300_defconfig`. The color-corrected 240x80 logo source lives at
+  [`board/casio-be300/logo_linux4be_clut224.ppm`](board/casio-be300/logo_linux4be_clut224.ppm)
+  and is copied into the extracted kernel tree before configuration.
 - **Phase 5–6** — Configure with `configs/be300_defconfig`
   from the applied patch series and build `vmlinux`. The kernel mounts the
   JFFS2 root filesystem from NAND mtd3 directly.

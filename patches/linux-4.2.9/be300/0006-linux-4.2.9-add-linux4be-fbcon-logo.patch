@@ -1,0 +1,61 @@
+From 87ab7b0db97fdd4e1cfc11567e6ab98cb48b1e35 Mon Sep 17 00:00:00 2001
+From: BE300 Patch Generator <be300@example.invalid>
+Date: Sat, 02 May 2026 12:00:00 -0700
+Subject: [PATCH 6/6] linux-4.2.9: add Linux4BE fbcon logo
+
+
+diff --git a/drivers/video/logo/Kconfig b/drivers/video/logo/Kconfig
+index 38f6486..eb61248 100644
+--- a/drivers/video/logo/Kconfig
++++ b/drivers/video/logo/Kconfig
+@@ -25,6 +25,11 @@ config LOGO_TINYCORE_CLUT224
+ 	bool "Unofficial 33-color TinyCoreLinux logo"
+ 	default y
+ 
++config LOGO_LINUX4BE_CLUT224
++	bool "Linux4BE BE-300 framebuffer console logo"
++	depends on CASIO_BE300
++	default y
++
+ config LOGO_BLACKFIN_VGA16
+ 	bool "16-colour Blackfin Processor Linux logo"
+ 	depends on BLACKFIN
+diff --git a/drivers/video/logo/Makefile b/drivers/video/logo/Makefile
+index 3f9f881..f943621 100644
+--- a/drivers/video/logo/Makefile
++++ b/drivers/video/logo/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_LOGO_LINUX_MONO)		+= logo_linux_mono.o
+ obj-$(CONFIG_LOGO_LINUX_VGA16)		+= logo_linux_vga16.o
+ obj-$(CONFIG_LOGO_LINUX_CLUT224)	+= logo_linux_clut224.o
+ obj-$(CONFIG_LOGO_TINYCORE_CLUT224)	+= logo_tinycore_clut224.o
++obj-$(CONFIG_LOGO_LINUX4BE_CLUT224)	+= logo_linux4be_clut224.o
+ obj-$(CONFIG_LOGO_BLACKFIN_CLUT224)	+= logo_blackfin_clut224.o
+ obj-$(CONFIG_LOGO_BLACKFIN_VGA16)	+= logo_blackfin_vga16.o
+ obj-$(CONFIG_LOGO_DEC_CLUT224)		+= logo_dec_clut224.o
+diff --git a/drivers/video/logo/logo.c b/drivers/video/logo/logo.c
+index 866d7db..02455d0 100644
+--- a/drivers/video/logo/logo.c
++++ b/drivers/video/logo/logo.c
+@@ -75,6 +75,10 @@ const struct linux_logo * __init_refok fb_find_logo(int depth)
+ 		/* Generic Linux logo */
+ 		logo = &logo_tinycore_clut224;
+ #endif
++#ifdef CONFIG_LOGO_LINUX4BE_CLUT224
++		/* Linux4BE BE-300 logo */
++		logo = &logo_linux4be_clut224;
++#endif
+ #ifdef CONFIG_LOGO_BLACKFIN_CLUT224
+ 		/* Blackfin Linux logo */
+ 		logo = &logo_blackfin_clut224;
+diff --git a/include/linux/linux_logo.h b/include/linux/linux_logo.h
+index 4a5ce7f..56a827f 100644
+--- a/include/linux/linux_logo.h
++++ b/include/linux/linux_logo.h
+@@ -34,6 +34,7 @@ extern const struct linux_logo logo_linux_mono;
+ extern const struct linux_logo logo_linux_vga16;
+ extern const struct linux_logo logo_linux_clut224;
+ extern const struct linux_logo logo_tinycore_clut224;
++extern const struct linux_logo logo_linux4be_clut224;
+ extern const struct linux_logo logo_blackfin_vga16;
+ extern const struct linux_logo logo_blackfin_clut224;
+ extern const struct linux_logo logo_dec_clut224;

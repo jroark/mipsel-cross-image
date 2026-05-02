@@ -35,6 +35,13 @@ positive-width tabs with direct, high-contrast painting. The stock Opie compact
 tab layout depends on tab icons and can collapse inactive tabs on the BE-300
 profile, leaving only invisible click targets at the top of the display.
 
+Opie autostarts from BusyBox init on tty0, but `start-opie` switches that VT to
+`KD_GRAPHICS` before launching `qpe -qws`. This allows the kernel's framebuffer
+console to show boot text and the Linux4BE banner while keeping fbcon writes
+from repainting over the Qt/Embedded LinuxFb UI. If QPE exits with an error,
+the script returns tty0 to text mode and prints the last lines of
+`/tmp/opie.log`.
+
 The Opie power meter uses Linux APM emulation through `/proc/apm`. The BE-300
 kernel currently reports the emulator as AC online with a 100% battery because
 the emulator does not expose dynamic battery or charger state yet.

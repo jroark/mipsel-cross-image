@@ -45,10 +45,11 @@ CONFIG_UNIX98_PTYS=y
 # Early printk
 CONFIG_EARLY_PRINTK=y
 
-# Built-in kernel command line. Keep printk on serial only so Microwindows
-# owns the framebuffer without fbcon text or console blanking races.
+# Built-in kernel command line. Keep serial last so /dev/console remains the
+# UART, while printk also mirrors to fbcon during boot. GUI launchers switch
+# the active VT to KD_GRAPHICS before owning /dev/fb0.
 CONFIG_CMDLINE_BOOL=y
-CONFIG_CMDLINE="earlyprintk console=ttyVR0,115200 consoleblank=0 root=/dev/mtdblock3 rootfstype=jffs2 rootwait ro"
+CONFIG_CMDLINE="earlyprintk console=tty0 console=ttyVR0,115200 consoleblank=0 vt.global_cursor_default=0 root=/dev/mtdblock3 rootfstype=jffs2 rootwait ro"
 
 # Framebuffer — minimal (sfb built into board support)
 CONFIG_FB=y
@@ -59,6 +60,12 @@ CONFIG_FRAMEBUFFER_CONSOLE=y
 CONFIG_FONTS=y
 CONFIG_FONT_8x8=y
 # CONFIG_FONT_8x16 is not set
+CONFIG_LOGO=y
+# CONFIG_LOGO_LINUX_MONO is not set
+# CONFIG_LOGO_LINUX_VGA16 is not set
+# CONFIG_LOGO_LINUX_CLUT224 is not set
+# CONFIG_LOGO_TINYCORE_CLUT224 is not set
+CONFIG_LOGO_LINUX4BE_CLUT224=y
 
 # Serial: VR41xx SIU. The BE300 emulator's VR4131 SIU at 0xAF000800 is
 # ns16550-compatible and wired to VRIP 9. The mainline VR41xx common code

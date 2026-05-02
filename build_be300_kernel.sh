@@ -300,6 +300,19 @@ mipsel-linux-gnu-strip /tmp/touch_query_test
 cp /tmp/touch_query_test "$ROOTFS/bin/touch_query_test"
 chmod +x "$ROOTFS/bin/touch_query_test"
 
+# VT mode helper used by framebuffer-owning GUIs. KD_GRAPHICS leaves fbcon
+# active for boot/crash text but prevents it from repainting over /dev/fb0
+# while Qt/Embedded or Nano-X owns the screen.
+mipsel-linux-gnu-gcc -march=mips2 -Os -static \
+    -specs "$MUSL_SPECS" -isystem "$KHDRS/include" \
+    -B/tmp/libgcc_patched \
+    /work/board/opie/be300_vtmode.c \
+    /tmp/libgcc_helpers.o \
+    -o /tmp/be300-vtmode
+mipsel-linux-gnu-strip /tmp/be300-vtmode
+cp /tmp/be300-vtmode "$ROOTFS/bin/be300-vtmode"
+chmod +x "$ROOTFS/bin/be300-vtmode"
+
 # Phase C' — optional GUI profile.  The default Microwindows / Nano-X path is
 # pure C.  The OPIE profile replaces it with Qt/Embedded + curated OPIE apps.
 if [ "$BE300_UI" = "microwindows" ]; then
@@ -661,6 +674,7 @@ cat > "$ROOTFS/bin/start-microwindows" << 'MW_START'
 export HOME=/root
 export MWFONTDIR=/usr/share/microwindows/pcf
 
+/bin/be300-vtmode graphics >/dev/null 2>&1 || true
 printf '\033[?25l' >/dev/tty0 2>/dev/null || true
 exec </dev/null >/tmp/microwindows.log 2>&1
 /bin/rm -f /tmp/.nano-X
@@ -674,6 +688,7 @@ cleanup() {
         kill "$pid" 2>/dev/null
     done
     kill "$server_pid" 2>/dev/null
+    /bin/be300-vtmode text >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -1297,6 +1312,8 @@ echo "=== Phase 3: Applying BE-300 kernel patch series ==="
 /work/scripts/apply_patch_series.sh "$KERNEL_PATCH_SERIES" /work/linux-4.2.9
 cp /work/board/casio-be300/touch_be300.c \
    /work/linux-4.2.9/arch/mips/vr41xx/casio-be300/touch_be300.c
+cp /work/board/casio-be300/logo_linux4be_clut224.ppm \
+   /work/linux-4.2.9/drivers/video/logo/logo_linux4be_clut224.ppm
 
 ###############################################################################
 # Phase 5: Configure kernel
