@@ -21,7 +21,11 @@ that image profile so the Qt/OPIE libraries and applications have room in the
 11 MiB JFFS2 rootfs partition.
 
 The 64 MiB profile uses `opie-be300-64m.config`, enables extra PIM/tools,
-Today plugins, input methods, and taskbar applets, and trims nonessential
-SysInfo device artwork so the JFFS2 image still fits the fixed rootfs
-partition. It must be booted with the emulator's `--sdram 64` flag so Linux's
-registered memory size matches the emulated hardware.
+Today plugins, input methods, taskbar applets, and a fuller Settings tab with
+the stock Opie launcher wallpaper and three-column icon layout. The wallpaper is
+installed as a PNG copy because this Qt/Embedded build keeps JPEG support
+disabled. The screenshot style this approximates is the Opie/Qtopia launcher as
+commonly shipped by OpenZaurus-era images. The profile trims nonessential
+SysInfo device artwork so the JFFS2 image still fits the fixed rootfs partition.
+It must be booted with the emulator's `--sdram 64` flag so Linux's registered
+memory size matches the emulated hardware.

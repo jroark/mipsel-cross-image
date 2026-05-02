@@ -129,9 +129,15 @@ def patch_launcher():
         "        docView()->setFocus();\n"
         "        categoryBar->showTab(\"Documents\");\n"
         "    } else if ( categoryBar && categoryBar->count() > 0 ) {\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "        if ( categoryBar->launcherTab( \"Settings\" ) )\n"
+        "            categoryBar->showTab( \"Settings\" );\n"
+        "#endif\n"
         "        LauncherView *view = categoryBar->currentView();\n"
-        "        if ( view )\n"
+        "        if ( view ) {\n"
         "            view->setFocus();\n"
+        "            stack->raiseWidget( view );\n"
+        "        }\n"
         "    }\n"
         "}\n",
         1,
@@ -161,6 +167,13 @@ def patch_launcher():
         "    } else {\n"
         "        stack->raiseWidget( view );\n"
         "    }\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    if ( view->iconView() && view->iconView()->viewport() ) {\n"
+        "        view->iconView()->viewport()->update();\n"
+        "        view->iconView()->viewport()->repaint( FALSE );\n"
+        "    }\n"
+        "    view->update();\n"
+        "#endif\n"
         "}\n",
         1,
     )
@@ -386,6 +399,157 @@ def patch_launcher():
         1,
     )
 
+    text = text.replace(
+        "void Launcher::typeAdded( const QString& type, const QString& name,\n"
+        "                    const QPixmap& pixmap, const QPixmap& )\n"
+        "{\n"
+        "    tabs->newView( type, pixmap, name );\n"
+        "    ids.append( type );\n"
+        "    /* this will be called in applicationScanningProgress with value 100! */\n"
+        "//    tb->refreshStartMenu();\n"
+        "\n"
+        "    static bool first = TRUE;\n"
+        "    if ( first ) {\n"
+        "    first = FALSE;\n"
+        "        tabs->categoryBar->showTab(type);\n"
+        "    }\n"
+        "\n"
+        "    tabs->view( type )->setUpdatesEnabled( FALSE );\n"
+        "    tabs->view( type )->setSortEnabled( FALSE );\n"
+        "}\n",
+        "void Launcher::typeAdded( const QString& type, const QString& name,\n"
+        "                    const QPixmap& pixmap, const QPixmap& )\n"
+        "{\n"
+        "    tabs->newView( type, pixmap, name );\n"
+        "    ids.append( type );\n"
+        "    /* this will be called in applicationScanningProgress with value 100! */\n"
+        "//    tb->refreshStartMenu();\n"
+        "\n"
+        "    static bool first = TRUE;\n"
+        "    if ( first ) {\n"
+        "    first = FALSE;\n"
+        "        tabs->categoryBar->showTab(type);\n"
+        "    }\n"
+        "\n"
+        "    LauncherView *view = tabs->view( type );\n"
+        "    if ( view ) {\n"
+        "        view->setUpdatesEnabled( FALSE );\n"
+        "        view->setSortEnabled( FALSE );\n"
+        "    }\n"
+        "}\n",
+        1,
+    )
+
+    text = text.replace(
+        "void Launcher::applicationScanningProgress( int percent )\n"
+        "{\n"
+        "    switch ( percent ) {\n"
+        "        case 0: {\n"
+        "        for ( QStringList::ConstIterator it=ids.begin(); it!= ids.end(); ++it) {\n"
+        "        tabs->view( (*it) )->setUpdatesEnabled( FALSE );\n"
+        "        tabs->view( (*it) )->setSortEnabled( FALSE );\n"
+        "        }\n"
+        "        break;\n"
+        "        }\n"
+        "        case 100: {\n"
+        "        for ( QStringList::ConstIterator it=ids.begin(); it!= ids.end(); ++it) {\n"
+        "        tabs->view( (*it) )->setUpdatesEnabled( TRUE );\n"
+        "        tabs->view( (*it) )->setSortEnabled( TRUE );\n"
+        "        }\n"
+        "            tb->refreshStartMenu();\n"
+        "        break;\n"
+        "        }\n"
+        "        default:\n"
+        "            break;\n"
+        "    }\n"
+        "}\n",
+        "void Launcher::applicationScanningProgress( int percent )\n"
+        "{\n"
+        "    switch ( percent ) {\n"
+        "        case 0: {\n"
+        "        for ( QStringList::ConstIterator it=ids.begin(); it!= ids.end(); ++it) {\n"
+        "            LauncherView *view = tabs->view( (*it) );\n"
+        "            if ( view ) {\n"
+        "                view->setUpdatesEnabled( FALSE );\n"
+        "                view->setSortEnabled( FALSE );\n"
+        "            }\n"
+        "        }\n"
+        "        break;\n"
+        "        }\n"
+        "        case 100: {\n"
+        "        for ( QStringList::ConstIterator it=ids.begin(); it!= ids.end(); ++it) {\n"
+        "            LauncherView *view = tabs->view( (*it) );\n"
+        "            if ( view ) {\n"
+        "                view->setUpdatesEnabled( TRUE );\n"
+        "                view->setSortEnabled( TRUE );\n"
+        "            }\n"
+        "        }\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "            if ( !ids.isEmpty() ) {\n"
+        "                QString firstType = tabs->view( \"Settings\" ) ? QString( \"Settings\" ) : *ids.begin();\n"
+        "                tabs->categoryBar->showTab( firstType );\n"
+        "                LauncherView *view = tabs->view( firstType );\n"
+        "                if ( view ) {\n"
+        "                    view->relayout();\n"
+        "                    view->show();\n"
+        "                    view->setFocus();\n"
+        "                    view->update();\n"
+        "                    if ( view->iconView() && view->iconView()->viewport() ) {\n"
+        "                        view->iconView()->viewport()->update();\n"
+        "                        view->iconView()->viewport()->repaint( FALSE );\n"
+        "                    }\n"
+        "                }\n"
+        "            }\n"
+        "            tabs->show();\n"
+        "            showMaximized();\n"
+        "            raise();\n"
+        "            update();\n"
+        "#endif\n"
+        "            tb->refreshStartMenu();\n"
+        "        break;\n"
+        "        }\n"
+        "        default:\n"
+        "            break;\n"
+        "    }\n"
+        "}\n",
+        1,
+    )
+
+    write_text(path, text)
+
+
+def patch_launcherview():
+    restore_original("core/launcher/launcherview.cpp")
+
+    path = ROOT / "core/launcher/launcherview.cpp"
+    if not path.exists():
+        return
+
+    text = strip_be300_debug(read_text(path))
+    text = text.replace(
+        "void LauncherView::setUpdatesEnabled( bool u )\n"
+        "{\n"
+        "    icons->setUpdatesEnabled( u );\n"
+        "}\n",
+        "void LauncherView::setUpdatesEnabled( bool u )\n"
+        "{\n"
+        "    icons->setUpdatesEnabled( u );\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    if ( icons->viewport() ) {\n"
+        "        icons->viewport()->setUpdatesEnabled( u );\n"
+        "        if ( u ) {\n"
+        "            icons->viewport()->update();\n"
+        "            icons->viewport()->repaint( FALSE );\n"
+        "        }\n"
+        "    }\n"
+        "    if ( u ) {\n"
+        "        icons->update();\n"
+        "        update();\n"
+        "    }\n"
+        "#endif\n"
+        "}\n",
+        1,
+    )
     write_text(path, text)
 
 
@@ -482,13 +646,35 @@ def patch_launcher_main():
     write_text(path, text)
 
 
+def patch_backup():
+    for rel in (
+        "noncore/settings/backup/backuprestore.h",
+        "noncore/settings/backup/backuprestore.cpp",
+    ):
+        restore_original(rel)
+        path = ROOT / rel
+        if not path.exists():
+            continue
+
+        text = read_text(path).replace("__dev_t", "dev_t")
+        if rel.endswith(".h") and "#include <sys/types.h>" not in text:
+            text = text.replace(
+                "#include <qlist.h>\n#include <sys/stat.h>\n",
+                "#include <qlist.h>\n#include <sys/types.h>\n#include <sys/stat.h>\n",
+                1,
+            )
+        write_text(path, text)
+
+
 def main():
     patch_qpeapplication()
     patch_launcher()
+    patch_launcherview()
     patch_documentlist()
     patch_taskbar()
     patch_opie_application()
     patch_launcher_main()
+    patch_backup()
 
 
 if __name__ == "__main__":

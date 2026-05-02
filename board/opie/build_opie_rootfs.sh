@@ -1730,7 +1730,9 @@ if path.exists():
     path.write_text(text, encoding="latin-1")
 
 path = root / "core/launcher/launcherview.cpp"
-if path.exists():
+# Final launcher-view fixes live in patch_opie_sources.py.  Keep this
+# debug-era placeholder-icon patch disabled so stock Opie icons can paint.
+if False and path.exists():
     text = path.read_text(encoding="latin-1")
     if "#include <stdio.h>" not in text:
         text = text.replace(
@@ -3736,7 +3738,12 @@ install_selected_desktop_files() {
 		Applications/tableviewer.desktop \
 		1Pim/osearch.desktop \
 		1Pim/today.desktop \
+		Settings/aqpkg.desktop \
 		Settings/appearance.desktop \
+		Settings/calibrate.desktop \
+		Settings/language.desktop \
+		Settings/quit.desktop \
+		Settings/systemtime.desktop \
 		Settings/confedit.desktop \
 		Settings/doctab.desktop"
 	fi
@@ -3768,6 +3775,12 @@ install_selected_desktop_files() {
 		copy_if_exists "$OPIE_SRC/apps/$rel/.directory" \
 			"$ROOTFS/opt/QtPalmtop/apps/$rel/.directory"
 	done
+	if [ "$OPIE_PROFILE" = "opie64" ]; then
+		copy_if_exists "$OPIE_SRC/apps/Applications/backup.desktop" \
+			"$ROOTFS/opt/QtPalmtop/apps/Settings/backup.desktop"
+	fi
+	copy_if_exists "$OPIE_SRC/apps/Applications/citytime.desktop" \
+		"$ROOTFS/opt/QtPalmtop/apps/Settings/citytime.desktop"
 	copy_if_exists "$OPIE_SRC/apps/.directory" "$ROOTFS/opt/QtPalmtop/apps/.directory"
 }
 
@@ -3777,8 +3790,9 @@ install_selected_pics() {
 	extra_pics=""
 	if [ "$OPIE_PROFILE" = "opie64" ]; then
 		extra_pics="\
-		appearance checkbook clockapplet confedit doctab euroconv memory \
-		opie-sheet opie-write osearch screenshotapplet \
+		aqpkg appearance backup calibrate checkbook clockapplet confedit \
+		doctab euroconv memory netsystemtime opie-sheet opie-write \
+		osearch screenshotapplet \
 		tableviewer today"
 	fi
 
@@ -3797,8 +3811,13 @@ install_selected_pics() {
 	find "$ROOTFS/opt/QtPalmtop/apps" -name '*.desktop' -print | while read -r desktop; do
 		grep '^Icon[[:space:]]*=' "$desktop" | cut -d= -f2- | while read -r icon; do
 			[ -n "$icon" ] || continue
+			local_icon="$(printf '%s' "$icon" | tr '[:upper:]' '[:lower:]')"
 			for ext in png xpm; do
 				copy_if_exists "$OPIE_SRC/pics/${icon}.${ext}" \
+					"$ROOTFS/opt/QtPalmtop/pics/${icon}.${ext}"
+				copy_if_exists "$OPIE_SRC/pics/inline/${icon}.${ext}" \
+					"$ROOTFS/opt/QtPalmtop/pics/${icon}.${ext}"
+				copy_if_exists "$OPIE_SRC/pics/inline/${local_icon}.${ext}" \
 					"$ROOTFS/opt/QtPalmtop/pics/${icon}.${ext}"
 			done
 		done
@@ -3843,7 +3862,7 @@ FONTDIR
 
 	extra_apps=""
 	if [ "$OPIE_PROFILE" = "opie64" ]; then
-		extra_apps="today osearch opie-write checkbook opie-sheet tableviewer euroconv appearance doctab confedit"
+		extra_apps="today osearch opie-write checkbook opie-sheet tableviewer euroconv aqpkg backup language systemtime appearance calibrate doctab confedit"
 	fi
 	for app in qpe quicklauncher embeddedkonsole helpbrowser textedit addressbook \
 			datebook todolist opie-notes advancedfm calculator clock sysinfo \
@@ -3854,8 +3873,17 @@ FONTDIR
 
 	install_selected_desktop_files
 	install_selected_pics
+	if [ "$OPIE_PROFILE" = "opie64" ] && \
+			[ -f /work/board/opie/defaults/opie-background.png ]; then
+		mkdir -p "$ROOTFS/opt/QtPalmtop/pics/launcher"
+		cp /work/board/opie/defaults/opie-background.png \
+			"$ROOTFS/opt/QtPalmtop/pics/launcher/opie-background.png"
+	fi
 	find "$ROOTFS/opt/QtPalmtop/pics" -type f \
-		\( -name '*.jpg' -o -name 'firstuse-*' \) -delete
+		\( -name '*.jpg' -o -name '*.jpeg' -o -name 'firstuse-*' \) -print |
+		while read -r pic; do
+			rm -f "$pic"
+		done
 	if [ "$OPIE_PROFILE" = "opie64" ] && \
 			[ -d "$ROOTFS/opt/QtPalmtop/pics/sysinfo" ]; then
 		find "$ROOTFS/opt/QtPalmtop/pics/sysinfo" -type f -print |
@@ -3876,6 +3904,13 @@ FONTDIR
 	fi
 	mkdir -p "$ROOTFS/opt/QtPalmtop/etc/default"
 	cp -a /work/board/opie/defaults/. "$ROOTFS/opt/QtPalmtop/etc/default/"
+	if [ "$OPIE_PROFILE" = "opie64" ] && \
+			[ -f /work/board/opie/defaults/Launcher-opie64.conf ]; then
+		cp /work/board/opie/defaults/Launcher-opie64.conf \
+			"$ROOTFS/opt/QtPalmtop/etc/default/Launcher.conf"
+	fi
+	rm -f "$ROOTFS/opt/QtPalmtop/etc/default/Launcher-opie64.conf"
+	rm -f "$ROOTFS/opt/QtPalmtop/etc/default/opie-background.png"
 	copy_if_exists "$OPIE_SRC/etc/mime.types" "$ROOTFS/opt/QtPalmtop/etc/mime.types"
 	copy_if_exists "$OPIE_SRC/etc/mime.conf" "$ROOTFS/opt/QtPalmtop/etc/mime.conf"
 

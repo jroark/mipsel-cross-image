@@ -76,8 +76,10 @@ docker-compose run --rm mips-dev bash -c "./build_be300_opie64_nand.sh"
 ```
 
 The 64 MiB profile keeps the stock images unchanged, registers the larger
-SDRAM size in Linux, and builds a larger OPIE applet/PIM/tools set. It must be
-booted with `--sdram 64`; do not substitute a `mem=` kernel argument.
+SDRAM size in Linux, and builds a larger OPIE applet/PIM/tools set. Its
+launcher defaults use the stock Opie wallpaper and a fuller Settings tab that
+matches the classic Opie/Qtopia Settings screen more closely. It must be booted
+with `--sdram 64`; do not substitute a `mem=` kernel argument.
 
 ### 4. Build a CompactFlash recovery image
 After the NAND build has populated `linux-4.2.9/` and `rootfs_be300/`:
