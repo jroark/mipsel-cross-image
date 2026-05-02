@@ -30,6 +30,11 @@ SysInfo device artwork so the JFFS2 image still fits the fixed rootfs partition.
 It must be booted with the emulator's `--sdram 64` flag so Linux's registered
 memory size matches the emulated hardware.
 
+The BE-300 launcher patches force the category tab bar to use equal
+positive-width tabs with direct, high-contrast painting. The stock Opie compact
+tab layout depends on tab icons and can collapse inactive tabs on the BE-300
+profile, leaving only invisible click targets at the top of the display.
+
 The Opie power meter uses Linux APM emulation through `/proc/apm`. The BE-300
 kernel currently reports the emulator as AC online with a 100% battery because
 the emulator does not expose dynamic battery or charger state yet.
@@ -42,3 +47,9 @@ emulator's framebuffer implementation at physical `0x0A000200` and falls back to
 Qt's software raster code if the register mmap is unavailable.
 `BE300_QWS_NOACCEL=1` keeps the software raster path even if acceleration is
 requested.
+
+The BE-300 Qt mouse handler reads the touchscreen through
+`TPanel:/dev/input/event1`. It coalesces high-rate pressed-motion evdev reports
+while preserving immediate press and release reports, which keeps launcher icon
+taps and window close taps from turning into small drags or follow-on selection
+changes.

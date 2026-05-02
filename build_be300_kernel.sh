@@ -7,7 +7,7 @@ KERNEL_PATCH_SERIES="/work/patches/linux-4.2.9/be300/series"
 BE300_UI="${BE300_UI:-microwindows}"
 KERNEL_CONFIG_FRAGMENTS=""
 OPIE_CONFIG="/work/board/opie/opie-be300.config"
-OPIE_BUILD_STAMP=".be300-opie-built-v44"
+OPIE_BUILD_STAMP=".be300-opie-built-v45"
 OPIE_PROFILE="base"
 OPIE_EXTRA_DEFS=""
 case "$BE300_UI" in
@@ -27,7 +27,7 @@ case "$BE300_UI" in
         NAND_IMAGE_NAME="be300-opie64.nand"
         KERNEL_CONFIG_FRAGMENTS="/work/configs/be300_64m.config"
         OPIE_CONFIG="/work/board/opie/opie-be300-64m.config"
-        OPIE_BUILD_STAMP=".be300-opie64-built-v5"
+        OPIE_BUILD_STAMP=".be300-opie64-built-v6"
         OPIE_PROFILE="opie64"
         OPIE_EXTRA_DEFS="-DBE300_ENABLE_TASKBAR_PLUGINS"
         ;;

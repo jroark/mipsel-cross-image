@@ -21,7 +21,7 @@ QT_BUILD_LOG="$LOG_DIR/be300_qte_build.log"
 QT_HOST_BUILD_LOG="$LOG_DIR/be300_qte_host_tools.log"
 OPIE_BUILD_LOG="$LOG_DIR/be300_opie_build.log"
 OPIE_CONFIG="${OPIE_CONFIG:-/work/board/opie/opie-be300.config}"
-OPIE_BUILD_STAMP="${OPIE_BUILD_STAMP:-.be300-opie-built-v44}"
+OPIE_BUILD_STAMP="${OPIE_BUILD_STAMP:-.be300-opie-built-v45}"
 OPIE_PROFILE="${OPIE_PROFILE:-base}"
 OPIE_EXTRA_DEFS="${OPIE_EXTRA_DEFS:-}"
 
@@ -555,7 +555,7 @@ PY
 }
 
 build_qt() {
-	if [ ! -f "$QT_SRC/.be300-qt-built-v11" ] || [ ! -f "$QT_SRC/lib/libqte.so.${QT_VERSION}" ]; then
+	if [ ! -f "$QT_SRC/.be300-qt-built-v12" ] || [ ! -f "$QT_SRC/lib/libqte.so.${QT_VERSION}" ]; then
 		echo "=== Building Qt/Embedded ${QT_VERSION} for BE-300 ==="
 		(
 			cd "$QT_SRC"
@@ -570,7 +570,7 @@ build_qt() {
 				-no-xkb -no-sm -no-xft -no-qvfb \
 				>"$QT_BUILD_LOG" 2>&1 || exit 1
 			make -j"$(nproc)" >>"$QT_BUILD_LOG" 2>&1 || exit 1
-			touch "$QT_SRC/.be300-qt-built-v11"
+			touch "$QT_SRC/.be300-qt-built-v12"
 		) || {
 			tail -80 "$QT_BUILD_LOG"
 			exit 1

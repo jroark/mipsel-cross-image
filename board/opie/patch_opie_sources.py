@@ -553,6 +553,95 @@ def patch_launcherview():
     write_text(path, text)
 
 
+def patch_launchertab():
+    restore_original("core/launcher/launchertab.cpp")
+
+    path = ROOT / "core/launcher/launchertab.cpp"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+
+    if "BE300 fixed launcher tab geometry" not in text:
+        text = text.replace(
+            "    setFocusPolicy( NoFocus );\n",
+            "    setFocusPolicy( NoFocus );\n"
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300 fixed launcher tab geometry: the stock compact\n"
+            "       layout can assign non-positive widths to inactive tabs\n"
+            "       when tab icons are absent. */\n"
+            "    setFixedHeight( 22 );\n"
+            "#endif\n",
+            1,
+        )
+
+    if "BE300 visible launcher tabs" not in text:
+        text = text.replace(
+            "    int available = width()-1;\n",
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    {\n"
+            "    /* BE300 visible launcher tabs: use equal positive-width\n"
+            "       tabs so every category has a visible click target on\n"
+            "       the 240 pixel display. */\n"
+            "    QFontMetrics be300fm = fontMetrics();\n"
+            "    int hframe, vframe, overlap;\n"
+            "    style().tabbarMetrics( this, hframe, vframe, overlap );\n"
+            "    int h = QMAX( be300fm.height(), QApplication::globalStrut().height() ) + vframe + 2;\n"
+            "    if ( h < 22 )\n"
+            "        h = 22;\n"
+            "    int x = 0;\n"
+            "    int i = 0;\n"
+            "    int n = count();\n"
+            "    QListIterator< LauncherTab > be300it( items );\n"
+            "    for ( be300it.toFirst(); be300it.current(); ++be300it, ++i ) {\n"
+            "        LauncherTab *tab = be300it.current();\n"
+            "        int w = ( width() - x ) / ( n - i );\n"
+            "        if ( w < 1 )\n"
+            "            w = 1;\n"
+            "        tab->setRect( QRect( x, 0, w, h ) );\n"
+            "        x += w;\n"
+            "    }\n"
+            "    setFixedHeight( h );\n"
+            "    update();\n"
+            "    return;\n"
+            "    }\n"
+            "#endif\n"
+            "\n"
+            "    int available = width()-1;\n",
+            1,
+        )
+
+    if "BE300 plain launcher tab paint" not in text:
+        text = text.replace(
+            "    LauncherTabBar *that = (LauncherTabBar *) this;\n",
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    {\n"
+            "    /* BE300 plain launcher tab paint: avoid style/theme paths\n"
+            "       that can blend tab text into the background on LinuxFb. */\n"
+            "    QRect r( t->rect() );\n"
+            "    QColor fill = selected ? QColor( 49, 125, 205 ) : QColor( 214, 226, 242 );\n"
+            "    QColor border = selected ? QColor( 18, 63, 120 ) : QColor( 126, 146, 172 );\n"
+            "    p->fillRect( r, fill );\n"
+            "    p->setPen( border );\n"
+            "    p->drawRect( r );\n"
+            "    QFont f( font() );\n"
+            "    f.setBold( selected );\n"
+            "    p->setFont( f );\n"
+            "    p->setPen( selected ? white : black );\n"
+            "    QRect tr( r.left() + 2, r.top() + 1,\n"
+            "              r.width() - 4, r.height() - 2 );\n"
+            "    p->drawText( tr, AlignCenter | AlignVCenter | ShowPrefix, t->text() );\n"
+            "    return;\n"
+            "    }\n"
+            "#endif\n"
+            "\n"
+            "    LauncherTabBar *that = (LauncherTabBar *) this;\n",
+            1,
+        )
+
+    write_text(path, text)
+
+
 def patch_documentlist():
     restore_original("core/launcher/documentlist.cpp")
 
@@ -670,6 +759,7 @@ def main():
     patch_qpeapplication()
     patch_launcher()
     patch_launcherview()
+    patch_launchertab()
     patch_documentlist()
     patch_taskbar()
     patch_opie_application()

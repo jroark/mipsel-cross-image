@@ -80,6 +80,9 @@ SDRAM size in Linux, and builds a larger OPIE applet/PIM/tools set. Its
 launcher defaults use the stock Opie wallpaper and a fuller Settings tab that
 matches the classic Opie/Qtopia Settings screen more closely. It must be booted
 with `--sdram 64`; do not substitute a `mem=` kernel argument.
+The BE-300 launcher also overrides Opie's compact category tab geometry so the
+top tabs remain visible and have positive-width click targets on the 240 pixel
+display.
 
 ### 4. Build a CompactFlash recovery image
 After the NAND build has populated `linux-4.2.9/` and `rootfs_be300/`:

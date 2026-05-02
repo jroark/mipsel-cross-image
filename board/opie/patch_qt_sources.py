@@ -288,6 +288,128 @@ def patch_mouse():
         "\treturn;\n",
         "\treturn;\n",
     )
+    if "BE300_TOUCH_MOVE_MIN_MS" not in text:
+        text = text.replace(
+            "#define BE300_BTN_TOUCH 0x14a\n",
+            "#define BE300_BTN_TOUCH 0x14a\n"
+            "#define BE300_TOUCH_MOVE_MIN_MS 35u\n"
+            "#define BE300_TOUCH_MOVE_MIN_DELTA 3\n",
+            1,
+        )
+    if "evLastSentPressed" not in text:
+        text = text.replace(
+            "    bool evDirty;\n"
+            "    bool evHaveX;\n"
+            "    bool evHaveY;\n"
+            "private slots:\n",
+            "    bool evDirty;\n"
+            "    bool evHaveX;\n"
+            "    bool evHaveY;\n"
+            "    bool evLastSentPressed;\n"
+            "    int evLastSentX;\n"
+            "    int evLastSentY;\n"
+            "    unsigned int evLastMoveMsec;\n"
+            "private slots:\n",
+            1,
+        )
+        text = text.replace(
+            "    evPressed(FALSE), evDirty(FALSE), evHaveX(FALSE), evHaveY(FALSE)\n",
+            "    evPressed(FALSE), evDirty(FALSE), evHaveX(FALSE), evHaveY(FALSE),\n"
+            "    evLastSentPressed(FALSE), evLastSentX(0), evLastSentY(0),\n"
+            "    evLastMoveMsec(0)\n",
+            1,
+        )
+    old = (
+        "    if ( useEvdev ) {\n"
+        "\tBe300InputEvent event;\n"
+        "\tint n;\n"
+        "\twhile ( (n = read(mouseFD, &event, sizeof(event))) == (int)sizeof(event) ) {\n"
+        "\t    if ( event.type == BE300_EV_ABS ) {\n"
+        "\t\tif ( event.code == BE300_ABS_X ) {\n"
+        "\t\t    evX = event.value;\n"
+        "\t\t    evHaveX = TRUE;\n"
+        "\t\t    evDirty = TRUE;\n"
+        "\t\t} else if ( event.code == BE300_ABS_Y ) {\n"
+        "\t\t    evY = event.value;\n"
+        "\t\t    evHaveY = TRUE;\n"
+        "\t\t    evDirty = TRUE;\n"
+        "\t\t}\n"
+        "\t    } else if ( event.type == BE300_EV_KEY && event.code == BE300_BTN_TOUCH ) {\n"
+        "\t\tevPressed = event.value != 0;\n"
+        "\t\tevDirty = TRUE;\n"
+        "\t    } else if ( event.type == BE300_EV_SYN && event.code == BE300_SYN_REPORT ) {\n"
+        "\t\tif ( evDirty ) {\n"
+        "\t\t    if ( !evPressed || ( evHaveX && evHaveY ) ) {\n"
+        "\t\t\tmousePos = QPoint(evX, evY);\n"
+        "\t\t\temit mouseChanged(mousePos, evPressed ? Qt::LeftButton : 0);\n"
+        "\t\t    }\n"
+        "\t\t    evDirty = FALSE;\n"
+        "\t\t}\n"
+        "\t    }\n"
+        "\t}\n"
+        "\treturn;\n"
+        "    }\n"
+    )
+    new = (
+        "    if ( useEvdev ) {\n"
+        "\tBe300InputEvent event;\n"
+        "\tint n;\n"
+        "\twhile ( (n = read(mouseFD, &event, sizeof(event))) == (int)sizeof(event) ) {\n"
+        "\t    unsigned int eventMsec = event.sec * 1000u + event.usec / 1000u;\n"
+        "\t    if ( event.type == BE300_EV_ABS ) {\n"
+        "\t\tif ( event.code == BE300_ABS_X ) {\n"
+        "\t\t    evX = event.value;\n"
+        "\t\t    evHaveX = TRUE;\n"
+        "\t\t    evDirty = TRUE;\n"
+        "\t\t} else if ( event.code == BE300_ABS_Y ) {\n"
+        "\t\t    evY = event.value;\n"
+        "\t\t    evHaveY = TRUE;\n"
+        "\t\t    evDirty = TRUE;\n"
+        "\t\t}\n"
+        "\t    } else if ( event.type == BE300_EV_KEY && event.code == BE300_BTN_TOUCH ) {\n"
+        "\t\tevPressed = event.value != 0;\n"
+        "\t\tevDirty = TRUE;\n"
+        "\t    } else if ( event.type == BE300_EV_SYN && event.code == BE300_SYN_REPORT ) {\n"
+        "\t\tif ( evDirty && ( !evPressed || ( evHaveX && evHaveY ) ) ) {\n"
+        "\t\t    QPoint p = ( evHaveX && evHaveY ) ? QPoint(evX, evY) : mousePos;\n"
+        "\t\t    bool send = FALSE;\n"
+        "\n"
+        "\t\t    if ( evPressed ) {\n"
+        "\t\t\tif ( !evLastSentPressed ) {\n"
+        "\t\t\t    send = TRUE;\n"
+        "\t\t\t} else {\n"
+        "\t\t\t    int dx = QABS( p.x() - evLastSentX );\n"
+        "\t\t\t    int dy = QABS( p.y() - evLastSentY );\n"
+        "\t\t\t    unsigned int elapsed = eventMsec - evLastMoveMsec;\n"
+        "\n"
+        "\t\t\t    if ( ( dx || dy ) &&\n"
+        "\t\t\t\t ( dx + dy >= BE300_TOUCH_MOVE_MIN_DELTA ||\n"
+        "\t\t\t\t   elapsed >= BE300_TOUCH_MOVE_MIN_MS ) )\n"
+        "\t\t\t\tsend = TRUE;\n"
+        "\t\t\t}\n"
+        "\t\t    } else {\n"
+        "\t\t\tsend = evLastSentPressed;\n"
+        "\t\t\tif ( send )\n"
+        "\t\t\t    p = QPoint( evLastSentX, evLastSentY );\n"
+        "\t\t    }\n"
+        "\n"
+        "\t\t    if ( send ) {\n"
+        "\t\t\tmousePos = p;\n"
+        "\t\t\temit mouseChanged(mousePos, evPressed ? Qt::LeftButton : 0);\n"
+        "\t\t\tevLastSentPressed = evPressed;\n"
+        "\t\t\tevLastSentX = p.x();\n"
+        "\t\t\tevLastSentY = p.y();\n"
+        "\t\t\tevLastMoveMsec = eventMsec;\n"
+        "\t\t    }\n"
+        "\t\t    evDirty = FALSE;\n"
+        "\t\t}\n"
+        "\t    }\n"
+        "\t}\n"
+        "\treturn;\n"
+        "    }\n"
+    )
+    if old in text and "BE300_TOUCH_MOVE_MIN_DELTA" in text:
+        text = text.replace(old, new, 1)
     write_text(path, text)
 
 
