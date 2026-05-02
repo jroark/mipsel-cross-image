@@ -8,7 +8,7 @@ diff --git a/arch/mips/vr41xx/Kconfig b/arch/mips/vr41xx/Kconfig
 index 74927b4..12b40be 100644
 --- a/arch/mips/vr41xx/Kconfig
 +++ b/arch/mips/vr41xx/Kconfig
-@@ -61,6 +61,22 @@ config ZAO_CAPCELLA
+@@ -61,6 +61,32 @@ config ZAO_CAPCELLA
  	select SYS_SUPPORTS_32BIT_KERNEL
  	select SYS_SUPPORTS_LITTLE_ENDIAN
  
@@ -29,6 +29,16 @@ index 74927b4..12b40be 100644
 +	select INPUT_POLLDEV
 +
  endchoice
++
++config CASIO_BE300_SDRAM_MB
++	int "BE-300 SDRAM size in MiB"
++	depends on CASIO_BE300
++	range 16 64
++	default 16
++	help
++	  SDRAM size registered during early BE-300 boot. Use 16 for
++	  real hardware and stock emulator boots, or 64 when booting the
++	  emulator with --sdram 64.
  
  choice
 diff --git a/arch/mips/vr41xx/Platform b/arch/mips/vr41xx/Platform

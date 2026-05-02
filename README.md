@@ -59,6 +59,26 @@ When `--ne2000` is present, `/bin/start-network` brings `eth0` up during
 boot and starts DHCP in the background. Run `/bin/ne2000-net-test` from the
 serial shell for the blocking DHCP/DNS/HTTP smoke test.
 
+### Optional OPIE images
+The build can also replace the default Microwindows UI with Qt/Embedded 2.3.10
+and OPIE 1.2.5.
+
+For the stock 16 MiB RAM profile:
+```bash
+docker-compose run --rm mips-dev bash -c "./build_be300_opie_nand.sh"
+./bin/be300 --nand linux-4.2.9/be300-opie.nand --speed 0
+```
+
+For the expanded emulator-only profile:
+```bash
+docker-compose run --rm mips-dev bash -c "./build_be300_opie64_nand.sh"
+./bin/be300 --sdram 64 --nand linux-4.2.9/be300-opie64.nand --speed 0
+```
+
+The 64 MiB profile keeps the stock images unchanged, registers the larger
+SDRAM size in Linux, and builds a larger OPIE applet/PIM/tools set. It must be
+booted with `--sdram 64`; do not substitute a `mem=` kernel argument.
+
 ### 4. Build a CompactFlash recovery image
 After the NAND build has populated `linux-4.2.9/` and `rootfs_be300/`:
 ```bash
@@ -88,10 +108,11 @@ At a high level:
   from linux-4.2.9 into `/work/musl-khdrs`. musl doesn't ship `linux/*.h`,
   and the older `uclibc-kernel-headers/` set lacks the `__UAPI_DEF_*` guards
   so it collides with musl's own `netinet/in.h`.
-- **Phase 1** — Build a static BusyBox linked against musl:
-  1. `make distclean && defconfig`, then disable applets that can't build
-     against musl + sanitized 4.2.9 UAPI (all networking, runit, WTMP/UTMP,
-     NFS/RPC, TC, `FEATURE_SYSLOGD_CFG`).
+- **Phase 1** — Build BusyBox linked against the BE-300 musl toolchain:
+  1. `make distclean && defconfig`, keep the selected networking applets used
+     by the NE2000 smoke test, and disable only applets that still need niche
+     headers or unsupported runtime pieces (runit, WTMP/UTMP, NFS/RPC, TC,
+     `FEATURE_SYSLOGD_CFG`).
   2. Patch a private copy of `libgcc.a` at `/tmp/libgcc_patched/`: the Debian
      cross toolchain's libgcc is built with `-march=mips32r2` and its 64-bit
      helpers (`__divdi3`, `__moddi3`, `__udivdi3`, `__umoddi3`, `__fixdfdi`,
@@ -102,6 +123,11 @@ At a high level:
   3. `make busybox EXTRA_CFLAGS="-march=mips2 ..." EXTRA_LDFLAGS="... -B/tmp/libgcc_patched"`.
   4. Populate `$ROOTFS` (`bin/busybox`, applet symlinks, `/init → /bin/busybox`,
      `/etc/inittab` that mounts proc/sys/dev and spawns a shell on tty0).
+- **UI profile** — Build the selected user interface into `$ROOTFS`:
+  the default `BE300_UI=microwindows` path builds Nano-X/Microwindows tools,
+  `BE300_UI=opie` builds the curated 16 MiB OPIE profile, and
+  `BE300_UI=opie64` builds the expanded OPIE profile and merges
+  `configs/be300_64m.config`.
 - **Phase 2–3** — Extract linux-4.2.9 and apply
   `patches/linux-4.2.9/be300/series`. The series contains the GCC/UAPI
   compatibility fixes, BE-300 board support, VR41xx TLB/PTE fixes, VR4131
@@ -115,8 +141,11 @@ At a high level:
 
 ```
 build_be300_kernel.sh        Full BE-300 build (kernel + musl + BusyBox)
+build_be300_opie_nand.sh     OPIE image for the stock 16 MiB RAM profile
+build_be300_opie64_nand.sh   Emulator OPIE image with 64 MiB SDRAM config
 build_be300_cf_image.sh      CompactFlash recovery image build
 configs/be300_defconfig      Kernel defconfig
+configs/be300_64m.config     64 MiB BE-300 kernel config overlay
 configs/be300_cf.config      CF boot config overlay
 patches/linux-4.2.9/be300/   Canonical numbered kernel patch series
 scripts/apply_patch_series.sh Applies a series file to an extracted tree
@@ -128,6 +157,7 @@ board/casio-be300/           SPL, CF loader, and userspace helper sources
   test_c_init.c              Diagnostic musl C /init
   test_page2.S               Diagnostic multi-page asm init
   Makefile
+board/opie/                  Qt/Embedded and OPIE source overlays/configs
 bin/be300                    BE-300 emulator (macOS arm64)
 kernels/vmlinux-2.4          Known-good Linux 2.4.18 reference
 kernels/vmlinux-2.6          Known-good Linux 2.6.8.1 reference
@@ -137,8 +167,9 @@ CLAUDE.md                    Deep technical notes and gotchas
 ```
 
 Generated and vendored build trees such as `linux-4.2.9/`, `rootfs_be300/`,
-`musl-*`, `busybox-1.24.2/`, and `microwindows/` are ignored locally. Edit the
-source inputs and patch series instead of generated outputs.
+`musl-*`, `busybox-1.24.2/`, `microwindows/`, `qt-*-be300/`,
+`opie-*-be300/`, and `rootfs_be300*` are ignored locally. Edit the source
+inputs and patch series instead of generated outputs.
 
 ## Key Toolchain Constraints
 

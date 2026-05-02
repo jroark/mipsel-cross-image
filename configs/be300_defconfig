@@ -11,7 +11,7 @@ CONFIG_CASIO_BE300=y
 # CONFIG_SWAP is not set
 # CONFIG_MODULES is not set
 CONFIG_EMBEDDED=y
-# CONFIG_SYSVIPC is not set
+CONFIG_SYSVIPC=y
 # CONFIG_CC_OPTIMIZE_FOR_SIZE is not set
 CONFIG_LOG_BUF_SHIFT=14
 
@@ -48,7 +48,7 @@ CONFIG_EARLY_PRINTK=y
 # Built-in kernel command line. Keep printk on serial only so Microwindows
 # owns the framebuffer without fbcon text or console blanking races.
 CONFIG_CMDLINE_BOOL=y
-CONFIG_CMDLINE="earlyprintk console=ttyVR0,115200 consoleblank=0 root=/dev/mtdblock3 rootfstype=jffs2 rootwait"
+CONFIG_CMDLINE="earlyprintk console=ttyVR0,115200 consoleblank=0 root=/dev/mtdblock3 rootfstype=jffs2 rootwait ro"
 
 # Framebuffer — minimal (sfb built into board support)
 CONFIG_FB=y

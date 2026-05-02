@@ -17,6 +17,10 @@ docker-compose build
 # Build the BE-300 kernel (full pipeline: BusyBox + JFFS2 rootfs + kernel)
 docker-compose run --rm mips-dev bash -c "./build_be300_kernel.sh"
 
+# Build the optional OPIE NAND images
+docker-compose run --rm mips-dev bash -c "./build_be300_opie_nand.sh"
+docker-compose run --rm mips-dev bash -c "./build_be300_opie64_nand.sh"
+
 # Build the CompactFlash recovery image after the NAND/rootfs build
 docker-compose run --rm mips-dev bash -c "./build_be300_cf_image.sh"
 
@@ -29,6 +33,8 @@ docker-compose run --rm mips-dev bash -c "./build_tcl_kernel.sh"
 # linux-4.2.9/be300.nand and the boot ROM walks its B000FF SPL container
 # to load Linux. See "BE-300 boot path" in Key Constraints for details.
 ./bin/be300 --nand linux-4.2.9/be300.nand --speed 0
+./bin/be300 --nand linux-4.2.9/be300-opie.nand --speed 0
+./bin/be300 --sdram 64 --nand linux-4.2.9/be300-opie64.nand --speed 0
 
 # Useful debug flags
 ./bin/be300 --nand linux-4.2.9/be300.nand --speed 0 --log-mmio 2>mmio.log
@@ -102,12 +108,13 @@ Test / diagnostic programs (not linked into the kernel):
 
 **Phase 0** — Install sanitized Linux UAPI headers (`make headers_install`) for musl into `/work/musl-khdrs`. musl doesn't ship Linux `linux/*.h` UAPI; `uclibc-kernel-headers` can't be used because it lacks the `__UAPI_DEF_*` guards and collides with musl's `netinet/in.h`.
 
-**Phase 1** — Build BusyBox statically linked against musl, populate the JFFS2 rootfs source tree at `/work/rootfs_be300/`:
+**Phase 1** — Build BusyBox linked against the BE-300 musl toolchain, populate the selected JFFS2 rootfs source tree (`/work/rootfs_be300/`, `/work/rootfs_be300_opie/`, or `/work/rootfs_be300_opie64/`):
 1. `make distclean && defconfig`
 2. Keep selected networking applets enabled (`ifconfig`, `route`, `ip`, `udhcpc`, `nslookup`, `ping`) for the NE2000 boot smoke test. Disable only the applets that still need niche kernel headers or unsupported runtime pieces: runit (`BUG_need_to_implement_gettimeofday_ns`), WTMP/UTMP, NFS/RPC, TC, syslogd cfg
 3. Patch a private copy of `libgcc.a` (`-B/tmp/libgcc_patched`): strip `_divdi3.o _moddi3.o _udivdi3.o _umoddi3.o _fixdfdi.o _fixunsdfdi.o _floatdidf.o _floatundidf.o _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o` and replace with mips2-compiled `libgcc_helpers.o`
 4. `make busybox EXTRA_CFLAGS="-march=mips2 -specs musl-gcc.specs -isystem musl-khdrs/include" EXTRA_LDFLAGS="-specs musl-gcc.specs -B/tmp/libgcc_patched"`
-5. Install busybox to `$ROOTFS/bin/busybox`, create applet symlinks, replace `/bin/wget` with `board/casio-be300/be300_wget.c` because the BusyBox 1.24.2 wget applet faults on this target, point `/sbin/init` at busybox, install `/usr/share/udhcpc/default.script`, and write `/etc/inittab` (mounts proc + sysfs + tmpfs, runs `/bin/ne2000-net-test`, spawns respawn shells on tty0 and ttyVR0). This tree becomes the JFFS2 image at Phase 7b and is the actual booted root filesystem.
+5. Install busybox to `$ROOTFS/bin/busybox`, create applet symlinks, replace `/bin/wget` with `board/casio-be300/be300_wget.c` because the BusyBox 1.24.2 wget applet faults on this target, point `/sbin/init` at busybox, install `/usr/share/udhcpc/default.script`, and write `/etc/inittab`. The default profile starts Microwindows/Nano-X; the OPIE profiles mount `/root` as tmpfs and start `/bin/start-opie` on tty0 while keeping the serial shell on ttyVR0. This tree becomes the JFFS2 image at Phase 7b and is the actual booted root filesystem.
+6. For `BE300_UI=opie` and `BE300_UI=opie64`, `board/opie/build_opie_rootfs.sh` builds Qt/Embedded 2.3.10 and OPIE 1.2.5 with MIPS2-only toolchain flags and installs only the selected app/library/picture allowlist. The `opie64` profile also merges `configs/be300_64m.config` and enables extra PIM/tools, Today plugins, input methods, and taskbar applets.
 
 **Phase 2–6** — Kernel build:
 1. Download linux-4.2.9-patched.tar.xz from Tiny Core Linux
@@ -117,8 +124,8 @@ Test / diagnostic programs (not linked into the kernel):
 
 **Phase 7** — Build SPL + JFFS2 + NAND image:
 - **7a**: extract `KERNEL_LOAD_VA`/`KERNEL_ENTRY_VA`/`KERNEL_SIZE` from the vmlinux ELF, compile `board/casio-be300/spl_start.S` + `spl.c` + `spl.lds` with those baked in via `-D`, link as `spl.elf`.
-- **7b**: `mkfs.jffs2 --root=$ROOTFS --output=linux-4.2.9/rootfs.jffs2 --eraseblock=16384 --pagesize=512 --no-cleanmarkers --pad=0xB00000 --little-endian` to package the BusyBox tree from Phase 1 as the mtd3 image.
-- **7c**: `tools/mk_be300_nand.py --vmlinux ... --spl ... --rootfs rootfs.jffs2 --out linux-4.2.9/be300.nand` packs everything into the 16 MiB NAND image (partition table at page 0, SPL B000FF container at `0x4000`, flat kernel binary at `0x14000`, JFFS2 rootfs at `0x500000`).
+- **7b**: `mkfs.jffs2 --root=$ROOTFS --output=linux-4.2.9/<profile-rootfs>.jffs2 --eraseblock=16384 --pagesize=512 --no-cleanmarkers --pad=0xB00000 --little-endian` to package the Phase 1 tree as the mtd3 image.
+- **7c**: `tools/mk_be300_nand.py --vmlinux ... --spl ... --rootfs <profile-rootfs>.jffs2 --out linux-4.2.9/<profile>.nand` packs everything into the 16 MiB NAND image (partition table at page 0, SPL B000FF container at `0x4000`, flat kernel binary at `0x14000`, JFFS2 rootfs at `0x500000`).
 
 ### CF Image Build (build_be300_cf_image.sh)
 
@@ -146,7 +153,7 @@ with `tools/mk_be300_cf_linux.py`.
   5. Mailbox handoff: SPL writes `entry` to `*0xA00024FC` and `0x03020101` to `*0xA0002400`; ROM's outer loop polls and `jr`s to the entry value. The ROM does NOT OR `0x20000000` into the entry — that's the SPL's responsibility for the NK handoff in WinCE; for our SPL the kernel runs from the cached KSEG0 alias, which is fine because the SPL writes records via uncached KSEG1.
 - **Emulator is strictly 32-bit**: The be300 emulator runs 32-bit MIPS code only. Disassembly of both known-good kernels (2.4.18, 2.6.8.1) confirms zero 64-bit instructions (no sd, ld, daddu, daddiu, dsll, dsrl). The 4.2.9 kernel's dynamically generated `clear_page`/`copy_page` functions use `sd`/`ld` by default because VR4131 reports `cpu_has_64bit_gp_regs=true`. This MUST be disabled — force `clear_word_size=4` and `copy_word_size=4` in `arch/mips/mm/page.c`.
 - **vmlinux must fit before the JFFS2 partition**: the flat kernel binary lives at NAND offset `0x14000` and the JFFS2 rootfs starts at `0x500000`, leaving ~4.92 MiB for vmlinux. `tools/mk_be300_nand.py` (lines 183–187) fails the build if this is exceeded; if it ever does, either shrink the kernel or move the rootfs offset (and update the partition table in `board/casio-be300/nand.c` and `tools/mk_be300_nand.py` together).
-- **Memory registration**: Common VR41xx `prom_init()` doesn't call `add_memory_region()`. The patch series registers 16MB for BE-300. Do NOT rely solely on `mem=16M` on the cmdline — this has caused the kernel to allocate pages beyond physical RAM (writes to non-existent memory are silently dropped by the emulator, corrupting page tables and file data).
+- **Memory registration**: Common VR41xx `prom_init()` doesn't call `add_memory_region()`. The patch series registers `CONFIG_CASIO_BE300_SDRAM_MB`, default 16MB for stock BE-300 images. The expanded OPIE emulator profile merges `configs/be300_64m.config` and must be booted with `--sdram 64`. Do NOT rely solely on `mem=...` on the cmdline — this has caused the kernel to allocate pages beyond physical RAM (writes to non-existent memory are silently dropped by the emulator, corrupting page tables and file data).
 - **serial_be300 is incomplete**: The custom serial TTY driver in the source overlays is unfinished. Use `keep_bootcon` on the kernel cmdline to retain early printk serial output past normal console registration.
 - **VR4131 cache bug**: Hit_Writeback_Inv_D must be split into separate writeback + invalidate. The patch series updates `flush_dcache_line()` and `protected_writeback_dcache_line()` in `r4kcache.h`. Required for real hardware; also works on the emulator.
 - **Userspace ISA — use `-march=mips2`, NOT `mips32`**: VR4131 is MIPS III and does NOT implement the MIPS32 SPECIAL2 opcode space. The SPECIAL2 `mul rd, rs, rt` instruction (which GCC happily emits under `-march=mips32`) raises a Reserved Instruction exception and kills the process with SIGILL. Build musl, BusyBox, and anything else linked into userspace with `-march=mips2`. Binaries compiled with `-nostdlib` additionally need `-mno-abicalls -fno-pic` so `$gp` isn't referenced before crt0 would initialize it.

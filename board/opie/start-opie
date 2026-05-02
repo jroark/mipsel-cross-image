@@ -1,0 +1,32 @@
+#!/bin/sh
+export HOME=/root
+export QTDIR=/opt/QtPalmtop
+export QPEDIR=/opt/QtPalmtop
+export OPIEDIR=/opt/QtPalmtop
+export PATH=/opt/QtPalmtop/bin:/bin:/sbin:/usr/bin:/usr/sbin
+export LD_LIBRARY_PATH=/opt/QtPalmtop/lib:/lib
+export QWS_DISPLAY="LinuxFb:/dev/fb0:mmWidth80:mmHeight106"
+export QWS_SIZE="240x320"
+export QWS_MOUSE_PROTO="${QWS_MOUSE_PROTO:-TPanel:/dev/input/event1}"
+export QWS_KEYBOARD="${QWS_KEYBOARD:-USB:/dev/input/event0 USB:/dev/input/event2}"
+export OPIE_NO_SOUND=1
+
+/bin/be300-vtmode graphics >/dev/null 2>&1 || true
+trap '/bin/be300-vtmode text >/dev/null 2>&1 || true' EXIT
+
+exec </dev/null
+
+: > /tmp/opie.log
+/opt/QtPalmtop/bin/qpe -qws >/tmp/opie.log 2>&1
+rc=$?
+echo "[opie] qpe exited rc=$rc" >/dev/kmsg 2>/dev/null || true
+if [ "$rc" -ne 0 ]; then
+    /bin/be300-vtmode text >/dev/null 2>&1 || true
+    {
+        echo
+        echo "OPIE exited rc=$rc"
+        echo "Last /tmp/opie.log lines:"
+        tail -20 /tmp/opie.log 2>/dev/null
+    } >/dev/tty0 2>/dev/null || true
+fi
+exit "$rc"

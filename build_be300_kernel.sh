@@ -4,6 +4,38 @@ set -e
 KERNEL_SOURCE_URL="http://distro.ibiblio.org/tinycorelinux/7.x/x86/release/src/kernel/linux-4.2.9-patched.tar.xz"
 BUSYBOX_VERSION="1.24.2"
 KERNEL_PATCH_SERIES="/work/patches/linux-4.2.9/be300/series"
+BE300_UI="${BE300_UI:-microwindows}"
+KERNEL_CONFIG_FRAGMENTS=""
+OPIE_CONFIG="/work/board/opie/opie-be300.config"
+OPIE_BUILD_STAMP=".be300-opie-built-v44"
+OPIE_PROFILE="base"
+OPIE_EXTRA_DEFS=""
+case "$BE300_UI" in
+    microwindows)
+        ROOTFS="/work/rootfs_be300"
+        ROOTFS_JFFS2_NAME="rootfs.jffs2"
+        NAND_IMAGE_NAME="be300.nand"
+        ;;
+    opie)
+        ROOTFS="/work/rootfs_be300_opie"
+        ROOTFS_JFFS2_NAME="rootfs-opie.jffs2"
+        NAND_IMAGE_NAME="be300-opie.nand"
+        ;;
+    opie64)
+        ROOTFS="/work/rootfs_be300_opie64"
+        ROOTFS_JFFS2_NAME="rootfs-opie64.jffs2"
+        NAND_IMAGE_NAME="be300-opie64.nand"
+        KERNEL_CONFIG_FRAGMENTS="/work/configs/be300_64m.config"
+        OPIE_CONFIG="/work/board/opie/opie-be300-64m.config"
+        OPIE_BUILD_STAMP=".be300-opie64-built-v1"
+        OPIE_PROFILE="opie64"
+        OPIE_EXTRA_DEFS="-DBE300_ENABLE_TASKBAR_PLUGINS"
+        ;;
+    *)
+        echo "ERROR: BE300_UI must be 'microwindows', 'opie', or 'opie64' (got '$BE300_UI')" >&2
+        exit 1
+        ;;
+esac
 
 ###############################################################################
 # Phase 0a: Rebuild musl with -march=mips2 (no SPECIAL2 mul instruction)
@@ -17,23 +49,65 @@ KERNEL_PATCH_SERIES="/work/patches/linux-4.2.9/be300/series"
 MUSL_MIPS2="/work/musl-mipsel"
 MUSL_SRC="/work/musl-1.2.5"
 
+prepare_be300_libgcc() {
+    # Patched libgcc.a: the stock libgcc (from the mips32r2 cross toolchain)
+    # uses MIPS32-only instructions in several helper routines.  VR4131 is
+    # MIPS III and raises Reserved Instruction on those opcodes.  Create a
+    # private libgcc archive that strips the offending objects and adds
+    # MIPS2-compiled replacements.
+    mkdir -p /tmp/libgcc_patched
+    LIBGCC_ORIG=$(mipsel-linux-gnu-gcc -print-libgcc-file-name)
+    cp "$LIBGCC_ORIG" /tmp/libgcc_patched/libgcc.a
+    mipsel-linux-gnu-ar d /tmp/libgcc_patched/libgcc.a \
+        _mulsc3.o _muldc3.o \
+        _divdi3.o _moddi3.o _udivdi3.o _umoddi3.o \
+        _fixdfdi.o _fixunsdfdi.o _floatdidf.o _floatundidf.o \
+        _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o \
+        _clzsi2.o _clzdi2.o _ctzsi2.o _ctzdi2.o \
+        _popcountsi2.o _popcountdi2.o _paritysi2.o _paritydi2.o \
+        _ffssi2.o _ffsdi2.o \
+        2>/dev/null || true
+    mipsel-linux-gnu-gcc -march=mips2 -mfpxx -O2 -fPIC -ffreestanding -fno-builtin \
+        -c -o /tmp/libgcc_helpers.o /work/board/casio-be300/libgcc_helpers.c
+    mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libgcc.a /tmp/libgcc_helpers.o
+    mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libbe300gcc.a /tmp/libgcc_helpers.o
+}
+
 unsupported_mips2_insn() {
     mipsel-linux-gnu-objdump -d "$1" 2>/dev/null \
         | awk '$3 ~ /^(mul|clz|clo|ext|ins|seb|seh|wsbh|rdhwr)$/ {print; exit}' || true
 }
 
+check_mips2_file() {
+    local file="$1"
+    local bad=""
+
+    if [ ! -e "$file" ]; then
+        echo "missing $file"
+        return
+    fi
+    bad=$(unsupported_mips2_insn "$file")
+    if [ -n "$bad" ]; then
+        echo "$file: $bad"
+    fi
+}
+
+prepare_be300_libgcc
+
 MUSL_BAD_INSN=""
-if [ -f "$MUSL_MIPS2/lib/libc.a" ]; then
-    MUSL_BAD_INSN=$(unsupported_mips2_insn "$MUSL_MIPS2/lib/libc.a")
-else
-    MUSL_BAD_INSN="missing libc.a"
-fi
+MUSL_BAD_INSN="$(
+    check_mips2_file "$MUSL_MIPS2/lib/libc.a"
+    check_mips2_file "$MUSL_MIPS2/lib/libc.so"
+)"
 
 if [ -z "$MUSL_BAD_INSN" ] \
         && [ -f "$MUSL_SRC/arch/mips/pthread_arch.h" ] \
         && grep -q "__be300_mips_tp" "$MUSL_SRC/arch/mips/pthread_arch.h"; then
     echo "--- musl-mipsel already MIPS2-compatible, skipping rebuild ---"
 else
+    if [ -n "$MUSL_BAD_INSN" ]; then
+        echo "--- musl-mipsel needs rebuild: $MUSL_BAD_INSN ---"
+    fi
     echo "=== Phase 0a: Rebuilding musl-mipsel with -march=mips2 ==="
     if [ ! -d "$MUSL_SRC" ]; then
         cd /work
@@ -47,19 +121,32 @@ else
     make distclean 2>/dev/null || true
     # Explicitly set cross tools so musl doesn't try mipsel-linux-musl-*
     CROSS=mipsel-linux-gnu-
-    CC="${CROSS}gcc -march=mips2" \
+    CC="${CROSS}gcc -march=mips2 -mfpxx -B/tmp/libgcc_patched -L/tmp/libgcc_patched" \
+    LIBCC="/tmp/libgcc_patched/libgcc.a" \
     AR="${CROSS}ar" \
     RANLIB="${CROSS}ranlib" \
     LD="${CROSS}ld" \
         ./configure --target=mipsel-linux-gnu \
-            --prefix="$MUSL_MIPS2" \
-            --disable-shared 2>&1 | tail -5
-    make CC="${CROSS}gcc -march=mips2" \
+            --prefix="$MUSL_MIPS2" 2>&1 | tail -5
+    make CC="${CROSS}gcc -march=mips2 -mfpxx -B/tmp/libgcc_patched -L/tmp/libgcc_patched" \
+         LIBCC="/tmp/libgcc_patched/libgcc.a" \
          AR="${CROSS}ar" \
          RANLIB="${CROSS}ranlib" \
          -j$(nproc) 2>&1 | tail -5
     make install 2>&1 | tail -5
     cd /work
+fi
+if [ -e "$MUSL_MIPS2/lib/libc.so" ] && [ ! -e "$MUSL_MIPS2/lib/ld-musl-mipsel.so.1" ]; then
+    ln -sf libc.so "$MUSL_MIPS2/lib/ld-musl-mipsel.so.1"
+fi
+MUSL_BAD_INSN="$(
+    check_mips2_file "$MUSL_MIPS2/lib/libc.a"
+    check_mips2_file "$MUSL_MIPS2/lib/libc.so"
+)"
+if [ -n "$MUSL_BAD_INSN" ]; then
+    echo "ERROR: musl-mipsel still contains unsupported VR4131 instructions:" >&2
+    echo "$MUSL_BAD_INSN" >&2
+    exit 1
 fi
 
 ###############################################################################
@@ -165,33 +252,12 @@ set_busybox_string_config CONFIG_EXTRA_LDLIBS ""
 
 yes "" | make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- oldconfig
 
-# Build with musl + mips32 (no r2 instructions). Use musl-gcc wrapper
+# Build with musl + mips2. Use musl-gcc wrapper
 # via -specs. -nostdinc on the existing headers is not needed since musl
 # specs handle include paths.
 # musl doesn't ship Linux UAPI headers (linux/*.h); use sanitized headers
 # from linux-4.2.9 via `make headers_install` (see Phase 0 above).
-# Patched libgcc.a: the stock libgcc (from the mips32r2 cross toolchain)
-# uses the MIPS32 SPECIAL2 `mul` instruction in __divdi3/__moddi3/__udivdi3
-# etc. VR4131 is MIPS III and doesn't support SPECIAL2 — it raises
-# Reserved Instruction (SIGILL). Create a private libgcc.a that strips
-# those .o files and adds mips2-compiled replacements.
-mkdir -p /tmp/libgcc_patched
-LIBGCC_ORIG=$(mipsel-linux-gnu-gcc -print-libgcc-file-name)
-cp "$LIBGCC_ORIG" /tmp/libgcc_patched/libgcc.a
-# Remove the offending .o files (those using SPECIAL2 mul)
-mipsel-linux-gnu-ar d /tmp/libgcc_patched/libgcc.a \
-    _divdi3.o _moddi3.o _udivdi3.o _umoddi3.o \
-    _fixdfdi.o _fixunsdfdi.o _floatdidf.o _floatundidf.o \
-	    _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o \
-	    _clzsi2.o _clzdi2.o _ctzsi2.o _ctzdi2.o \
-	    _popcountsi2.o _popcountdi2.o _paritysi2.o _paritydi2.o \
-	    _ffssi2.o _ffsdi2.o \
-	    2>/dev/null || true
-# Compile our replacements with -march=mips2 and add them to the patched archive
-mipsel-linux-gnu-gcc -march=mips2 -O2 -c -o /tmp/libgcc_helpers.o \
-    /work/board/casio-be300/libgcc_helpers.c
-mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libgcc.a /tmp/libgcc_helpers.o
-mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libbe300gcc.a /tmp/libgcc_helpers.o
+prepare_be300_libgcc
 
 if ! grep -q 'BE300_FORCE_OBJECTS' scripts/trylink; then
     sed -i '/\$START_GROUP \$O_FILES \$A_FILES \$END_GROUP \\/a\
@@ -205,7 +271,6 @@ ls -l busybox
 mipsel-linux-gnu-strip busybox
 
 # Populate full rootfs (this becomes the JFFS2 mtd3 partition).
-ROOTFS="/work/rootfs_be300"
 rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"/{bin,sbin,usr/bin,usr/sbin,proc,sys,dev,tmp,etc,root,mnt,usr/share/udhcpc}
 cp busybox "$ROOTFS/bin/busybox"
@@ -235,7 +300,10 @@ mipsel-linux-gnu-strip /tmp/touch_query_test
 cp /tmp/touch_query_test "$ROOTFS/bin/touch_query_test"
 chmod +x "$ROOTFS/bin/touch_query_test"
 
-# Phase C' — Microwindows / Nano-X (pure C, builds against musl + mips2,
+# Phase C' — optional GUI profile.  The default Microwindows / Nano-X path is
+# pure C.  The OPIE profile replaces it with Qt/Embedded + curated OPIE apps.
+if [ "$BE300_UI" = "microwindows" ]; then
+# Microwindows / Nano-X (pure C, builds against musl + mips2,
 # no libstdc++ needed). Builds the nano-X server plus a small client app set
 # (launcher, terminal, browser, soft keyboard, and diagnostics). Input devices
 # are discovered by evdev device name so optional keyboards do not change the
@@ -663,6 +731,15 @@ esac
 MW_START
 chmod +x "$ROOTFS/bin/start-microwindows"
 cd /work
+else
+echo "=== Building Qt/Embedded + OPIE for BE-300 ==="
+OPIE_CONFIG="$OPIE_CONFIG" \
+OPIE_BUILD_STAMP="$OPIE_BUILD_STAMP" \
+OPIE_PROFILE="$OPIE_PROFILE" \
+OPIE_EXTRA_DEFS="$OPIE_EXTRA_DEFS" \
+    /work/board/opie/build_opie_rootfs.sh "$ROOTFS" "$MUSL_SPECS" "$KHDRS"
+cd /work
+fi
 
 # Create standard busybox symlinks. We can't run ./busybox on the host
 # (different arch), so use a hardcoded list of the applets we need.
@@ -828,9 +905,28 @@ log "PASS wget google.com"
 NET_TEST
 chmod +x "$ROOTFS/bin/ne2000-net-test"
 
+if [ "$BE300_UI" = "opie" ] || [ "$BE300_UI" = "opie64" ]; then
 cat > "$ROOTFS/etc/inittab" << 'INITTAB'
 ::sysinit:/bin/mount -t proc proc /proc
 ::sysinit:/bin/mount -t sysfs sysfs /sys
+::sysinit:/bin/mkdir -p /dev/pts
+::sysinit:/bin/mount -t devpts devpts /dev/pts
+::sysinit:/bin/mount -t tmpfs tmpfs /tmp
+::sysinit:/bin/mount -t tmpfs -o size=768k tmpfs /root
+::sysinit:/bin/mkdir -p /root/Settings /root/Applications /root/Documents
+::sysinit:/bin/echo "=== Casio BE-300 Linux 4.2.9 (BusyBox + OPIE) ==="
+::sysinit:/bin/echo "  OPIE starts on tty0; serial shell is ttyVR0."
+::sysinit:/bin/start-network
+tty0::once:/bin/start-opie
+ttyVR0::respawn:/bin/sh
+::ctrlaltdel:/bin/umount -a -r
+::shutdown:/bin/umount -a -r
+INITTAB
+else
+cat > "$ROOTFS/etc/inittab" << 'INITTAB'
+::sysinit:/bin/mount -t proc proc /proc
+::sysinit:/bin/mount -t sysfs sysfs /sys
+::sysinit:/bin/mount -o remount,rw /
 ::sysinit:/bin/mkdir -p /dev/pts
 ::sysinit:/bin/mount -t devpts devpts /dev/pts
 ::sysinit:/bin/mount -t tmpfs tmpfs /tmp
@@ -842,6 +938,7 @@ ttyVR0::respawn:/bin/sh
 ::ctrlaltdel:/bin/umount -a -r
 ::shutdown:/bin/umount -a -r
 INITTAB
+fi
 
 # The kernel boots straight off the JFFS2 rootfs in NAND mtd3 — no embedded
 # initramfs. Clean up artifacts from older runs that did build one.
@@ -1210,6 +1307,14 @@ echo "=== Phase 5: Configuring kernel ==="
 # Generate .config
 make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- be300_defconfig
 
+for fragment in $KERNEL_CONFIG_FRAGMENTS; do
+    if [ ! -f "$fragment" ]; then
+        echo "ERROR: kernel config fragment not found: $fragment" >&2
+        exit 1
+    fi
+    ./scripts/kconfig/merge_config.sh -m .config "$fragment"
+done
+
 # Resolve any missing options
 make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- olddefconfig
 
@@ -1304,7 +1409,7 @@ echo "=== Phase 7b: Building JFFS2 rootfs image ==="
 # NAND geometry: 32 pages × 512 B = 16 KiB erase block; 512 B page.
 # --no-cleanmarkers is the right call for NAND (mtd's NAND wbuf path
 # regenerates them at runtime). --little-endian matches the kernel.
-ROOTFS_JFFS2="/work/linux-4.2.9/rootfs.jffs2"
+ROOTFS_JFFS2="/work/linux-4.2.9/${ROOTFS_JFFS2_NAME}"
 mkfs.jffs2 \
     --root="$ROOTFS" \
     --output="$ROOTFS_JFFS2" \
@@ -1322,11 +1427,17 @@ python3 /work/tools/mk_be300_nand.py \
     --vmlinux /work/linux-4.2.9/vmlinux \
     --spl "$SPL_DIR/spl.elf" \
     --rootfs "$ROOTFS_JFFS2" \
-    --out /work/linux-4.2.9/be300.nand
+    --out "/work/linux-4.2.9/${NAND_IMAGE_NAME}"
 
-ls -l /work/linux-4.2.9/be300.nand
+ls -l "/work/linux-4.2.9/${NAND_IMAGE_NAME}"
 echo ""
 echo "Test with:"
-echo "  ./bin/be300 --nand linux-4.2.9/be300.nand"
-echo "  ./bin/be300 --nand linux-4.2.9/be300.nand --cf cf.img"
-echo "  ./bin/be300 --nand linux-4.2.9/be300.nand --ne2000 --net-mac 02:de:ad:be:ef:01"
+if [ "$BE300_UI" = "opie64" ]; then
+    echo "  ./bin/be300 --sdram 64 --nand linux-4.2.9/${NAND_IMAGE_NAME} --speed 0"
+    echo "  ./bin/be300 --sdram 64 --nand linux-4.2.9/${NAND_IMAGE_NAME} --cf cf.img"
+    echo "  ./bin/be300 --sdram 64 --nand linux-4.2.9/${NAND_IMAGE_NAME} --ne2000 --net-mac 02:de:ad:be:ef:01"
+else
+    echo "  ./bin/be300 --nand linux-4.2.9/${NAND_IMAGE_NAME}"
+    echo "  ./bin/be300 --nand linux-4.2.9/${NAND_IMAGE_NAME} --cf cf.img"
+    echo "  ./bin/be300 --nand linux-4.2.9/${NAND_IMAGE_NAME} --ne2000 --net-mac 02:de:ad:be:ef:01"
+fi

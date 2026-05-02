@@ -20,9 +20,15 @@
 /musl-khdrs/
 /musl-mipsel/
 /microwindows/
+/qt-2.3.10-be300/
+/qt-2.3.10-host/
+/opie-1.2.5-be300/
 /rootfs_be300/
+/rootfs_be300_opie/
+/rootfs_be300_opie64/
 /rootfs_ramdisk/
 /rootfs_cf/
+/build-opie/
 /busybox_ramdisk/
 /ramdisk_extracted/
 /uclibc-kernel-headers/

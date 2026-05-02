@@ -238,11 +238,14 @@ diff --git a/arch/mips/vr41xx/common/init.c b/arch/mips/vr41xx/common/init.c
 index 2391632..e0fb1e5 100644
 --- a/arch/mips/vr41xx/common/init.c
 +++ b/arch/mips/vr41xx/common/init.c
-@@ -70,6 +70,7 @@ void __init prom_init(void)
+@@ -70,6 +70,10 @@ void __init prom_init(void)
  		if (i < (argc - 1))
  			strlcat(arcs_cmdline, " ", COMMAND_LINE_SIZE);
  	}
-+	add_memory_region(0, 16 << 20, BOOT_MEM_RAM);
++#ifdef CONFIG_CASIO_BE300
++	add_memory_region(0, CONFIG_CASIO_BE300_SDRAM_MB << 20,
++			  BOOT_MEM_RAM);
++#endif
  }
  
  void __init prom_free_prom_memory(void)

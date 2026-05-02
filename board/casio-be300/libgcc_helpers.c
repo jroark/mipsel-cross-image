@@ -19,6 +19,29 @@ typedef unsigned long long UDI;
 typedef int                SI;
 typedef unsigned int       USI;
 
+/*
+ * libgcc's complex multiply helpers are also built for the host toolchain's
+ * MIPS32 target and use MIPS32 bitfield instructions.  Musl pulls these into
+ * libc.so for complex math, so provide simple MIPS2-built replacements.
+ */
+_Complex float __mulsc3(float a, float b, float c, float d)
+{
+	_Complex float r;
+
+	__real__ r = a * c - b * d;
+	__imag__ r = a * d + b * c;
+	return r;
+}
+
+_Complex double __muldc3(double a, double b, double c, double d)
+{
+	_Complex double r;
+
+	__real__ r = a * c - b * d;
+	__imag__ r = a * d + b * c;
+	return r;
+}
+
 /* Compute unsigned 64-bit division and remainder via schoolbook shift/sub. */
 static UDI __udivmoddi4(UDI num, UDI den, UDI *rem)
 {
