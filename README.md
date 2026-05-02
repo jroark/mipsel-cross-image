@@ -153,7 +153,7 @@ patches/linux-4.2.9/be300/   Canonical numbered kernel patch series
 scripts/apply_patch_series.sh Applies a series file to an extracted tree
 board/casio-be300/           SPL, CF loader, and userspace helper sources
   setup.c                    arch_initcall, idle override, prom_putchar
-  sfb.c                      Framebuffer driver (KSEG1 0xAA200000)
+  sfb.c                      Framebuffer driver (PA 0x0A200000 / KSEG1 0xAA200000)
   keys.c                     Polled hardware buttons
   libgcc_helpers.c           mips2 libgcc replacements
   test_c_init.c              Diagnostic musl C /init

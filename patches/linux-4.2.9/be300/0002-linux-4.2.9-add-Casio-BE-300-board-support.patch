@@ -8,7 +8,7 @@ diff --git a/arch/mips/vr41xx/Kconfig b/arch/mips/vr41xx/Kconfig
 index 74927b4..12b40be 100644
 --- a/arch/mips/vr41xx/Kconfig
 +++ b/arch/mips/vr41xx/Kconfig
-@@ -61,6 +61,32 @@ config ZAO_CAPCELLA
+@@ -61,6 +61,33 @@ config ZAO_CAPCELLA
  	select SYS_SUPPORTS_32BIT_KERNEL
  	select SYS_SUPPORTS_LITTLE_ENDIAN
  
@@ -27,6 +27,7 @@ index 74927b4..12b40be 100644
 +	select FB_CFB_COPYAREA if FB
 +	select FB_CFB_IMAGEBLIT if FB
 +	select INPUT_POLLDEV
++	select SYS_SUPPORTS_APM_EMULATION
 +
  endchoice
 +
@@ -63,11 +64,49 @@ index b6c8d5c..35902e9 100644
 +load-$(CONFIG_CASIO_BE300)	+= 0xffffffff80020000
 diff --git a/arch/mips/vr41xx/casio-be300/Makefile b/arch/mips/vr41xx/casio-be300/Makefile
 new file mode 100644
-index 0000000..65bf482
+index 0000000..cd69e19
 --- /dev/null
 +++ b/arch/mips/vr41xx/casio-be300/Makefile
 @@ -0,0 +1 @@
-+obj-y := setup.o sfb.o keys.o nand.o irq.o stowaway_serio.o touch_be300.o
++obj-y := setup.o sfb.o keys.o nand.o irq.o stowaway_serio.o touch_be300.o power.o
+diff --git a/arch/mips/vr41xx/casio-be300/power.c b/arch/mips/vr41xx/casio-be300/power.c
+new file mode 100644
+index 0000000..f1f37fa
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/power.c
+@@ -0,0 +1,32 @@
++/*
++ * arch/mips/vr41xx/casio-be300/power.c
++ *
++ * Minimal APM status provider for the BE-300 emulator profile.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/apm-emulation.h>
++#include <linux/init.h>
++
++static void be300_apm_get_power_status(struct apm_power_info *info)
++{
++	info->ac_line_status = APM_AC_ONLINE;
++	info->battery_status = APM_BATTERY_STATUS_HIGH;
++	info->battery_flag = APM_BATTERY_FLAG_HIGH;
++	info->battery_life = 100;
++	info->time = -1;
++	info->units = APM_UNITS_UNKNOWN;
++}
++
++static int __init be300_power_init(void)
++{
++	apm_get_power_status = be300_apm_get_power_status;
++
++	return 0;
++}
++device_initcall(be300_power_init);
 diff --git a/arch/mips/vr41xx/casio-be300/irq.c b/arch/mips/vr41xx/casio-be300/irq.c
 new file mode 100644
 index 0000000..d1df5e9
@@ -1236,15 +1275,15 @@ index 0000000..576b48e
 + * Stride = 256 * 2 = 512 bytes per line.
 + *
 + * Color format per hardware.txt: RGB565 (bits 15-11=R, 10-5=G, 4-0=B).
-+ * The original sfb.c used 5-bit green (RGB555). We keep the original
-+ * to match what is known to work with the emulator and real hardware.
-+ * Use --sfb-5bit-green with the emulator for this format.
++ * fbdev mmap exposes the physical framebuffer while screen_base uses the
++ * uncached KSEG1 alias for kernel-side cfb helpers.
 + */
-+#define VIDEORAM_BASE	0xaa200000
++#define VIDEORAM_PHYS	0x0a200000
++#define VIDEORAM_KSEG1	0xaa200000
 +#define VIDEOMEMSIZE	(320 * 256 * 16 / 8)
 +
-+static u_long videomemory;
-+static u_long videomemory_phys = VIDEORAM_BASE;
++static u_long videomemory = VIDEORAM_KSEG1;
++static u_long videomemory_phys = VIDEORAM_PHYS;
 +static u_long videomemorysize = VIDEOMEMSIZE;
 +
 +static struct fb_info fb_info;
@@ -1278,7 +1317,7 @@ index 0000000..576b48e
 +	.id		= "Casio BE-x00 FB",
 +	.type		= FB_TYPE_PACKED_PIXELS,
 +	.visual		= FB_VISUAL_TRUECOLOR,
-+	.ypanstep	= 8,
++	.ypanstep	= 0,
 +	.accel		= FB_ACCEL_NONE,
 +};
 +
@@ -1470,6 +1509,8 @@ index 0000000..576b48e
 +static int sfb_pan_display(struct fb_var_screeninfo *var,
 +			   struct fb_info *info)
 +{
++	if (var->xoffset || var->yoffset)
++		return -EINVAL;
 +	if (var->vmode & FB_VMODE_YWRAP) {
 +		if (var->yoffset < 0
 +		    || var->yoffset >= info->var.yres_virtual
@@ -1500,9 +1541,7 @@ index 0000000..576b48e
 +	if (len > videomemorysize - (vma->vm_pgoff << PAGE_SHIFT))
 +		return -EINVAL;
 +
-+	/* videomemory_phys holds the KSEG1 virtual address (0xaa200000);
-+	 * the physical base is the low 29 bits (0x0a200000). */
-+	pfn = ((videomemory_phys & 0x1fffffff) >> PAGE_SHIFT) + vma->vm_pgoff;
++	pfn = (videomemory_phys >> PAGE_SHIFT) + vma->vm_pgoff;
 +
 +	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 +	if (remap_pfn_range(vma, vma->vm_start, pfn, len, vma->vm_page_prot))
@@ -1514,7 +1553,7 @@ index 0000000..576b48e
 +static int __init sfb_init(void)
 +{
 +	fb_info.fbops = &sfb_ops;
-+	videomemory = videomemory_phys;
++	videomemory = VIDEORAM_KSEG1;
 +	fb_info.screen_base = (char *)videomemory;
 +	fb_info.screen_size = videomemorysize;
 +

@@ -29,3 +29,16 @@ commonly shipped by OpenZaurus-era images. The profile trims nonessential
 SysInfo device artwork so the JFFS2 image still fits the fixed rootfs partition.
 It must be booted with the emulator's `--sdram 64` flag so Linux's registered
 memory size matches the emulated hardware.
+
+The Opie power meter uses Linux APM emulation through `/proc/apm`. The BE-300
+kernel currently reports the emulator as AC online with a 100% battery because
+the emulator does not expose dynamic battery or charger state yet.
+
+Qt/Embedded's BE-300 LinuxFb path uses `/dev/fb0` for the framebuffer mmap and
+defaults to Qt's software raster code. An experimental accelerator can be enabled
+with `BE300_QWS_ACCEL=1`; it maps the VRC4173 display engine through `/dev/mem`
+for RGB565 solid fills and same-framebuffer scroll/copy. This mirrors the
+emulator's framebuffer implementation at physical `0x0A000200` and falls back to
+Qt's software raster code if the register mmap is unavailable.
+`BE300_QWS_NOACCEL=1` keeps the software raster path even if acceleration is
+requested.

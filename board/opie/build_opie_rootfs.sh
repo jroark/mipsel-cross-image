@@ -325,27 +325,6 @@ if "[be300-qws]" not in text:
 else:
     path.write_text(text)
 
-path = Path("/work/qt-2.3.10-be300/src/kernel/qwidget_qws.cpp")
-text = path.read_text()
-old = (
-    "    qgfx_qws->setWidgetDeviceRegion(r);\n"
-    "    qgfx_qws->setOffset(offset.x(),offset.y());\n"
-)
-new = (
-    "#ifdef QT_QWS_CASSIOPEIA\n"
-    "    if ( isVisible() && topLevelWidget()->isVisible() ) {\n"
-    "        QRect be300r( offset.x(), offset.y(), width(), height() );\n"
-    "        be300r = qt_screen->mapToDevice( be300r, QSize( qt_screen->width(), qt_screen->height() ) );\n"
-    "        r = QRegion( be300r );\n"
-    "    }\n"
-    "#endif\n"
-    "    qgfx_qws->setWidgetDeviceRegion(r);\n"
-    "    qgfx_qws->setOffset(offset.x(),offset.y());\n"
-)
-if old in text and "QRect be300r" not in text:
-    text = text.replace(old, new, 1)
-path.write_text(text)
-
 for rel in ("include/qvaluestack.h", "src/tools/qvaluestack.h"):
     path = Path("/work/qt-2.3.10-be300") / rel
     text = path.read_text()
@@ -576,7 +555,7 @@ PY
 }
 
 build_qt() {
-	if [ ! -f "$QT_SRC/.be300-qt-built-v9" ] || [ ! -f "$QT_SRC/lib/libqte.so.${QT_VERSION}" ]; then
+	if [ ! -f "$QT_SRC/.be300-qt-built-v11" ] || [ ! -f "$QT_SRC/lib/libqte.so.${QT_VERSION}" ]; then
 		echo "=== Building Qt/Embedded ${QT_VERSION} for BE-300 ==="
 		(
 			cd "$QT_SRC"
@@ -591,7 +570,7 @@ build_qt() {
 				-no-xkb -no-sm -no-xft -no-qvfb \
 				>"$QT_BUILD_LOG" 2>&1 || exit 1
 			make -j"$(nproc)" >>"$QT_BUILD_LOG" 2>&1 || exit 1
-			touch "$QT_SRC/.be300-qt-built-v9"
+			touch "$QT_SRC/.be300-qt-built-v11"
 		) || {
 			tail -80 "$QT_BUILD_LOG"
 			exit 1

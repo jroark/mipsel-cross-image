@@ -33,15 +33,15 @@
  * Stride = 256 * 2 = 512 bytes per line.
  *
  * Color format per hardware.txt: RGB565 (bits 15-11=R, 10-5=G, 4-0=B).
- * The original sfb.c used 5-bit green (RGB555). We keep the original
- * to match what is known to work with the emulator and real hardware.
- * Use --sfb-5bit-green with the emulator for this format.
+ * fbdev mmap exposes the physical framebuffer while screen_base uses the
+ * uncached KSEG1 alias for kernel-side cfb helpers.
  */
-#define VIDEORAM_BASE	0xaa200000
+#define VIDEORAM_PHYS	0x0a200000
+#define VIDEORAM_KSEG1	0xaa200000
 #define VIDEOMEMSIZE	(320 * 256 * 16 / 8)
 
-static u_long videomemory;
-static u_long videomemory_phys = VIDEORAM_BASE;
+static u_long videomemory = VIDEORAM_KSEG1;
+static u_long videomemory_phys = VIDEORAM_PHYS;
 static u_long videomemorysize = VIDEOMEMSIZE;
 
 static struct fb_info fb_info;
@@ -75,7 +75,7 @@ static struct fb_fix_screeninfo sfb_fix __initdata = {
 	.id		= "Casio BE-x00 FB",
 	.type		= FB_TYPE_PACKED_PIXELS,
 	.visual		= FB_VISUAL_TRUECOLOR,
-	.ypanstep	= 8,
+	.ypanstep	= 0,
 	.accel		= FB_ACCEL_NONE,
 };
 
@@ -267,6 +267,8 @@ static int sfb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
 static int sfb_pan_display(struct fb_var_screeninfo *var,
 			   struct fb_info *info)
 {
+	if (var->xoffset || var->yoffset)
+		return -EINVAL;
 	if (var->vmode & FB_VMODE_YWRAP) {
 		if (var->yoffset < 0
 		    || var->yoffset >= info->var.yres_virtual
@@ -297,9 +299,7 @@ static int sfb_mmap(struct fb_info *info,
 	if (len > videomemorysize - (vma->vm_pgoff << PAGE_SHIFT))
 		return -EINVAL;
 
-	/* videomemory_phys holds the KSEG1 virtual address (0xaa200000);
-	 * the physical base is the low 29 bits (0x0a200000). */
-	pfn = ((videomemory_phys & 0x1fffffff) >> PAGE_SHIFT) + vma->vm_pgoff;
+	pfn = (videomemory_phys >> PAGE_SHIFT) + vma->vm_pgoff;
 
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 	if (remap_pfn_range(vma, vma->vm_start, pfn, len, vma->vm_page_prot))
@@ -311,7 +311,7 @@ static int sfb_mmap(struct fb_info *info,
 static int __init sfb_init(void)
 {
 	fb_info.fbops = &sfb_ops;
-	videomemory = videomemory_phys;
+	videomemory = VIDEORAM_KSEG1;
 	fb_info.screen_base = (char *)videomemory;
 	fb_info.screen_size = videomemorysize;
 

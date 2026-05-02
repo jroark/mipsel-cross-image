@@ -48,7 +48,7 @@ python3 tools/mk_be300_nand.py \
   --out linux-4.2.9/be300.nand
 ```
 
-Emulator keys: Q=quit, S=screenshot, M=help. Useful flags: `--log-mmio`, `--trace`, `--sfb-5bit-green`, `--speed 0` (unthrottled).
+Emulator keys: Q=quit, S=screenshot, M=help. Useful flags: `--log-mmio`, `--trace`, `--speed 0` (unthrottled).
 
 ## Kernel Patch Series
 
@@ -71,7 +71,7 @@ rather than editing `linux-4.2.9/` directly.
 - **VR4131 peripherals** at 0xAF000000+ (SIU, ICU, CMU, GIU, BCU, PMU, RTC) — these are in mainline Linux
 - **RAM**: 16 MB at physical 0x00000000
 - **UART**: NEC D89041F1001 on companion chip at 0xAA008680, 4-byte register spacing — NOT an 8250
-- **Display**: 240x320, 16bpp at 0xAA200000, stride 512 bytes. hardware.txt says RGB565; original sfb.c used 5-bit green (RGB555)
+- **Display**: 240x320 visible, RGB565, 16bpp at physical 0x0A200000 / KSEG1 0xAA200000, stride 512 bytes.
 - **I/O port base**: 0xAA00C000
 
 Reference manuals: `docs/Vr4131-um_200203.pdf`, `docs/Vrc4173.pdf`. Hardware notes: `docs/hardware.txt`, `docs/hw_notes.txt`.
@@ -162,7 +162,8 @@ with `tools/mk_be300_cf_linux.py`.
 - **Do NOT force per-page D-cache flush in `__update_cache`**: An unconditional `if (1)` replacement of the `exec || pages_do_alias(...)` guard in `arch/mips/mm/cache.c` is a no-op on the emulator (which doesn't simulate the D-cache) but hangs real hardware at `Calibrating delay loop...` — something in the per-page flush path on VR4131 silicon prevents the timer interrupt from delivering, so `jiffies` never advances. An earlier cycle of work hit the same thing ("per-page flush breaks real HW framebuffer"). Leave `__update_cache` at its stock behavior. The real fix for data-page-zeros was keeping the `clear_page_simple` hook out of `build_copy_page`, not this.
 - **Docker mknod**: Cannot create device nodes in unprivileged Docker. Not an issue at runtime — the kernel mounts devtmpfs (`CONFIG_DEVTMPFS_MOUNT=y`) over `/dev` on the JFFS2 root before exec'ing `/sbin/init`, so all required device nodes appear dynamically.
 - **NAND and `--ne2000` can coexist only via the XFER path**: the legacy NAND DIO ports (`PA 0x0A00D200/D202`) live inside the VRC4173 PCMCIA card window (`0x0A00D000-0x0A00D7FF`). `board/casio-be300/nand.c` therefore drives NAND through the VRC4173 XFER engine (`PA 0x0A00A4xx` / `0x0A00B000`), and `board/casio-be300/setup.c` enables the PCMCIA bridge so CF/NE2000 can own the C000/D000 windows without stealing NAND I/O. Do not reintroduce DIO-backed Linux NAND access unless the emulator decode model is changed with it.
-- **simplefb doesn't work**: The mainline `simplefb` driver uses `ioremap_wc()` which doesn't work for the BE300's KSEG1-mapped VRAM. Use the ported `sfb.c` instead, which directly accesses 0xAA200000 as a KSEG1 virtual address.
+- **simplefb doesn't work**: The mainline `simplefb` driver uses `ioremap_wc()` which doesn't work for the BE300's KSEG1-mapped VRAM. Use the ported `sfb.c` instead: kernel CFB helpers write through uncached KSEG1 0xAA200000, while fbdev mmap and `fix.smem_start` expose physical 0x0A200000 to LinuxFb clients.
+- **OPIE LinuxFb acceleration**: The default BE-300 Qt/Embedded LinuxFb path is Qt's software raster code over `/dev/fb0`. The experimental accelerator is opt-in with `BE300_QWS_ACCEL=1`; it maps VRC4173 registers through `/dev/mem` and uses display-engine mode 0 for solid RGB565 fills and mode 1 for same-framebuffer scroll/copy. The contract matches the emulator model at PA 0x0A000200: destination offset registers 0x210/0x214, source offset registers 0x218/0x21C, width/height 0x208/0x20C, trigger 0x234. `BE300_QWS_NOACCEL=1` keeps the software raster path even if acceleration is requested.
 - **Framebuffer console requires CFB helpers**: `CONFIG_FB_CFB_FILLRECT/COPYAREA/IMAGEBLIT` must be force-selected in Kconfig since no standard driver selects them. The patch series adds `select FB_CFB_*` to the CASIO_BE300 Kconfig entry.
 
 ### Toolchain Notes
