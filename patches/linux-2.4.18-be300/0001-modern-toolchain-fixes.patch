@@ -1,0 +1,3294 @@
+--- /dev/null	2026-05-13 23:48:26
++++ b/include/linux/be300_modern_compat.h	2026-05-13 20:52:24
+@@ -0,0 +1,21 @@
++/*
++ * be300_modern_compat.h — BE-300 modern-toolchain shims for 2.4.18.
++ *
++ * Pulled in via gcc -include from arch/mips/Makefile so every TU sees
++ * the same overrides. Modern GCC (12+) treats __FUNCTION__ as a const
++ * char[] runtime variable, breaking the 1300+ kernel sites that
++ * concatenate it directly into format strings (KERN_ERR __FUNCTION__
++ * "fmt"). Replace with a placeholder string literal so concatenations
++ * resolve at preprocess time; printk("%s", __FUNCTION__) just prints
++ * "<fn>" instead of the real name — acceptable price for a green build.
++ */
++#ifndef _BE300_MODERN_COMPAT_H
++#define _BE300_MODERN_COMPAT_H
++
++#undef __FUNCTION__
++#define __FUNCTION__ "<fn>"
++
++#undef __PRETTY_FUNCTION__
++#define __PRETTY_FUNCTION__ "<fn>"
++
++#endif /* _BE300_MODERN_COMPAT_H */
+--- /dev/null	2026-05-13 23:48:26
++++ b/include/asm-mips/vr4131/vr4131.h	2026-05-13 22:13:51
+@@ -0,0 +1,68 @@
++/*
++ * include/asm-mips/vr4131/vr4131.h
++ *
++ * NEC VR4131 (uPD30131) chip-specific register and IRQ definitions for
++ * the 2.4 kernel. The linux4be 2.4.18 tree shipped without a VR4131
++ * header — it only had vr4111/vr4121/vr4122/vr4181 — so any driver that
++ * dereferences a `VR41XX_*` macro (which the per-chip headers define)
++ * fails to build when CONFIG_VR4131=y.
++ *
++ * VR4131 inherits the on-chip BCU/CMU/ICU/PMU/RTC/SIU/GIU peripheral
++ * block from VR4122 at PA 0x0F000000+ with identical offsets. Include
++ * the VR4122 definitions as the baseline and add VR4131-specific
++ * overrides below.
++ */
++#ifndef __ASM_MIPS_VR4131_VR4131_H
++#define __ASM_MIPS_VR4131_VR4131_H
++
++#include <asm/addrspace.h>
++#include <asm/vr4122/vr4122.h>
++
++/*
++ * Pointer-typed register macros (like vr4111.h / vr4181.h use). VR4122
++ * exposes its registers as plain integer addresses (`KSEG1ADDR(x)`),
++ * but the driver code (buttons.c::power_btn_interrupt etc.) expects to
++ * dereference VR41XX_* macros directly with `*VR41XX_FOO = bar`. Re-wrap
++ * the VR4122 KSEG1 addresses as pointer macros for VR4131 use.
++ */
++#define __vr41xx_preg16(off)	((volatile unsigned short *)KSEG1ADDR(off))
++
++/* PMU (Power Management Unit) — same layout as VR4122. */
++#ifndef VR41XX_PMUINTREG
++#define VR41XX_PMUINTREG	__vr41xx_preg16(0x0F0000C0)
++#endif
++#ifndef VR41XX_PMUINT_POWERSW
++#define VR41XX_PMUINT_POWERSW	0x1
++#endif
++#ifndef VR41XX_PMUINT_BATT
++#define VR41XX_PMUINT_BATT	0x2
++#endif
++
++/* GIU (GPIO interface unit) — same VR4122 layout, all at 0x0F000140+. */
++#ifndef VR41XX_GIUIOSELL
++#define VR41XX_GIUIOSELL	__vr41xx_preg16(0x0F000140)
++#define VR41XX_GIUIOSELH	__vr41xx_preg16(0x0F000142)
++#define VR41XX_GIUPIODL		__vr41xx_preg16(0x0F000144)
++#define VR41XX_GIUPIODH		__vr41xx_preg16(0x0F000146)
++#define VR41XX_GIUINTSTATL	__vr41xx_preg16(0x0F000148)
++#define VR41XX_GIUINTSTATH	__vr41xx_preg16(0x0F00014A)
++#define VR41XX_GIUINTENL	__vr41xx_preg16(0x0F00014C)
++#define VR41XX_GIUINTENH	__vr41xx_preg16(0x0F00014E)
++#define VR41XX_GIUINTTYPL	__vr41xx_preg16(0x0F000150)
++#define VR41XX_GIUINTTYPH	__vr41xx_preg16(0x0F000152)
++#define VR41XX_GIUINTALSELL	__vr41xx_preg16(0x0F000154)
++#define VR41XX_GIUINTALSELH	__vr41xx_preg16(0x0F000156)
++#define VR41XX_GIUINTHTSELL	__vr41xx_preg16(0x0F000158)
++#define VR41XX_GIUINTHTSELH	__vr41xx_preg16(0x0F00015A)
++#endif
++
++/* IRQs — VR4131 ICU pin assignments match VR4122 for the
++ * power/battery/RTC lines used by the buttons driver. */
++#ifndef VR41XX_IRQ_POWER
++#define VR41XX_IRQ_POWER	VR4122_IRQ_POWER
++#endif
++#ifndef VR41XX_IRQ_BATTERY
++#define VR41XX_IRQ_BATTERY	VR4122_IRQ_BATTERY
++#endif
++
++#endif /* __ASM_MIPS_VR4131_VR4131_H */
+--- /dev/null	2026-05-13 23:48:26
++++ b/arch/mips/vr41xx/vr4131/casio-be300/nand_be300.c	2026-05-13 22:28:48
+@@ -0,0 +1,371 @@
++/*
++ * arch/mips/vr41xx/vr4131/casio-be300/nand_be300.c
++ *
++ * Custom MTD driver for the Casio BE-300 NAND, modeled on the modern
++ * 4.2.9 board/casio-be300/nand.c. Drives the VRC4173 NAND XFER engine
++ * (PA 0x0A00A4xx + 0x0A00B000) directly and registers a generic
++ * `struct mtd_info` rather than going through the 2.4 NAND framework
++ * (drivers/mtd/nand/nand.c) — that framework is hardwired to direct-IO
++ * NAND with separate CLE/ALE/NCE addresses, which is not how the VRC4173
++ * exposes the chip.
++ *
++ * The XFER protocol is documented inline in the matching 4.2.9 driver
++ * and verified against the BE-300 emulator (be300-framebuffer source).
++ * Summary:
++ *   * CMD phase   -> XFER_CMD = 0x03; write opcode byte to XFER_ADDR;
++ *                    XFER_ACK = 0; poll XFER_STATUS bit 0.
++ *   * ADDR phase  -> XFER_CMD = 0x06; write up to 3 address bytes
++ *                    (col_lo, page_lo, page_hi) to XFER_ADDR; XFER_ACK = 0.
++ *   * Data stream -> KICK = 1 then MODE = 0x05 (READ) / 0x07 (PROGRAM);
++ *                    poll XFER_STATUS; data flows through STREAM_PORT
++ *                    in 4-byte units (520 bytes per page = 512 data + 8 OOB).
++ *
++ * Layout mirrors tools/mk_be300_nand.py:
++ *   ptable  : 0x000000-0x004000  (RO)
++ *   spl     : 0x004000-0x014000  (RO)
++ *   kernel  : 0x014000-0x500000  (RO)
++ *   rootfs  : 0x500000-0x1000000 (JFFS2, RW)
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/string.h>
++#include <linux/slab.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/partitions.h>
++#include <asm/io.h>
++#include <asm/addrspace.h>
++
++/* VRC4173 XFER engine and stream port (uncached KSEG1 aliases). */
++#define BE300_XFER_BASE		KSEG1ADDR(0x0a00a400)
++#define BE300_STREAM_BASE	KSEG1ADDR(0x0a00b000)
++
++#define XFER_CMD		((volatile u32 *)(BE300_XFER_BASE + 0x14))
++#define XFER_ADDR_BYTE		((volatile u8  *)(BE300_XFER_BASE + 0x20))
++#define XFER_ACK		((volatile u32 *)(BE300_XFER_BASE + 0x30))
++#define XFER_STATUS		((volatile u32 *)(BE300_XFER_BASE + 0x40))
++#define XFER_KICK		((volatile u32 *)(BE300_XFER_BASE + 0x60))
++#define XFER_MODE		((volatile u32 *)(BE300_XFER_BASE + 0x64))
++#define STREAM_PORT		((volatile u32 *)(BE300_STREAM_BASE))
++#define STREAM_PORT_BYTE	((volatile u8  *)(BE300_STREAM_BASE))
++
++#define MODE_READ		0x05
++#define MODE_PROGRAM		0x07
++#define MODE_PROGRAM_OOB2	0x06
++
++#define BE300_PAGE_DATA		512
++#define BE300_PAGE_OOB		16
++#define BE300_PAGE_RAW		(BE300_PAGE_DATA + BE300_PAGE_OOB)
++#define BE300_BLOCK_PAGES	32
++#define BE300_BLOCK_SIZE	(BE300_BLOCK_PAGES * BE300_PAGE_DATA)
++#define BE300_FLASH_SIZE	(16 * 1024 * 1024)
++#define BE300_NUM_BLOCKS	(BE300_FLASH_SIZE / BE300_BLOCK_SIZE)
++
++#define NAND_CMD_READ0		0x00
++#define NAND_CMD_READ1		0x01
++#define NAND_CMD_READOOB	0x50
++#define NAND_CMD_ERASE1		0x60
++#define NAND_CMD_STATUS		0x70
++#define NAND_CMD_SEQIN		0x80
++#define NAND_CMD_READID		0x90
++#define NAND_CMD_ERASE2		0xd0
++#define NAND_CMD_PAGEPROG	0x10
++#define NAND_CMD_RESET		0xff
++
++static struct mtd_info be300_mtd;
++static u8 *be300_page_buf;	/* one PAGE_RAW buffer for read-modify-write */
++
++/* Wait for XFER engine ready. The emulator answers within a few ops; cap at
++ * a generous timeout in case real hardware is slower or the chip stalls. */
++static void xfer_wait_ready(void)
++{
++	unsigned int timeout = 200000;
++
++	while (timeout-- && !(*XFER_STATUS & 1))
++		;
++}
++
++/* Send one NAND command byte. */
++static void nand_send_cmd(u8 cmd)
++{
++	*XFER_CMD = 0x03;
++	*XFER_ADDR_BYTE = cmd;
++	*XFER_ACK = 0;
++	xfer_wait_ready();
++}
++
++/* Send the 3-byte address tuple (col_lo, page_lo, page_hi). The XFER queue
++ * holds exactly 3 bytes; pushing more shifts col out — see the SPL
++ * (board/casio-be300/spl.c) and CLAUDE.md "BE-300 boot path" notes. */
++static void nand_send_addr(u8 col, u32 page)
++{
++	*XFER_CMD = 0x06;
++	*XFER_ADDR_BYTE = col;
++	*XFER_ADDR_BYTE = page & 0xff;
++	*XFER_ADDR_BYTE = (page >> 8) & 0xff;
++	*XFER_ACK = 0;
++}
++
++/* Read one raw 520-byte page (512 data + 8 OOB) from `page` into buf.
++ * The XFER stream is consumed in 4-byte words from STREAM_PORT. */
++static void be300_read_raw_page(u32 page, u8 *buf)
++{
++	int i;
++
++	nand_send_cmd(NAND_CMD_READ0);
++	nand_send_addr(0, page);
++
++	*XFER_KICK = 1;
++	*XFER_MODE = MODE_READ;
++	xfer_wait_ready();
++
++	for (i = 0; i < BE300_PAGE_DATA / 4; i++)
++		((u32 *)buf)[i] = *STREAM_PORT;
++	/* Drain the 8-byte OOB region (we ignore content). */
++	(void)*STREAM_PORT;
++	(void)*STREAM_PORT;
++}
++
++/* Program one full 520-byte page (512 data + 8 OOB). The OOB is ignored by
++ * the emulator (it synthesizes Casio NANDWRITER tags on the fly), so we just
++ * stream 0xFF for the OOB half. After 8 OOB-1 bytes the engine wants
++ * MODE=0x06 to receive the trailing 8 OOB-2 bytes. */
++static void be300_program_page(u32 page, const u8 *data)
++{
++	int i;
++	const u32 *w = (const u32 *)data;
++
++	nand_send_cmd(NAND_CMD_SEQIN);
++	nand_send_addr(0, page);
++
++	*XFER_KICK = 1;
++	*XFER_MODE = MODE_PROGRAM;
++	xfer_wait_ready();
++
++	/* 512 data bytes. */
++	for (i = 0; i < BE300_PAGE_DATA / 4; i++)
++		*STREAM_PORT = w[i];
++
++	/* 8 OOB-1 bytes (all 0xFF — emulator preserves nothing here). */
++	*STREAM_PORT = 0xffffffff;
++	*STREAM_PORT = 0xffffffff;
++
++	/* Hand off to OOB-2 mode for the last 8 OOB bytes. */
++	*XFER_MODE = MODE_PROGRAM_OOB2;
++	xfer_wait_ready();
++	*STREAM_PORT = 0xffffffff;
++	*STREAM_PORT = 0xffffffff;
++
++	nand_send_cmd(NAND_CMD_PAGEPROG);
++}
++
++/* Erase one 16 KiB block (32 pages). */
++static void be300_erase_block(u32 block)
++{
++	u32 first_page = block * BE300_BLOCK_PAGES;
++
++	*XFER_CMD = 0x03;
++	*XFER_ADDR_BYTE = NAND_CMD_ERASE1;
++	*XFER_ACK = 0;
++	xfer_wait_ready();
++
++	/* Block-erase address is 2 bytes (page_lo, page_hi). */
++	*XFER_CMD = 0x06;
++	*XFER_ADDR_BYTE = first_page & 0xff;
++	*XFER_ADDR_BYTE = (first_page >> 8) & 0xff;
++	*XFER_ACK = 0;
++
++	*XFER_CMD = 0x03;
++	*XFER_ADDR_BYTE = NAND_CMD_ERASE2;
++	*XFER_ACK = 0;
++	xfer_wait_ready();
++}
++
++/* MTD callbacks ------------------------------------------------------ */
++
++static int be300_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
++			  size_t *retlen, u_char *buf)
++{
++	u32 page = from / BE300_PAGE_DATA;
++	u32 page_off = from % BE300_PAGE_DATA;
++	size_t copied = 0;
++
++	if (from + len > BE300_FLASH_SIZE)
++		return -EINVAL;
++
++	while (copied < len) {
++		size_t chunk = BE300_PAGE_DATA - page_off;
++
++		if (chunk > len - copied)
++			chunk = len - copied;
++
++		if (page_off == 0 && chunk == BE300_PAGE_DATA) {
++			/* Aligned full-page read — go direct to caller buf. */
++			be300_read_raw_page(page, buf + copied);
++		} else {
++			be300_read_raw_page(page, be300_page_buf);
++			memcpy(buf + copied, be300_page_buf + page_off, chunk);
++		}
++
++		copied += chunk;
++		page_off = 0;
++		page++;
++	}
++
++	*retlen = copied;
++	return 0;
++}
++
++static int be300_mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
++			   size_t *retlen, const u_char *buf)
++{
++	u32 page = to / BE300_PAGE_DATA;
++	u32 page_off = to % BE300_PAGE_DATA;
++	size_t written = 0;
++
++	if (to + len > BE300_FLASH_SIZE)
++		return -EINVAL;
++
++	/* JFFS2 always writes whole pages, but be defensive: implement the
++	 * partial-page case via read-modify-write through be300_page_buf. */
++	while (written < len) {
++		size_t chunk = BE300_PAGE_DATA - page_off;
++
++		if (chunk > len - written)
++			chunk = len - written;
++
++		if (page_off == 0 && chunk == BE300_PAGE_DATA) {
++			be300_program_page(page, buf + written);
++		} else {
++			be300_read_raw_page(page, be300_page_buf);
++			memcpy(be300_page_buf + page_off, buf + written, chunk);
++			be300_program_page(page, be300_page_buf);
++		}
++
++		written += chunk;
++		page_off = 0;
++		page++;
++	}
++
++	*retlen = written;
++	return 0;
++}
++
++static int be300_mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
++{
++	u32 block, num_blocks;
++
++	if (instr->addr % BE300_BLOCK_SIZE ||
++	    instr->len % BE300_BLOCK_SIZE) {
++		instr->state = MTD_ERASE_FAILED;
++		return -EINVAL;
++	}
++	if (instr->addr + instr->len > BE300_FLASH_SIZE) {
++		instr->state = MTD_ERASE_FAILED;
++		return -EINVAL;
++	}
++
++	block = instr->addr / BE300_BLOCK_SIZE;
++	num_blocks = instr->len / BE300_BLOCK_SIZE;
++	while (num_blocks--)
++		be300_erase_block(block++);
++
++	instr->state = MTD_ERASE_DONE;
++	if (instr->callback)
++		instr->callback(instr);
++	return 0;
++}
++
++/* Partition table mirrors tools/mk_be300_nand.py. */
++static struct mtd_partition be300_nand_partitions[] = {
++	{
++		.name		= "ptable",
++		.offset		= 0x000000,
++		.size		= 0x004000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "spl",
++		.offset		= 0x004000,
++		.size		= 0x010000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "kernel",
++		.offset		= 0x014000,
++		.size		= 0x4ec000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "rootfs",
++		.offset		= 0x500000,
++		.size		= 0xb00000,
++	},
++};
++
++static int __init be300_nand_init(void)
++{
++	int ret;
++
++	be300_page_buf = kmalloc(BE300_PAGE_RAW, GFP_KERNEL);
++	if (!be300_page_buf)
++		return -ENOMEM;
++
++	memset(&be300_mtd, 0, sizeof(be300_mtd));
++	be300_mtd.type		= MTD_NANDFLASH;
++	be300_mtd.flags		= MTD_CAP_NANDFLASH;
++	be300_mtd.size		= BE300_FLASH_SIZE;
++	be300_mtd.erasesize	= BE300_BLOCK_SIZE;
++	be300_mtd.oobblock	= BE300_PAGE_DATA;
++	be300_mtd.oobsize	= BE300_PAGE_OOB;
++	be300_mtd.ecctype	= MTD_ECC_NONE;
++	be300_mtd.eccsize	= 0;
++	be300_mtd.name		= "BE-300 NAND";
++	be300_mtd.read		= be300_mtd_read;
++	be300_mtd.write		= be300_mtd_write;
++	be300_mtd.erase		= be300_mtd_erase;
++	be300_mtd.module	= THIS_MODULE;
++
++	printk(KERN_INFO "BE-300 NAND: 16 MiB Samsung K9F2808 (XFER engine), "
++	       "16 KiB eraseblocks, 512 B pages\n");
++
++#ifdef CONFIG_MTD_PARTITIONS
++	ret = add_mtd_partitions(&be300_mtd, be300_nand_partitions,
++				 sizeof(be300_nand_partitions) /
++				 sizeof(be300_nand_partitions[0]));
++#else
++	ret = add_mtd_device(&be300_mtd);
++#endif
++	if (ret) {
++		printk(KERN_ERR "BE-300 NAND: failed to register MTD: %d\n", ret);
++		kfree(be300_page_buf);
++		be300_page_buf = NULL;
++		return ret;
++	}
++	return 0;
++}
++
++static void __exit be300_nand_exit(void)
++{
++#ifdef CONFIG_MTD_PARTITIONS
++	del_mtd_partitions(&be300_mtd);
++#else
++	del_mtd_device(&be300_mtd);
++#endif
++	kfree(be300_page_buf);
++	be300_page_buf = NULL;
++}
++
++module_init(be300_nand_init);
++module_exit(be300_nand_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("John Roark");
++MODULE_DESCRIPTION("Casio Cassiopeia BE-300 NAND MTD driver (VRC4173 XFER engine)");
+--- /dev/null	2026-05-13 23:48:26
++++ b/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c	2026-05-13 22:38:06
+@@ -0,0 +1,374 @@
++/*
++ * arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c
++ *
++ * VRC4173 PIU touchscreen driver for the Casio BE-300, ported to the 2.4
++ * kernel from the working 4.2.9 driver at board/casio-be300/touch_be300.c.
++ *
++ * The 4.2.9 driver is interrupt-driven through the VRC4173 GIRQ0 cascade
++ * (SYSINT1 bit 8 -> GIU pin 0 -> VRC4173 GIRQ0 status bit 9). The 2.4
++ * linux4be tree never wired that cascade, so this version is **polled**
++ * via a 20 ms kernel timer that reads PIU_CNTREG and PIU_INTREG. That's
++ * good enough for the BE-300's 240x320 pen — a 50 Hz scan keeps drag
++ * latency well under the LCD refresh.
++ *
++ *   PIU MMIO base:  PA 0x0A000300, size 0x60
++ *   PIU_CNTREG +0x00 (16-bit) — control + readback PADSTATE/pen-down
++ *   PIU_INTREG +0x04 (16-bit) — pending status (low byte) | mask (high)
++ *   PIU_PB0x  +0x20..+0x2C    — page-0 ADC samples (yp, ym, xm, xp)
++ *   PIU_PB1x  +0x50..+0x5C    — page-1 ADC samples
++ *
++ * ADC linear range and decode constants come from the same emulator
++ * model that the 4.2.9 driver targets — see board/casio-be300/touch_be300.c
++ * for the protocol notes the in-tree comment cites.
++ *
++ * Userspace interface (matching the standard /dev/be300tpanel reader the
++ * 4.2.9 build's BusyBox toolset already understands):
++ *   read() yields fixed-size records:
++ *       struct { u16 x; u16 y; u16 down; u16 padding; }
++ *   poll()/fasync supported.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/sched.h>
++#include <linux/poll.h>
++#include <linux/wait.h>
++#include <linux/timer.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <asm/io.h>
++#include <asm/uaccess.h>
++#include <asm/addrspace.h>
++
++#define PIU_BASE	KSEG1ADDR(0x0A000300)
++
++#define PIU_CNTREG	((volatile u16 *)(PIU_BASE + 0x00))
++#define PIU_INTREG	((volatile u16 *)(PIU_BASE + 0x04))
++#define PIU_SIVL	((volatile u16 *)(PIU_BASE + 0x08))
++#define PIU_STBL	((volatile u16 *)(PIU_BASE + 0x0c))
++#define PIU_CMD		((volatile u16 *)(PIU_BASE + 0x10))
++#define PIU_PB00	((volatile u16 *)(PIU_BASE + 0x20))
++#define PIU_PB01	((volatile u16 *)(PIU_BASE + 0x24))
++#define PIU_PB02	((volatile u16 *)(PIU_BASE + 0x28))
++#define PIU_PB03	((volatile u16 *)(PIU_BASE + 0x2c))
++#define PIU_PB10	((volatile u16 *)(PIU_BASE + 0x50))
++#define PIU_PB11	((volatile u16 *)(PIU_BASE + 0x54))
++#define PIU_PB12	((volatile u16 *)(PIU_BASE + 0x58))
++#define PIU_PB13	((volatile u16 *)(PIU_BASE + 0x5c))
++
++#define PIUCNT_SCAN_KICK	0x0001
++#define PIUCNT_PADATSTART	0x0004
++#define PIUCNT_PIUSEQEN		0x0100
++#define PIUCNT_PIUPWR		0x0200
++#define PIUCNT_PEN_DETECTED	0x2000
++
++#define PIUINT_PENCHGINTR	0x0001
++#define PIUINT_PADDLOSTINTR	0x0004
++#define PIUINT_PADPAGE0INTR	0x0008
++#define PIUINT_PADPAGE1INTR	0x0010
++#define PIUINT_TOUCH_DATA	(PIUINT_PADPAGE0INTR | PIUINT_PADPAGE1INTR)
++#define PIUINT_PENDING_ALL	(PIUINT_PENCHGINTR | PIUINT_PADDLOSTINTR | \
++				 PIUINT_TOUCH_DATA)
++
++/* ADC linear ranges (be300-framebuffer/src/be300_devices.c). */
++#define PIU_ADC_Y_MIN		0x81E1u
++#define PIU_ADC_Y_MAX		0x8E30u
++#define PIU_ADC_X_MIN		0x8300u
++#define PIU_ADC_X_MAX		0x8D1Bu
++
++#define BE300_TOUCH_WIDTH	240
++#define BE300_TOUCH_HEIGHT	320
++#define BE300_TOUCH_PANEL_HEIGHT	359
++#define BE300_TOUCH_MINOR	170	/* misc minor */
++#define BE300_TOUCH_POLL_HZ	50	/* scan rate */
++
++#define BUFFER_SLOTS		64
++
++struct be300_touch_event {
++	u16 x;
++	u16 y;
++	u16 down;
++	u16 _pad;
++};
++
++static struct {
++	struct be300_touch_event buf[BUFFER_SLOTS];
++	unsigned head, tail;
++	int pen_down;
++	int initialized;
++	int active;
++	wait_queue_head_t wait;
++	struct fasync_struct *fasync;
++	struct timer_list poll;
++	spinlock_t lock;
++} tp;
++
++static int adc_valid(u16 v, u16 lo, u16 hi)
++{
++	return v >= lo && v <= hi;
++}
++
++static int adc_to_pos(u16 v, u16 lo, u16 hi, int span)
++{
++	if (v < lo) v = lo;
++	if (v > hi) v = hi;
++	return ((int)(v - lo) * (span - 1)) / (hi - lo);
++}
++
++static int adc_to_pos_inv(u16 v, u16 lo, u16 hi, int span)
++{
++	if (v < lo) v = lo;
++	if (v > hi) v = hi;
++	return ((int)(hi - v) * (span - 1)) / (hi - lo);
++}
++
++static void decode_page(volatile u16 *pb0, int *out_x, int *out_y)
++{
++	u16 yp = pb0[0];
++	u16 ym = pb0[2];
++	u16 xm = pb0[4];
++	u16 xp = pb0[6];
++	int x = 0, y = 0, n;
++
++	n = 0;
++	if (adc_valid(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX)) {
++		x += adc_to_pos(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++				BE300_TOUCH_WIDTH);
++		n++;
++	}
++	if (adc_valid(xm, PIU_ADC_X_MIN, PIU_ADC_X_MAX)) {
++		x += adc_to_pos_inv(xm, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++				    BE300_TOUCH_WIDTH);
++		n++;
++	}
++	x = n ? x / n : adc_to_pos(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++				   BE300_TOUCH_WIDTH);
++
++	n = 0;
++	if (adc_valid(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX)) {
++		y += adc_to_pos(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++				BE300_TOUCH_PANEL_HEIGHT);
++		n++;
++	}
++	if (adc_valid(ym, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX)) {
++		y += adc_to_pos_inv(ym, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++				    BE300_TOUCH_PANEL_HEIGHT);
++		n++;
++	}
++	y = n ? y / n : adc_to_pos(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++				   BE300_TOUCH_PANEL_HEIGHT);
++	if (y >= BE300_TOUCH_HEIGHT)
++		y = BE300_TOUCH_HEIGHT - 1;
++
++	*out_x = x;
++	*out_y = y;
++}
++
++static void push_event(int x, int y, int down)
++{
++	unsigned long flags;
++	unsigned next;
++
++	spin_lock_irqsave(&tp.lock, flags);
++	next = (tp.head + 1) % BUFFER_SLOTS;
++	if (next == tp.tail) {
++		/* drop oldest */
++		tp.tail = (tp.tail + 1) % BUFFER_SLOTS;
++	}
++	tp.buf[tp.head].x = x;
++	tp.buf[tp.head].y = y;
++	tp.buf[tp.head].down = down ? 1 : 0;
++	tp.buf[tp.head]._pad = 0;
++	tp.head = next;
++	spin_unlock_irqrestore(&tp.lock, flags);
++
++	wake_up_interruptible(&tp.wait);
++	if (tp.fasync)
++		kill_fasync(&tp.fasync, SIGIO, POLL_IN);
++}
++
++static void be300_touch_poll_tick(unsigned long _data)
++{
++	u16 status, pending, mask, eff;
++	u16 cnt;
++	int x = 0, y = 0;
++	int pen;
++
++	status = *PIU_INTREG;
++	pending = status & 0xff;
++	mask = status >> 8;
++	eff = pending & mask;
++
++	if (eff & PIUINT_PADPAGE0INTR) {
++		decode_page(PIU_PB00, &x, &y);
++		push_event(x, y, 1);
++	}
++	if (eff & PIUINT_PADPAGE1INTR) {
++		decode_page(PIU_PB10, &x, &y);
++		push_event(x, y, 1);
++	}
++	if (eff & PIUINT_PENCHGINTR) {
++		cnt = *PIU_CNTREG;
++		pen = !!(cnt & PIUCNT_PEN_DETECTED);
++		tp.pen_down = pen;
++		push_event(x, y, pen);
++	}
++
++	/* W1C the pending bits we observed (preserve mask in high byte). */
++	if (eff)
++		*PIU_INTREG = (mask << 8) | eff;
++
++	/* Re-arm */
++	tp.poll.expires = jiffies + HZ / BE300_TOUCH_POLL_HZ;
++	if (tp.active)
++		add_timer(&tp.poll);
++}
++
++static int be300_touch_open(struct inode *inode, struct file *file)
++{
++	if (tp.active++)
++		return 0;
++
++	if (!tp.initialized) {
++		/* Configure PIU defaults from VRC4173 UM §9 idle dump and
++		 * enable PENCHG + page0/1 + datalost so eff bits show up via
++		 * polling. PIUPWR + PIUSEQEN + PADATSTART = autoscan. */
++		*PIU_SIVL = 0x05DC;
++		*PIU_STBL = 0x00C8;
++		*PIU_INTREG = (PIUINT_PENDING_ALL << 8) | 0;
++		*PIU_CNTREG = PIUCNT_PIUPWR | PIUCNT_PIUSEQEN |
++			      PIUCNT_PADATSTART;
++		tp.initialized = 1;
++	}
++
++	tp.head = tp.tail = 0;
++	tp.poll.expires = jiffies + HZ / BE300_TOUCH_POLL_HZ;
++	add_timer(&tp.poll);
++	return 0;
++}
++
++static int be300_touch_release(struct inode *inode, struct file *file)
++{
++	if (--tp.active <= 0) {
++		tp.active = 0;
++		del_timer_sync(&tp.poll);
++	}
++	return 0;
++}
++
++static ssize_t be300_touch_read(struct file *file, char *buf, size_t len,
++				loff_t *ppos)
++{
++	unsigned long flags;
++	size_t copied = 0;
++
++	if (len < sizeof(struct be300_touch_event))
++		return -EINVAL;
++
++	spin_lock_irqsave(&tp.lock, flags);
++	while (tp.head == tp.tail) {
++		spin_unlock_irqrestore(&tp.lock, flags);
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		interruptible_sleep_on(&tp.wait);
++		if (signal_pending(current))
++			return -ERESTARTSYS;
++		spin_lock_irqsave(&tp.lock, flags);
++	}
++
++	while (copied + sizeof(struct be300_touch_event) <= len &&
++	       tp.head != tp.tail) {
++		struct be300_touch_event ev = tp.buf[tp.tail];
++
++		tp.tail = (tp.tail + 1) % BUFFER_SLOTS;
++		spin_unlock_irqrestore(&tp.lock, flags);
++
++		if (copy_to_user(buf + copied, &ev, sizeof(ev)))
++			return -EFAULT;
++		copied += sizeof(ev);
++
++		spin_lock_irqsave(&tp.lock, flags);
++	}
++	spin_unlock_irqrestore(&tp.lock, flags);
++
++	return copied;
++}
++
++static unsigned int be300_touch_poll(struct file *file, poll_table *wait)
++{
++	unsigned long flags;
++	int has_data;
++
++	poll_wait(file, &tp.wait, wait);
++
++	spin_lock_irqsave(&tp.lock, flags);
++	has_data = (tp.head != tp.tail);
++	spin_unlock_irqrestore(&tp.lock, flags);
++
++	return has_data ? (POLLIN | POLLRDNORM) : 0;
++}
++
++static int be300_touch_fasync(int fd, struct file *file, int on)
++{
++	return fasync_helper(fd, file, on, &tp.fasync);
++}
++
++static struct file_operations be300_touch_fops = {
++	read:		be300_touch_read,
++	poll:		be300_touch_poll,
++	open:		be300_touch_open,
++	release:	be300_touch_release,
++	fasync:		be300_touch_fasync,
++};
++
++static struct miscdevice be300_touch_misc = {
++	BE300_TOUCH_MINOR, "be300tpanel", &be300_touch_fops,
++};
++
++static int __init be300_touch_init(void)
++{
++	int err;
++
++	memset(&tp, 0, sizeof(tp));
++	init_waitqueue_head(&tp.wait);
++	spin_lock_init(&tp.lock);
++
++	init_timer(&tp.poll);
++	tp.poll.function = be300_touch_poll_tick;
++	tp.poll.data = 0;
++
++	err = misc_register(&be300_touch_misc);
++	if (err) {
++		printk(KERN_ERR "BE-300 touch: misc_register failed: %d\n", err);
++		return err;
++	}
++
++	printk(KERN_INFO "BE-300 touchscreen: VRC4173 PIU @ PA 0x0A000300, "
++	       "polled at %d Hz, /dev/be300tpanel (minor %d)\n",
++	       BE300_TOUCH_POLL_HZ, BE300_TOUCH_MINOR);
++	return 0;
++}
++
++static void __exit be300_touch_exit(void)
++{
++	del_timer_sync(&tp.poll);
++	misc_deregister(&be300_touch_misc);
++}
++
++module_init(be300_touch_init);
++module_exit(be300_touch_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("John Roark");
++MODULE_DESCRIPTION("Casio Cassiopeia BE-300 PIU touchscreen (polled)");
+--- /dev/null	2026-05-13 23:48:26
++++ b/arch/mips/vr41xx/vr4131/casio-be300/stowaway_be300.c	2026-05-13 22:42:32
+@@ -0,0 +1,255 @@
++/*
++ * arch/mips/vr41xx/vr4131/casio-be300/stowaway_be300.c
++ *
++ * 2.4 port of board/casio-be300/stowaway_serio.c — drives the BE-300
++ * emulator's --stowaway-keyboard Targus dock emulation. The 4.2.9 driver
++ * registers a serio port and lets drivers/input/keyboard/stowaway.c
++ * decode scancodes; 2.4 has the input subsystem (drivers/input/) but no
++ * serio framework, so we collapse both halves into one driver: poll the
++ * SIU UART at 20 ms via a kernel timer, run the probe handshake, then
++ * decode each scancode byte against the same KEY_* table the 4.2.9
++ * in-tree stowaway driver uses (drivers/input/keyboard/stowaway.c) and
++ * emit input events via input_report_key().
++ *
++ * Wire protocol (verified against be300-framebuffer src/stowaway.c):
++ *   1. LCR write w/ DLAB=1  -> emulator resets its state.
++ *   2. IER MSI=1            -> emulator marks modem-wait.
++ *   3. MCR DTR=1            -> emulator bumps modem_events_delivered.
++ *   4. MCR RTS rising edge  -> emulator queues 0xFA, 0xFD.
++ *   5. Driver reads both    -> emulator sets connected=true.
++ *   6. Keystrokes arrive as 8-bit scancodes (bit 7 = release).
++ *
++ * The SIU UART (PA 0x0A008680, 4-byte register stride) is shared with
++ * the be300_serial console driver. When --stowaway-keyboard is enabled
++ * the emulator's stowaway shim hijacks both directions of the port, so
++ * serial output is silently consumed while the keyboard is active. That
++ * matches the 4.2.9 behavior and the comment in stowaway_serio.c.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/timer.h>
++#include <linux/input.h>
++#include <linux/string.h>
++#include <linux/spinlock.h>
++#include <asm/io.h>
++#include <asm/addrspace.h>
++
++/* VRC4173 SIU UART KSEG1 base. Register stride is 4 bytes. */
++#define SIU_BASE	KSEG1ADDR(0x0A008680)
++
++#define SIU_RBR		((volatile u8 *)(SIU_BASE + 0x00))
++#define SIU_THR		((volatile u8 *)(SIU_BASE + 0x00))
++#define SIU_IER		((volatile u8 *)(SIU_BASE + 0x04))
++#define SIU_LCR		((volatile u8 *)(SIU_BASE + 0x0c))
++#define SIU_MCR		((volatile u8 *)(SIU_BASE + 0x10))
++#define SIU_LSR		((volatile u8 *)(SIU_BASE + 0x14))
++#define SIU_MSR		((volatile u8 *)(SIU_BASE + 0x18))
++
++#define LCR_8N1		0x03
++#define LCR_DLAB	0x80
++#define IER_MSI		0x08
++#define MCR_DTR		0x01
++#define MCR_RTS		0x02
++#define LSR_DR		0x01
++
++#define PROBE_ACK_0	0xfa
++#define PROBE_ACK_1	0xfd
++
++#define SKBD_KEY_MASK	0x7f
++#define SKBD_RELEASE	0x80
++
++#define POLL_MS		20
++#define PROBE_GIVEUP	100	/* ~2 s of probe attempts before stopping */
++
++enum stow_state {
++	STOW_INIT,
++	STOW_RTS_LOW,
++	STOW_RTS_HIGH,
++	STOW_AWAIT_ACK0,
++	STOW_AWAIT_ACK1,
++	STOW_CONNECTED,
++	STOW_GIVE_UP,
++};
++
++/* Stowaway scancode -> Linux input KEY_* (lifted from 4.2.9
++ * drivers/input/keyboard/stowaway.c::skbd_keycode). */
++static const unsigned char skbd_keycode[128] = {
++	KEY_1, KEY_2, KEY_3, KEY_Z, KEY_4, KEY_5, KEY_6, KEY_7,
++	0, KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_GRAVE,
++	KEY_X, KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_SPACE,
++	KEY_CAPSLOCK, KEY_TAB, KEY_LEFTCTRL, 0, 0, 0, 0, 0,
++	0, 0, 0, KEY_LEFTALT, 0, 0, 0, 0,
++	0, 0, 0, 0, KEY_C, KEY_V, KEY_B, KEY_N,
++	KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_HOME, KEY_8, KEY_9, KEY_0, KEY_ESC,
++	KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_BACKSLASH, KEY_END, KEY_U, KEY_I, KEY_O, KEY_P,
++	KEY_APOSTROPHE, KEY_ENTER, KEY_PAGEUP, 0, KEY_J, KEY_K, KEY_L, KEY_SEMICOLON,
++	KEY_SLASH, KEY_UP, KEY_PAGEDOWN, 0, KEY_M, KEY_COMMA, KEY_DOT, KEY_INSERT,
++	KEY_DELETE, KEY_LEFT, KEY_DOWN, KEY_RIGHT, 0, 0, 0, 0,
++	KEY_LEFTSHIFT, KEY_RIGHTSHIFT, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0,
++	0, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,
++	KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12, 0, 0, 0
++};
++
++static struct input_dev stow_input;
++static struct timer_list stow_timer;
++static enum stow_state stow_state;
++static unsigned stow_ticks;
++static int stow_registered;
++
++static void stow_drain_rx(void)
++{
++	while (*SIU_LSR & LSR_DR)
++		(void)*SIU_RBR;
++}
++
++static void stow_reset_port(void)
++{
++	*SIU_LCR = LCR_8N1 | LCR_DLAB;
++	*SIU_LCR = LCR_8N1;
++	*SIU_IER = IER_MSI;
++	*SIU_MCR = MCR_DTR;
++	stow_drain_rx();
++}
++
++static void stow_dispatch_byte(u8 byte)
++{
++	unsigned code = byte & SKBD_KEY_MASK;
++	int down = !(byte & SKBD_RELEASE);
++
++	if (skbd_keycode[code])
++		input_report_key(&stow_input, skbd_keycode[code], down);
++}
++
++static void stow_tick(unsigned long _data)
++{
++	u8 byte;
++	int requeue = 1;
++
++	switch (stow_state) {
++	case STOW_INIT:
++		stow_reset_port();
++		stow_state = STOW_RTS_LOW;
++		stow_ticks = 0;
++		break;
++
++	case STOW_RTS_LOW:
++		*SIU_MCR = MCR_DTR;
++		stow_state = STOW_RTS_HIGH;
++		break;
++
++	case STOW_RTS_HIGH:
++		*SIU_MCR = MCR_DTR | MCR_RTS;
++		stow_state = STOW_AWAIT_ACK0;
++		break;
++
++	case STOW_AWAIT_ACK0:
++		if (*SIU_LSR & LSR_DR) {
++			byte = *SIU_RBR;
++			if (byte == PROBE_ACK_0)
++				stow_state = STOW_AWAIT_ACK1;
++			else
++				stow_state = STOW_RTS_LOW;
++			break;
++		}
++		if (++stow_ticks >= PROBE_GIVEUP) {
++			stow_state = STOW_GIVE_UP;
++			requeue = 0;
++			break;
++		}
++		stow_state = STOW_RTS_LOW;
++		break;
++
++	case STOW_AWAIT_ACK1:
++		if (*SIU_LSR & LSR_DR) {
++			byte = *SIU_RBR;
++			if (byte == PROBE_ACK_1) {
++				stow_state = STOW_CONNECTED;
++				printk(KERN_INFO "BE-300 Stowaway: connected\n");
++				stow_ticks = 0;
++			} else {
++				stow_state = STOW_RTS_LOW;
++			}
++			break;
++		}
++		if (++stow_ticks >= PROBE_GIVEUP) {
++			stow_state = STOW_RTS_LOW;
++			stow_ticks = 0;
++		}
++		break;
++
++	case STOW_CONNECTED:
++		while (*SIU_LSR & LSR_DR) {
++			byte = *SIU_RBR;
++			stow_dispatch_byte(byte);
++		}
++		break;
++
++	case STOW_GIVE_UP:
++		requeue = 0;
++		break;
++	}
++
++	if (requeue) {
++		stow_timer.expires = jiffies + (HZ * POLL_MS) / 1000;
++		if (stow_timer.expires == jiffies)
++			stow_timer.expires = jiffies + 1;
++		add_timer(&stow_timer);
++	}
++}
++
++static int __init be300_stowaway_init(void)
++{
++	int i;
++
++	memset(&stow_input, 0, sizeof(stow_input));
++	stow_input.name = "BE-300 Stowaway keyboard";
++	stow_input.idbus = BUS_RS232;	/* 2.4 has no BUS_HOST yet */
++	stow_input.idvendor = 0x1033;	/* NEC */
++	stow_input.idproduct = 0x4173;
++	stow_input.idversion = 0x0001;
++
++	__set_bit(EV_KEY, stow_input.evbit);
++	for (i = 0; i < 128; i++)
++		if (skbd_keycode[i])
++			__set_bit(skbd_keycode[i], stow_input.keybit);
++
++	input_register_device(&stow_input);
++	stow_registered = 1;
++
++	init_timer(&stow_timer);
++	stow_timer.function = stow_tick;
++	stow_timer.data = 0;
++	stow_timer.expires = jiffies + (HZ * POLL_MS) / 1000;
++	stow_state = STOW_INIT;
++	stow_ticks = 0;
++	add_timer(&stow_timer);
++
++	printk(KERN_INFO "BE-300 Stowaway keyboard: polling SIU @ PA 0x0A008680, "
++	       "%d ms cadence; emits input events via the in-tree input layer\n",
++	       POLL_MS);
++	return 0;
++}
++
++static void __exit be300_stowaway_exit(void)
++{
++	del_timer_sync(&stow_timer);
++	if (stow_registered)
++		input_unregister_device(&stow_input);
++}
++
++module_init(be300_stowaway_init);
++module_exit(be300_stowaway_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("John Roark");
++MODULE_DESCRIPTION("Casio BE-300 Stowaway dock keyboard via VRC4173 SIU UART (polled)");
+--- /dev/null	2026-05-13 23:48:26
++++ b/arch/mips/vr41xx/vr4131/casio-be300/cf_be300.c	2026-05-13 23:35:18
+@@ -0,0 +1,168 @@
++/*
++ * arch/mips/vr41xx/vr4131/casio-be300/cf_be300.c
++ *
++ * BE-300 CompactFlash host driver. Registers the CF taskfile window the
++ * emulator exposes at PA 0x0A00C170 (+0x206 alt) as an IDE channel via
++ * the 2.4 generic IDE framework, so a CF inserted with ./bin/be300 --cf
++ * <image> appears as /dev/hda once the kernel finishes probing.
++ *
++ * Two pieces:
++ *   1. struct ide_ops be300_ide_ops — the per-board hook table the 2.4
++ *      MIPS IDE layer expects (declared in <asm/ide.h>, instance pointer
++ *      `ide_ops` in arch/mips/kernel/setup.c). Other VR41xx boards
++ *      (capcella, workpad, casio-e15) ship their own variants under
++ *      arch/mips/vr41xx/<chip>/ide-<board>.c -- we model on those.
++ *   2. be300_cf_init() — module_init that calls ide_register_hw() with
++ *      the BE-300 CF taskfile layout so the kernel's IDE probe creates
++ *      /dev/hda.
++ *
++ * Register layout (matches board/casio-be300/cf_linux_loader.c):
++ *   KSEG1(0x0A00C170) + 0  CF_DATA       (16-bit data port via 32-bit window)
++ *   KSEG1(0x0A00C170) + 1  CF_ERROR
++ *   KSEG1(0x0A00C170) + 2  CF_SECCNT
++ *   KSEG1(0x0A00C170) + 3  CF_LBA0       (LBA[7:0])
++ *   KSEG1(0x0A00C170) + 4  CF_LBA1       (LBA[15:8])
++ *   KSEG1(0x0A00C170) + 5  CF_LBA2       (LBA[23:16])
++ *   KSEG1(0x0A00C170) + 6  CF_DRIVE      (101dhhhh: drive+head)
++ *   KSEG1(0x0A00C170) + 7  CF_STATUS
++ *   KSEG1(0x0A00C376)      CF_ALTSTATUS  (control / altstatus, +0x206)
++ *
++ * No interrupt is wired (VRC4173 GIRQ0 cascade for CF was never
++ * finished in linux4be 2.4); the IDE core polls without an IRQ. CF
++ * transfers are slow but correct.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/ide.h>
++#include <linux/ioport.h>
++#include <linux/hdreg.h>
++#include <asm/ptrace.h>
++#include <asm/io.h>
++#include <asm/addrspace.h>
++#include <asm/vrc4173.h>
++
++#define BE300_CF_BASE_PA	0x0A00C170
++#define BE300_CF_ALT_PA		0x0A00C376
++/* mips_io_port_base is set to KSEG1ADDR(0x0A00C000) in
++ * casio-be300/setup.c, so inb(0x170)/outb(...,0x170) hits PA 0x0A00C170
++ * and inb(0x376) hits PA 0x0A00C376. Pass these as port offsets to the
++ * IDE framework; it'll apply mips_io_port_base via standard inb/outb. */
++#define BE300_CF_BASE		0x170
++#define BE300_CF_ALT		0x376
++
++/* ----- ide_ops hooks ------------------------------------------------- */
++
++/*
++ * The CF socket asserts the VRC4173 GIRQ0 bit-0 cascade source, which
++ * irq_be300.c demuxes onto VRC4173_IRQ_BASE + 0. Earlier revisions of
++ * this driver returned a placeholder IRQ + stubbed request_irq, which
++ * let the channel register but failed all reads with `lost interrupt`
++ * + `DriveStatusError` because the IDE state machine never saw an
++ * IRQ. With the cascade now wired we return the real sub-IRQ and call
++ * the kernel's request_irq for real.
++ */
++static int be300_ide_default_irq(ide_ioreg_t base)
++{
++	return VRC4173_IRQ_BASE + 0;
++}
++
++static ide_ioreg_t be300_ide_default_io_base(int index)
++{
++	if (index == 0)
++		return BE300_CF_BASE;
++	return 0;
++}
++
++static void be300_ide_init_hwif_ports(hw_regs_t *hw, ide_ioreg_t data_port,
++				      ide_ioreg_t ctrl_port, int *irq)
++{
++	ide_ioreg_t reg = data_port;
++	int i;
++
++	for (i = IDE_DATA_OFFSET; i <= IDE_STATUS_OFFSET; i++) {
++		hw->io_ports[i] = reg;
++		reg += 1;
++	}
++	if (ctrl_port)
++		hw->io_ports[IDE_CONTROL_OFFSET] = ctrl_port;
++	else
++		hw->io_ports[IDE_CONTROL_OFFSET] = BE300_CF_ALT;
++	if (irq)
++		*irq = 0;
++	hw->io_ports[IDE_IRQ_OFFSET] = 0;
++}
++
++static int be300_ide_request_irq(unsigned int irq,
++				 void (*handler)(int, void *, struct pt_regs *),
++				 unsigned long flags, const char *device,
++				 void *dev_id)
++{
++	return request_irq(irq, handler, flags, device, dev_id);
++}
++
++static void be300_ide_free_irq(unsigned int irq, void *dev_id)
++{
++	free_irq(irq, dev_id);
++}
++
++/*
++ * The CF taskfile is at a KSEG1 MMIO address (0xAA00C170), not an I/O
++ * port in the standard ioport_resource map, so check_region()/
++ * request_region() would always report "in use" against an empty map.
++ * Stub them so the IDE core's auto-probe sees the region as available
++ * and proceeds to identify the drive. No conflict is possible at this
++ * address because nothing else on the BE-300 maps here.
++ */
++static int be300_ide_check_region(ide_ioreg_t from, unsigned int extent)
++{
++	return 0;
++}
++
++static void be300_ide_request_region(ide_ioreg_t from, unsigned int extent,
++				     const char *name)
++{
++}
++
++static void be300_ide_release_region(ide_ioreg_t from, unsigned int extent)
++{
++}
++
++struct ide_ops be300_ide_ops = {
++	&be300_ide_default_irq,
++	&be300_ide_default_io_base,
++	&be300_ide_init_hwif_ports,
++	&be300_ide_request_irq,
++	&be300_ide_free_irq,
++	&be300_ide_check_region,
++	&be300_ide_request_region,
++	&be300_ide_release_region
++};
++
++/*
++ * No explicit ide_register_hw() here -- the IDE core's
++ * ide_init_default_hwifs() (drivers/ide/ide.c) auto-probes index 0
++ * via our be300_ide_default_io_base() hook and registers the channel
++ * for us. Adding our own registration just creates a conflict.
++ * Compiling this file is enough -- be300_ide_ops is referenced from
++ * setup.c at machine init, and the IDE core finds the CF window.
++ */
++static int __init be300_cf_banner(void)
++{
++	printk(KERN_INFO "BE-300 CF: VRC4173 PCMCIA window @ PA 0x%08X "
++	       "(taskfile), 0x%08X (altstatus); IDE core will auto-probe\n",
++	       BE300_CF_BASE_PA, BE300_CF_ALT_PA);
++	return 0;
++}
++module_init(be300_cf_banner);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("John Roark");
++MODULE_DESCRIPTION("Casio BE-300 CompactFlash IDE host (VRC4173 PCMCIA window)");
+--- /dev/null	2026-05-13 23:48:26
++++ b/arch/mips/vr41xx/vr4131/casio-be300/irq_be300.c	2026-05-13 23:46:47
+@@ -0,0 +1,208 @@
++/*
++ * arch/mips/vr41xx/vr4131/casio-be300/irq_be300.c
++ *
++ * Second-level interrupt demuxer for the BE-300, ported from the 4.2.9
++ * board/casio-be300/irq.c driver to the 2.4 cascade API.
++ *
++ * The VR4131 ICU (arch/mips/vr41xx/common/icu.c) reports the GIU summary
++ * as SYSINT1 bit 8, which Linux exposes as GIU_IRQ(0..31) (= 40..71). On
++ * the BE-300 every VRC4173 sub-source (touch, buttons, CF/NE2000, PC
++ * Connect) rides on a single GPIO pin (GIU line 0). The actual cascade
++ * source is the VRC4173 GIRQ0 status register at PA 0x0A000004.
++ *
++ *   SYSINT1.bit8 (GIU)
++ *      +-- GIU0 = GIU_IRQ(0) = 40
++ *            +-- VRC4173 GIRQ0 word @ 0x0A000004:
++ *                  bit 0 -> CF / NE2000   (VRC4173_IRQ_BASE + 0 = 72)
++ *                  bit 1 -> buttons       (VRC4173_IRQ_BASE + 1 = 73)
++ *                  bit 4 -> CommMode      (VRC4173_IRQ_BASE + 4 = 76, unused)
++ *                  bit 9 -> touch (PIU)   (VRC4173_IRQ_BASE + 9 = 81)
++ *
++ * 2.4 cascade flow (arch/mips/vr41xx/common/giu.c):
++ *   - vr41xx_cascade_irq(GIU_IRQ(0), be300_girq0_get_irq) registers a
++ *     per-pin callback that returns the cascaded sub-IRQ number to
++ *     dispatch. giuint_do_IRQ() reads GIRQ0 status via this callback
++ *     and calls do_IRQ(sub_irq, regs).
++ *   - One sub-IRQ per GIU event; multiple pending bits result in
++ *     successive GIU re-assertions (the GIU pin stays high until all
++ *     sub-IRQs are acked).
++ *
++ * GIRQ0 status / ack are write-1-to-clear in the emulator. Bit 0
++ * (CF/NE2000) has a quirk: state_change_pending is cleared only by
++ * reading the CF cause register at PA 0x0A00A03C, not by W1C on the
++ * GIRQ0 ack at 0x0A000014. Match the 4.2.9 driver's order: read cause
++ * first when bit 0 is set, then W1C the GIRQ0 status latch.
++ *
++ * Also force GIUINTENL bit 0 = 1 manually after vr41xx_cascade_irq.
++ * The 4.2.9 driver hits the same edge case where irq_set_chained_handler
++ * doesn't propagate to GIUINTENL on this board; same bare-metal fix here.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/types.h>
++#include <asm/io.h>
++#include <asm/addrspace.h>
++#include <asm/vr41xx.h>
++#include <asm/vrc4173.h>
++
++#define BE300_GIRQ0_STATUS	KSEG1ADDR(0x0A000004)
++#define BE300_GIRQ0_ACK		KSEG1ADDR(0x0A000014)
++#define BE300_GIRQ0_CAUSE	KSEG1ADDR(0x0A00A03C)
++#define BE300_GIUINTENL		KSEG1ADDR(0x0F00014C)
++
++#define BE300_GIRQ0_NR		16
++
++/* Software shadow mask. Bits 0..15 map to VRC4173_IRQ_BASE + 0..15. */
++static u32 be300_girq0_mask;
++
++extern int vr41xx_cascade_irq(unsigned int irq, int (*get_irq_number)(int));
++
++static inline u32 girq0_read_status(void)
++{
++	return *(volatile u32 *)BE300_GIRQ0_STATUS;
++}
++
++static inline void girq0_write_ack(u32 bits)
++{
++	*(volatile u32 *)BE300_GIRQ0_ACK = bits;
++}
++
++static inline u32 girq0_read_cause(void)
++{
++	return *(volatile u32 *)BE300_GIRQ0_CAUSE;
++}
++
++static unsigned int be300_girq0_startup(unsigned int irq)
++{
++	be300_girq0_mask |= 1u << (irq - VRC4173_IRQ_BASE);
++	return 0;
++}
++
++static void be300_girq0_shutdown(unsigned int irq)
++{
++	be300_girq0_mask &= ~(1u << (irq - VRC4173_IRQ_BASE));
++}
++
++static void be300_girq0_enable(unsigned int irq)
++{
++	be300_girq0_mask |= 1u << (irq - VRC4173_IRQ_BASE);
++}
++
++static void be300_girq0_disable(unsigned int irq)
++{
++	be300_girq0_mask &= ~(1u << (irq - VRC4173_IRQ_BASE));
++}
++
++static void be300_girq0_ack(unsigned int irq)
++{
++	girq0_write_ack(1u << (irq - VRC4173_IRQ_BASE));
++}
++
++static void be300_girq0_end(unsigned int irq)
++{
++	if (!(irq_desc[irq].status & (IRQ_DISABLED | IRQ_INPROGRESS)))
++		be300_girq0_enable(irq);
++}
++
++static struct hw_interrupt_type be300_girq0_type = {
++	"BE300-GIRQ0",
++	be300_girq0_startup,
++	be300_girq0_shutdown,
++	be300_girq0_enable,
++	be300_girq0_disable,
++	be300_girq0_ack,
++	be300_girq0_end,
++	NULL
++};
++
++/*
++ * Cascade callback invoked by giuint_do_IRQ when GIU pin 0 fires.
++ * Reads GIRQ0 status, applies our software mask, returns the lowest
++ * pending sub-IRQ number; W1Cs the bit we picked (and for bit 0 also
++ * reads the CF cause register, which is the only way to clear the CF
++ * source's internal pending latch).
++ */
++static int be300_girq0_get_irq(int giu_irq)
++{
++	u32 pending = girq0_read_status();
++
++	/* Read cause to clear CF state_change_pending if bit 0 is set —
++	 * the 4.2.9 driver does this before W1Cing GIRQ0. */
++	if (pending & 0x1)
++		(void)girq0_read_cause();
++
++	pending &= be300_girq0_mask;
++	if (!pending)
++		return -EINVAL;
++
++	{
++		int bit;
++
++		/* Find lowest set bit. 2.4's ffs() pulls in generic_ffs which
++		 * isn't linked here; a 16-iteration loop is fine for an IRQ
++		 * dispatch path that runs at most a few times per second. */
++		for (bit = 0; bit < BE300_GIRQ0_NR; bit++)
++			if (pending & (1u << bit))
++				break;
++
++		/* W1C just the chosen bit; the GIU pin will reassert if any
++		 * remaining unmasked bit stays set, and we'll be called again. */
++		girq0_write_ack(1u << bit);
++		return VRC4173_IRQ_BASE + bit;
++	}
++}
++
++/*
++ * Called directly from arch/mips/vr41xx/vr4131/casio-be300/setup.c
++ * (nec_vr41xx_setup) rather than via module_init. The IDE core's
++ * driver_init() initcall calls request_irq() on VRC4173_IRQ_BASE + 0
++ * during its early probe, and request_irq fails silently to deliver
++ * if our IRQ chip isn't already installed. Module_init ordering put
++ * us after the IDE probe; calling from setup.c puts us before any
++ * initcall.
++ */
++int __init be300_irq_cascade_init(void)
++{
++	int i;
++	int err;
++	volatile u16 *inten;
++
++	for (i = 0; i < BE300_GIRQ0_NR; i++) {
++		irq_desc[VRC4173_IRQ_BASE + i].handler = &be300_girq0_type;
++		irq_desc[VRC4173_IRQ_BASE + i].status = IRQ_DISABLED;
++	}
++
++	err = vr41xx_cascade_irq(GIU_IRQ(0), be300_girq0_get_irq);
++	if (err) {
++		printk(KERN_ERR "BE-300 IRQ: vr41xx_cascade_irq(GIU_IRQ(0)) = %d\n",
++		       err);
++		return err;
++	}
++
++	/*
++	 * vr41xx_cascade_irq -> setup_irq -> startup_giuint_irq should set
++	 * GIUINTENL bit 0, but the early-init ordering on this board leaves
++	 * the bit at 0 so giuint_do_IRQ never sees GIU pin 0 fire. Force it
++	 * on manually. Matches the 4.2.9 driver's bare-metal poke.
++	 */
++	inten = (volatile u16 *)BE300_GIUINTENL;
++	*inten = *inten | 0x1;
++
++	printk(KERN_INFO "BE-300 IRQ: VRC4173 GIRQ0 demux at "
++	       "PA 0x0A000004 -> VRC4173_IRQ_BASE..%d (cascade on GIU_IRQ(0))\n",
++	       VRC4173_IRQ_BASE + BE300_GIRQ0_NR - 1);
++	return 0;
++}
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("John Roark");
++MODULE_DESCRIPTION("Casio BE-300 VRC4173 GIRQ0 second-level IRQ demuxer");
+--- a/arch/mips/config.in	2002-11-12 15:58:34
++++ b/arch/mips/config.in	2026-05-13 23:35:01
+@@ -485,7 +485,11 @@
+    define_bool CONFIG_VR41XX_TIME_C y
+    define_bool CONFIG_NONCOHERENT_IO y
+    define_bool CONFIG_DUMMY_KEYB y
+-
++   bool '  BE-300 NAND MTD driver (VRC4173 XFER engine)' CONFIG_CASIO_BE300_NAND
++   bool '  BE-300 PIU touchscreen driver (polled)' CONFIG_CASIO_BE300_TOUCH
++   bool '  BE-300 Stowaway keyboard via SIU UART (polled)' CONFIG_CASIO_BE300_STOWAWAY
++   bool '  BE-300 CompactFlash IDE host (VRC4173 window)' CONFIG_CASIO_BE300_CF
++   bool '  BE-300 VRC4173 GIRQ0 IRQ cascade' CONFIG_CASIO_BE300_IRQ_CASCADE
+ fi
+ if [ "$CONFIG_VADEM_CLIO_1000" = "y" ]; then
+    define_bool CONFIG_CPU_VR41XX y
+@@ -768,7 +772,7 @@
+ 
+ source drivers/telephony/Config.in
+ 
+-if [ "$CONFIG_ISA" = "y" -o "$CONFIG_PCI" = "y" ]; then
++if [ "$CONFIG_ISA" = "y" -o "$CONFIG_PCI" = "y" -o "$CONFIG_CASIO_BE300" = "y" ]; then
+ 
+    mainmenu_option next_comment
+    comment 'ATA/IDE/MFM/RLL support'
+--- a/arch/mips/kernel/sysirix.c	2002-01-02 12:42:12
++++ b/arch/mips/kernel/sysirix.c	2026-05-13 20:55:08
+@@ -1869,7 +1869,8 @@
+ 	__put_user(reclen, &dirent->d_reclen);
+ 	copy_to_user(dirent->d_name, name, namlen);
+ 	__put_user(0, &dirent->d_name[namlen]);
+-	((char *) dirent) += reclen;
++	/* Modern GCC: a cast result is not an lvalue. */
++	dirent = (void *)((char *)dirent + reclen);
+ 	buf->current_dir = dirent;
+ 	buf->count -= reclen;
+ 
+@@ -1962,7 +1963,8 @@
+ 	__put_user(reclen, &dirent->d_reclen);
+ 	__copy_to_user(dirent->d_name, name, namlen);
+ 	__put_user(0, &dirent->d_name[namlen]);
+-	((char *) dirent) += reclen;
++	/* Modern GCC: a cast result is not an lvalue. */
++	dirent = (void *)((char *)dirent + reclen);
+ 	buf->curr = dirent;
+ 	buf->count -= reclen;
+ 
+--- a/arch/mips/kernel/time.c	2002-04-21 12:30:08
++++ b/arch/mips/kernel/time.c	2026-05-13 20:41:27
+@@ -215,9 +215,11 @@
+ 	/* .. relative to previous jiffy (32 bits is enough) */
+ 	count -= timerlo;
+ 
+-	__asm__("multu  %2,%3"
+-	        : "=l" (tmp), "=h" (res)
+-	        : "r" (count), "r" (quotient));
++	/* Modern GCC removed =h/=l constraints; use mfhi/mflo. */
++	__asm__("multu  %2,%3\n\tmflo\t%0\n\tmfhi\t%1"
++	        : "=r" (tmp), "=r" (res)
++	        : "r" (count), "r" (quotient)
++	        : "hi", "lo");
+ 
+ 	/*
+ 	 * Due to possible jiffies inconsistencies, we need to check
+--- a/arch/mips/lx/irq.c	2002-05-09 10:22:36
++++ b/arch/mips/lx/irq.c	2026-05-13 20:42:30
+@@ -37,14 +37,14 @@
+  * routine used to mask the Lexra vectored interrupts using Lexra specific
+  * instructions.
+  */
+-extern inline void mask_lx_interrupt(unsigned int mask);
++static inline void mask_lx_interrupt(unsigned int mask);
+ 
+ /**
+  * External function defined in int-handler.S. This is an assembly language
+  * routine used to unmask the Lexra vectored interrupts using Lexra specific
+  * instructions.
+  */
+-extern inline void unmask_lx_interrupt(unsigned int mask);
++static inline void unmask_lx_interrupt(unsigned int mask);
+ 
+ extern int pci_devices_count; 
+ extern void lx_irq_setup(void);
+--- a/arch/mips/Makefile	2002-11-12 15:58:34
++++ b/arch/mips/Makefile	2026-05-13 20:56:11
+@@ -65,8 +65,23 @@
+ GCCFLAGS	+= -mcpu=r4300 -mips2 -Wa,--trap
+ endif
+ ifdef CONFIG_CPU_VR41XX
+-GCCFLAGS	+= -mips2 -Wa,-m4100,--trap
++# Old binutils accepted -Wa,-m4100 alongside -mips2; modern gas (binutils
++# 2.34+) errors with "-mips2 conflicts with the other architecture options,
++# which imply -mips3" because -m4100 implies MIPS-III. The VR4131 actually
++# implements MIPS-III but the emulator+kernel both target MIPS-II; emit
++# only -mips2 here so userspace and kernel agree on the ISA.
++GCCFLAGS	+= -mips2 -Wa,-mips2,--trap
+ endif
++
++# Pull in a global compatibility shim header (see comment inside) that
++# overrides __FUNCTION__ to a placeholder string literal so the 1300+
++# format-string concat sites in 2.4 source compile under modern GCC.
++GCCFLAGS	+= -include $(TOPDIR)/include/linux/be300_modern_compat.h
++
++# Modern GCC enables -fstack-protector by default and emits references
++# to __stack_chk_guard / __stack_chk_fail that the 2.4 kernel doesn't
++# provide. Turn the protector off (kernel doesn't want it anyway).
++GCCFLAGS	+= -fno-stack-protector
+ ifdef CONFIG_CPU_R4X00
+ GCCFLAGS	+= -mcpu=r4600 -mips2 -Wa,--trap
+ endif
+--- a/arch/mips/mm/r5432.c	2001-09-30 12:26:08
++++ b/arch/mips/mm/r5432.c	2026-05-13 20:42:30
+@@ -52,7 +52,7 @@
+ /* -------------------------------------------------------------------- */
+ /* #include <asm/r4kcache.h> */
+ 
+-extern inline void flush_icache_line_indexed(unsigned long addr)
++static inline void flush_icache_line_indexed(unsigned long addr)
+ {
+ 	__asm__ __volatile__(
+ 		".set noreorder\n\t"
+@@ -66,7 +66,7 @@
+ 		  "i" (Index_Invalidate_I));
+ }
+ 
+-extern inline void flush_dcache_line_indexed(unsigned long addr)
++static inline void flush_dcache_line_indexed(unsigned long addr)
+ {
+ 	__asm__ __volatile__(
+ 		".set noreorder\n\t"
+@@ -80,7 +80,7 @@
+ 		  "i" (Index_Writeback_Inv_D));
+ }
+ 
+-extern inline void flush_icache_line(unsigned long addr)
++static inline void flush_icache_line(unsigned long addr)
+ {
+ 	__asm__ __volatile__(
+ 		".set noreorder\n\t"
+@@ -93,7 +93,7 @@
+ 		  "i" (Hit_Invalidate_I));
+ }
+ 
+-extern inline void flush_dcache_line(unsigned long addr)
++static inline void flush_dcache_line(unsigned long addr)
+ {
+ 	__asm__ __volatile__(
+ 		".set noreorder\n\t"
+@@ -106,7 +106,7 @@
+ 		  "i" (Hit_Writeback_Inv_D));
+ }
+ 
+-extern inline void invalidate_dcache_line(unsigned long addr)
++static inline void invalidate_dcache_line(unsigned long addr)
+ {
+ 	__asm__ __volatile__(
+ 		".set noreorder\n\t"
+@@ -123,7 +123,7 @@
+ /*
+  * The next two are for badland addresses like signal trampolines.
+  */
+-extern inline void protected_flush_icache_line(unsigned long addr)
++static inline void protected_flush_icache_line(unsigned long addr)
+ {
+ 	__asm__ __volatile__(
+ 		".set noreorder\n\t"
+@@ -139,7 +139,7 @@
+ 		  "i" (Hit_Invalidate_I));
+ }
+ 
+-extern inline void protected_writeback_dcache_line(unsigned long addr)
++static inline void protected_writeback_dcache_line(unsigned long addr)
+ {
+ 	__asm__ __volatile__(
+ 		".set noreorder\n\t"
+@@ -182,7 +182,7 @@
+ 		: "r" (base),					\
+ 		  "i" (op));
+ 
+-extern inline void blast_dcache32(void)
++static inline void blast_dcache32(void)
+ {
+ 	unsigned long start = KSEG0;
+ 	unsigned long end = (start + dcache_size/2);
+@@ -194,7 +194,7 @@
+ 	}
+ }
+ 
+-extern inline void blast_dcache32_page(unsigned long page)
++static inline void blast_dcache32_page(unsigned long page)
+ {
+ 	unsigned long start = page;
+ 	unsigned long end = (start + PAGE_SIZE);
+@@ -205,7 +205,7 @@
+ 	}
+ }
+ 
+-extern inline void blast_dcache32_page_indexed(unsigned long page)
++static inline void blast_dcache32_page_indexed(unsigned long page)
+ {
+ 	unsigned long start = page;
+ 	unsigned long end = (start + PAGE_SIZE);
+@@ -217,7 +217,7 @@
+ 	}
+ }
+ 
+-extern inline void blast_icache32(void)
++static inline void blast_icache32(void)
+ {
+ 	unsigned long start = KSEG0;
+ 	unsigned long end = (start + icache_size/2);
+@@ -229,7 +229,7 @@
+ 	}
+ }
+ 
+-extern inline void blast_icache32_page(unsigned long page)
++static inline void blast_icache32_page(unsigned long page)
+ {
+ 	unsigned long start = page;
+ 	unsigned long end = (start + PAGE_SIZE);
+@@ -240,7 +240,7 @@
+ 	}
+ }
+ 
+-extern inline void blast_icache32_page_indexed(unsigned long page)
++static inline void blast_icache32_page_indexed(unsigned long page)
+ {
+ 	unsigned long start = page;
+ 	unsigned long end = (start + PAGE_SIZE);
+--- a/arch/mips/ramdisk/Makefile	2001-11-12 11:11:34
++++ b/arch/mips/ramdisk/Makefile	2026-05-13 20:55:37
+@@ -7,9 +7,12 @@
+ #
+ 
+ O_FORMAT = $(shell $(OBJDUMP) -i | head -2 | grep elf32)
++# Modern binutils ld emits an executable by default when given a script;
++# the kernel link then refuses it ("cannot use executable file ... as
++# input to a link"). -r forces a partial-link relocatable .o.
+ ramdisk.o: ramdisk.gz ld.script
+ 	echo "O_FORMAT:  " $(O_FORMAT)
+-	$(LD) -T ld.script -b binary --oformat $(O_FORMAT) -o $@ ramdisk.gz
++	$(LD) -r -T ld.script -b binary --oformat $(O_FORMAT) -o $@ ramdisk.gz
+ 
+ include $(TOPDIR)/Rules.make
+ 
+--- a/arch/mips/vr41xx/vr4131/casio-be300/Makefile	2002-06-14 08:02:16
++++ b/arch/mips/vr41xx/vr4131/casio-be300/Makefile	2026-05-13 23:35:02
+@@ -16,5 +16,10 @@
+ obj-y	 := prom.o setup.o
+ 
+ obj-$(CONFIG_PCI) += pci_fixup.o
++obj-$(CONFIG_CASIO_BE300_NAND) += nand_be300.o
++obj-$(CONFIG_CASIO_BE300_TOUCH) += touch_be300.o
++obj-$(CONFIG_CASIO_BE300_STOWAWAY) += stowaway_be300.o
++obj-$(CONFIG_CASIO_BE300_CF) += cf_be300.o
++obj-$(CONFIG_CASIO_BE300_IRQ_CASCADE) += irq_be300.o
+ 
+ include $(TOPDIR)/Rules.make
+--- a/arch/mips/vr41xx/vr4131/casio-be300/setup.c	2002-11-12 15:58:34
++++ b/arch/mips/vr41xx/vr4131/casio-be300/setup.c	2026-05-13 23:43:19
+@@ -32,6 +32,15 @@
+ 
+ void __init nec_vr41xx_setup(void)
+ {
++	/* I/O port base for inb/outb on the BE-300. The VRC4173 maps its
++	 * PCMCIA-attribute window starting at PA 0x0A00C000 (KSEG1 alias
++	 * 0xAA00C000); the CF taskfile lives at +0x170 within that window
++	 * and the altstatus at +0x376 — matches the 4.2.9
++	 * board/casio-be300/cf_linux_loader.c CF_BASE/CF_ALT and CLAUDE.md
++	 * "I/O port base: 0xAA00C000". Setting this here lets the in-tree
++	 * IDE generic code reach the CF via standard inb/outb. */
++	set_io_port_base(KSEG1ADDR(0x0A00C000));
++
+ 	_machine_restart = vr41xx_restart;
+ 	_machine_halt = vr41xx_halt;
+ 	_machine_power_off = vr41xx_power_off;
+@@ -45,10 +54,34 @@
+ 	initrd_end = (unsigned long)&__rd_end;
+ #endif
+ 
+-#ifdef CONFIG_BLK_DEV_IDE
+-	ide_ops = &std_ide_ops;
++#if defined(CONFIG_BLK_DEV_IDE) && defined(CONFIG_CASIO_BE300_CF)
++	/* be300_ide_ops is defined in cf_be300.c — the per-board hook table
++	 * the 2.4 MIPS IDE layer needs in order to link cleanly. The previous
++	 * `&std_ide_ops` reference here was broken in the linux4be tree
++	 * (std_ide_ops doesn't exist for VR4131; the other VR41xx boards
++	 * shipped their own ide-<board>.c). */
++	{
++		extern struct ide_ops be300_ide_ops;
++		ide_ops = &be300_ide_ops;
++	}
+ #endif
+ 
++#ifdef CONFIG_CASIO_BE300_IRQ_CASCADE
++	/* Register the VRC4173 GIRQ0 demuxer for the vr41xx GIU init to
++	 * call. vr41xx_giuint_init() invokes board_irq_init at the end of
++	 * its init_IRQ path, which is after the GIU's own setup_irq runs
++	 * but before any driver initcall — exactly when we want to attach
++	 * the cascade. Calling vr41xx_cascade_irq directly from setup
++	 * (before init_IRQ) is too early. */
++	{
++		extern int be300_irq_cascade_init(void);
++		extern void (*board_irq_init)(void);
++		/* board_irq_init takes a void(*)(void); our init returns int,
++		 * harmless because the return is ignored. Wrap the cast. */
++		board_irq_init = (void (*)(void))be300_irq_cascade_init;
++	}
++#endif
++
+ #ifdef CONFIG_FB
+ 	conswitchp = &dummy_con;
+ #endif
+--- a/config_be300	2002-11-13 14:55:22
++++ b/config_be300	2026-05-13 23:35:05
+@@ -129,7 +129,19 @@
+ #
+ # Memory Technology Devices (MTD)
+ #
+-# CONFIG_MTD is not set
++CONFIG_MTD=y
++CONFIG_MTD_PARTITIONS=y
++CONFIG_MTD_CHAR=y
++CONFIG_MTD_BLOCK=y
++CONFIG_CASIO_BE300_NAND=y
++CONFIG_CASIO_BE300_TOUCH=y
++CONFIG_CASIO_BE300_STOWAWAY=y
++CONFIG_CASIO_BE300_CF=y
++CONFIG_CASIO_BE300_IRQ_CASCADE=y
++CONFIG_IDE=y
++CONFIG_BLK_DEV_IDE=y
++CONFIG_BLK_DEV_IDEDISK=y
++CONFIG_IDEDISK_MULTI_MODE=y
+ 
+ #
+ # Parallel port support
+@@ -214,14 +226,23 @@
+ # CONFIG_SX is not set
+ # CONFIG_RIO is not set
+ # CONFIG_STALDRV is not set
+-# CONFIG_SERIAL_BE300 is not set
+-# CONFIG_SERIAL_BE300_CONSOLE is not set
++CONFIG_SERIAL_BE300=y
++CONFIG_SERIAL_BE300_CONSOLE=y
+ # CONFIG_SERIAL_TX3912 is not set
+ # CONFIG_SERIAL_TX3912_CONSOLE is not set
+ # CONFIG_TXX927_SERIAL is not set
+ # CONFIG_VRC4173 is not set
+ # CONFIG_TOUCH_PANEL is not set
+-# CONFIG_BUTTONS is not set
++# Touch panel is left off here because the in-tree drivers/char/tpanel.c
++# targets the VR4111/VR4181 on-CPU PIU and references CMU/PIU registers
++# that don't exist for VR4131. The BE-300 actually has its touch input
++# on the VRC4173 PIU (PA 0x0A000300), driven by vrc4173-piu.c — which
++# the linux4be team never finished wiring (no module_init, register
++# offsets in vrc4173.h don't match the BE-300 emulator). A real port of
++# board/casio-be300/touch_be300.c (4.2.9) is the way to deliver
++# touchscreen input on this 2.4 build.
++CONFIG_BUTTONS=y
++CONFIG_VR41XX_GPIO_BUTTONS=y
+ # CONFIG_ADIF is not set
+ CONFIG_UNIX98_PTYS=y
+ CONFIG_UNIX98_PTY_COUNT=256
+@@ -301,7 +322,8 @@
+ # CONFIG_VFAT_FS is not set
+ # CONFIG_EFS_FS is not set
+ # CONFIG_JFFS_FS is not set
+-# CONFIG_JFFS2_FS is not set
++CONFIG_JFFS2_FS=y
++CONFIG_JFFS2_FS_DEBUG=0
+ # CONFIG_CRAMFS is not set
+ # CONFIG_TMPFS is not set
+ # CONFIG_RAMFS is not set
+@@ -516,7 +538,9 @@
+ #
+ # Input core support
+ #
+-# CONFIG_INPUT is not set
++CONFIG_INPUT=y
++CONFIG_INPUT_KEYBDEV=y
++CONFIG_INPUT_EVDEV=y
+ # CONFIG_INPUT_KEYBDEV is not set
+ # CONFIG_INPUT_MOUSEDEV is not set
+ # CONFIG_INPUT_JOYDEV is not set
+--- a/drivers/char/generic_serial.c	2002-02-25 11:37:58
++++ b/drivers/char/generic_serial.c	2026-05-13 22:01:58
+@@ -33,7 +33,9 @@
+ static char *                  tmp_buf; 
+ static DECLARE_MUTEX(tmp_buf_sem);
+ 
+-static int gs_debug;
++/* Modern GCC errors on `static` here because generic_serial.h:101 has
++ * `extern int gs_debug;`. Match the extern. */
++int gs_debug;
+ 
+ #ifdef DEBUG
+ #define gs_dprintk(f, str...) if (gs_debug & f) printk (str)
+--- a/drivers/video/fbcon.c	2002-02-25 11:38:08
++++ b/drivers/video/fbcon.c	2026-05-13 20:49:50
+@@ -1881,7 +1881,13 @@
+        font length must be multiple of 256, at least. And 256 is multiple
+        of 4 */
+     k = 0;
+-    while (p > new_data) k += *--(u32 *)p;
++    /* Modern GCC: pre-decrement of a cast expression is invalid. Walk
++     * with a typed local instead, then store back to p. */
++    {
++        u32 *up = (u32 *)p;
++        while ((u8 *)up > new_data) k += *--up;
++        p = (u8 *)up;
++    }
+     FNTSUM(new_data) = k;
+     /* Check if the same font is on some other console already */
+     for (i = 0; i < MAX_NR_CONSOLES; i++) {
+--- a/fs/read_write.c	2002-02-25 11:38:10
++++ b/fs/read_write.c	2026-05-13 20:55:06
+@@ -242,7 +242,9 @@
+ 		int len = iov[i].iov_len;
+ 		if (len < 0)
+ 			goto out;
+-		(u32)tot_len += len;
++		/* Modern GCC: cast result is not an lvalue. The intent
++		 * was a 32-bit-truncated add for the overflow check below. */
++		tot_len = (size_t)((u32)tot_len + len);
+ 		if (tot_len < tmp || tot_len < (u32)len)
+ 			goto out;
+ 	}
+--- a/fs/readdir.c	2001-08-12 14:59:08
++++ b/fs/readdir.c	2026-05-13 20:53:20
+@@ -202,7 +202,8 @@
+ 	put_user(reclen, &dirent->d_reclen);
+ 	copy_to_user(dirent->d_name, name, namlen);
+ 	put_user(0, dirent->d_name + namlen);
+-	((char *) dirent) += reclen;
++	/* Modern GCC: a cast result is not an lvalue. */
++	dirent = (void *)((char *)dirent + reclen);
+ 	buf->current_dir = dirent;
+ 	buf->count -= reclen;
+ 	return 0;
+@@ -285,7 +286,8 @@
+ 	copy_to_user(dirent, &d, NAME_OFFSET(&d));
+ 	copy_to_user(dirent->d_name, name, namlen);
+ 	put_user(0, dirent->d_name + namlen);
+-	((char *) dirent) += reclen;
++	/* Modern GCC: a cast result is not an lvalue. */
++	dirent = (void *)((char *)dirent + reclen);
+ 	buf->current_dir = dirent;
+ 	buf->count -= reclen;
+ 	return 0;
+--- a/include/asm-generic/bitops.h	2000-11-27 17:47:38
++++ b/include/asm-generic/bitops.h	2026-05-13 20:42:30
+@@ -16,7 +16,7 @@
+  * C language equivalents written by Theodore Ts'o, 9/26/92
+  */
+ 
+-extern __inline__ int set_bit(int nr,long * addr)
++static __inline__ int set_bit(int nr,long * addr)
+ {
+ 	int	mask, retval;
+ 
+@@ -29,7 +29,7 @@
+ 	return retval;
+ }
+ 
+-extern __inline__ int clear_bit(int nr, long * addr)
++static __inline__ int clear_bit(int nr, long * addr)
+ {
+ 	int	mask, retval;
+ 
+@@ -42,7 +42,7 @@
+ 	return retval;
+ }
+ 
+-extern __inline__ int test_bit(int nr, long * addr)
++static __inline__ int test_bit(int nr, long * addr)
+ {
+ 	int	mask;
+ 
+--- a/include/asm-generic/smplock.h	2000-03-23 12:50:10
++++ b/include/asm-generic/smplock.h	2026-05-13 20:42:30
+@@ -38,13 +38,13 @@
+  * so we only need to worry about other
+  * CPU's.
+  */
+-extern __inline__ void lock_kernel(void)
++static __inline__ void lock_kernel(void)
+ {
+ 	if (!++current->lock_depth)
+ 		spin_lock(&kernel_flag);
+ }
+ 
+-extern __inline__ void unlock_kernel(void)
++static __inline__ void unlock_kernel(void)
+ {
+ 	if (--current->lock_depth < 0)
+ 		spin_unlock(&kernel_flag);
+--- a/include/asm-mips/atomic.h	2002-05-28 13:25:38
++++ b/include/asm-mips/atomic.h	2026-05-13 20:42:30
+@@ -55,7 +55,7 @@
+  * Atomically adds @i to @v.  Note that the guaranteed useful range
+  * of an atomic_t is only 24 bits.
+  */
+-extern __inline__ void atomic_add(int i, atomic_t * v)
++static __inline__ void atomic_add(int i, atomic_t * v)
+ {
+ 	int	flags;
+ 
+@@ -73,7 +73,7 @@
+  * Atomically subtracts @i from @v.  Note that the guaranteed
+  * useful range of an atomic_t is only 24 bits.
+  */
+-extern __inline__ void atomic_sub(int i, atomic_t * v)
++static __inline__ void atomic_sub(int i, atomic_t * v)
+ {
+ 	int	flags;
+ 
+@@ -83,7 +83,7 @@
+ 	restore_flags(flags);
+ }
+ 
+-extern __inline__ int atomic_add_return(int i, atomic_t * v)
++static __inline__ int atomic_add_return(int i, atomic_t * v)
+ {
+ 	int	temp, flags;
+ 
+@@ -97,7 +97,7 @@
+ 	return temp;
+ }
+ 
+-extern __inline__ int atomic_sub_return(int i, atomic_t * v)
++static __inline__ int atomic_sub_return(int i, atomic_t * v)
+ {
+ 	int	temp, flags;
+ 
+@@ -126,7 +126,7 @@
+  * Atomically adds @i to @v.  Note that the guaranteed useful range
+  * of an atomic_t is only 24 bits.
+  */
+-extern __inline__ void atomic_add(int i, atomic_t * v)
++static __inline__ void atomic_add(int i, atomic_t * v)
+ {
+ 	unsigned long temp;
+ 
+@@ -147,7 +147,7 @@
+  * Atomically subtracts @i from @v.  Note that the guaranteed
+  * useful range of an atomic_t is only 24 bits.
+  */
+-extern __inline__ void atomic_sub(int i, atomic_t * v)
++static __inline__ void atomic_sub(int i, atomic_t * v)
+ {
+ 	unsigned long temp;
+ 
+@@ -163,7 +163,7 @@
+ /*
+  * Same as above, but return the result value
+  */
+-extern __inline__ int atomic_add_return(int i, atomic_t * v)
++static __inline__ int atomic_add_return(int i, atomic_t * v)
+ {
+ 	unsigned long temp, result;
+ 
+@@ -184,7 +184,7 @@
+ 	return result;
+ }
+ 
+-extern __inline__ int atomic_sub_return(int i, atomic_t * v)
++static __inline__ int atomic_sub_return(int i, atomic_t * v)
+ {
+ 	unsigned long temp, result;
+ 
+--- a/include/asm-mips/bitops.h	2002-05-28 13:25:38
++++ b/include/asm-mips/bitops.h	2026-05-13 20:42:29
+@@ -58,7 +58,7 @@
+  * Note that @nr may be almost arbitrarily large; this function is not
+  * restricted to acting on a single-word quantity.
+  */
+-extern __inline__ void
++static __inline__ void
+ set_bit(int nr, volatile void *addr)
+ {
+ 	unsigned long *m = ((unsigned long *) addr) + (nr >> 5);
+@@ -82,7 +82,7 @@
+  * If it's called on the same region of memory simultaneously, the effect
+  * may be that only one operation succeeds.
+  */
+-extern __inline__ void __set_bit(int nr, volatile void * addr)
++static __inline__ void __set_bit(int nr, volatile void * addr)
+ {
+ 	unsigned long * m = ((unsigned long *) addr) + (nr >> 5);
+ 
+@@ -99,7 +99,7 @@
+  * you should call smp_mb__before_clear_bit() and/or smp_mb__after_clear_bit()
+  * in order to ensure changes are visible on other processors.
+  */
+-extern __inline__ void
++static __inline__ void
+ clear_bit(int nr, volatile void *addr)
+ {
+ 	unsigned long *m = ((unsigned long *) addr) + (nr >> 5);
+@@ -123,7 +123,7 @@
+  * Note that @nr may be almost arbitrarily large; this function is not
+  * restricted to acting on a single-word quantity.
+  */
+-extern __inline__ void
++static __inline__ void
+ change_bit(int nr, volatile void *addr)
+ {
+ 	unsigned long *m = ((unsigned long *) addr) + (nr >> 5);
+@@ -147,7 +147,7 @@
+  * If it's called on the same region of memory simultaneously, the effect
+  * may be that only one operation succeeds.
+  */
+-extern __inline__ void __change_bit(int nr, volatile void * addr)
++static __inline__ void __change_bit(int nr, volatile void * addr)
+ {
+ 	unsigned long * m = ((unsigned long *) addr) + (nr >> 5);
+ 
+@@ -162,7 +162,7 @@
+  * This operation is atomic and cannot be reordered.  
+  * It also implies a memory barrier.
+  */
+-extern __inline__ int
++static __inline__ int
+ test_and_set_bit(int nr, volatile void *addr)
+ {
+ 	unsigned long *m = ((unsigned long *) addr) + (nr >> 5);
+@@ -195,7 +195,7 @@
+  * If two examples of this operation race, one can appear to succeed
+  * but actually fail.  You must protect multiple accesses with a lock.
+  */
+-extern __inline__ int __test_and_set_bit(int nr, volatile void * addr)
++static __inline__ int __test_and_set_bit(int nr, volatile void * addr)
+ {
+ 	int mask, retval;
+ 	volatile int *a = addr;
+@@ -216,7 +216,7 @@
+  * This operation is atomic and cannot be reordered.  
+  * It also implies a memory barrier.
+  */
+-extern __inline__ int
++static __inline__ int
+ test_and_clear_bit(int nr, volatile void *addr)
+ {
+ 	unsigned long *m = ((unsigned long *) addr) + (nr >> 5);
+@@ -250,7 +250,7 @@
+  * If two examples of this operation race, one can appear to succeed
+  * but actually fail.  You must protect multiple accesses with a lock.
+  */
+-extern __inline__ int __test_and_clear_bit(int nr, volatile void * addr)
++static __inline__ int __test_and_clear_bit(int nr, volatile void * addr)
+ {
+ 	int	mask, retval;
+ 	volatile int	*a = addr;
+@@ -271,7 +271,7 @@
+  * This operation is atomic and cannot be reordered.  
+  * It also implies a memory barrier.
+  */
+-extern __inline__ int
++static __inline__ int
+ test_and_change_bit(int nr, volatile void *addr)
+ {
+ 	unsigned long *m = ((unsigned long *) addr) + (nr >> 5);
+@@ -304,7 +304,7 @@
+  * If two examples of this operation race, one can appear to succeed
+  * but actually fail.  You must protect multiple accesses with a lock.
+  */
+-extern __inline__ int __test_and_change_bit(int nr, volatile void * addr)
++static __inline__ int __test_and_change_bit(int nr, volatile void * addr)
+ {
+ 	int	mask, retval;
+ 	volatile int	*a = addr;
+@@ -329,7 +329,7 @@
+  * Note that @nr may be almost arbitrarily large; this function is not
+  * restricted to acting on a single-word quantity.
+  */
+-extern __inline__ void set_bit(int nr, volatile void * addr)
++static __inline__ void set_bit(int nr, volatile void * addr)
+ {
+ 	int	mask;
+ 	volatile int	*a = addr;
+@@ -351,7 +351,7 @@
+  * If it's called on the same region of memory simultaneously, the effect
+  * may be that only one operation succeeds.
+  */
+-extern __inline__ void __set_bit(int nr, volatile void * addr)
++static __inline__ void __set_bit(int nr, volatile void * addr)
+ {
+ 	int	mask;
+ 	volatile int	*a = addr;
+@@ -371,7 +371,7 @@
+  * you should call smp_mb__before_clear_bit() and/or smp_mb__after_clear_bit()
+  * in order to ensure changes are visible on other processors.
+  */
+-extern __inline__ void clear_bit(int nr, volatile void * addr)
++static __inline__ void clear_bit(int nr, volatile void * addr)
+ {
+ 	int	mask;
+ 	volatile int	*a = addr;
+@@ -393,7 +393,7 @@
+  * Note that @nr may be almost arbitrarily large; this function is not
+  * restricted to acting on a single-word quantity.
+  */
+-extern __inline__ void change_bit(int nr, volatile void * addr)
++static __inline__ void change_bit(int nr, volatile void * addr)
+ {
+ 	int	mask;
+ 	volatile int	*a = addr;
+@@ -415,7 +415,7 @@
+  * If it's called on the same region of memory simultaneously, the effect
+  * may be that only one operation succeeds.
+  */
+-extern __inline__ void __change_bit(int nr, volatile void * addr)
++static __inline__ void __change_bit(int nr, volatile void * addr)
+ {
+ 	unsigned long * m = ((unsigned long *) addr) + (nr >> 5);
+ 
+@@ -430,7 +430,7 @@
+  * This operation is atomic and cannot be reordered.  
+  * It also implies a memory barrier.
+  */
+-extern __inline__ int test_and_set_bit(int nr, volatile void * addr)
++static __inline__ int test_and_set_bit(int nr, volatile void * addr)
+ {
+ 	int	mask, retval;
+ 	volatile int	*a = addr;
+@@ -455,7 +455,7 @@
+  * If two examples of this operation race, one can appear to succeed
+  * but actually fail.  You must protect multiple accesses with a lock.
+  */
+-extern __inline__ int __test_and_set_bit(int nr, volatile void * addr)
++static __inline__ int __test_and_set_bit(int nr, volatile void * addr)
+ {
+ 	int	mask, retval;
+ 	volatile int	*a = addr;
+@@ -476,7 +476,7 @@
+  * This operation is atomic and cannot be reordered.  
+  * It also implies a memory barrier.
+  */
+-extern __inline__ int test_and_clear_bit(int nr, volatile void * addr)
++static __inline__ int test_and_clear_bit(int nr, volatile void * addr)
+ {
+ 	int	mask, retval;
+ 	volatile int	*a = addr;
+@@ -501,7 +501,7 @@
+  * If two examples of this operation race, one can appear to succeed
+  * but actually fail.  You must protect multiple accesses with a lock.
+  */
+-extern __inline__ int __test_and_clear_bit(int nr, volatile void * addr)
++static __inline__ int __test_and_clear_bit(int nr, volatile void * addr)
+ {
+ 	int	mask, retval;
+ 	volatile int	*a = addr;
+@@ -522,7 +522,7 @@
+  * This operation is atomic and cannot be reordered.  
+  * It also implies a memory barrier.
+  */
+-extern __inline__ int test_and_change_bit(int nr, volatile void * addr)
++static __inline__ int test_and_change_bit(int nr, volatile void * addr)
+ {
+ 	int	mask, retval;
+ 	volatile int	*a = addr;
+@@ -547,7 +547,7 @@
+  * If two examples of this operation race, one can appear to succeed
+  * but actually fail.  You must protect multiple accesses with a lock.
+  */
+-extern __inline__ int __test_and_change_bit(int nr, volatile void * addr)
++static __inline__ int __test_and_change_bit(int nr, volatile void * addr)
+ {
+ 	int	mask, retval;
+ 	volatile int	*a = addr;
+@@ -572,7 +572,7 @@
+  * @nr: bit number to test
+  * @addr: Address to start counting from
+  */
+-extern __inline__ int test_bit(int nr, volatile void *addr)
++static __inline__ int test_bit(int nr, volatile void *addr)
+ {
+ 	return ((1UL << (nr & 31)) & (((const unsigned int *) addr)[nr >> 5])) != 0;
+ }
+@@ -589,7 +589,7 @@
+  * Returns the bit-number of the first zero bit, not the number of the byte
+  * containing a bit.
+  */
+-extern __inline__ int find_first_zero_bit (void *addr, unsigned size)
++static __inline__ int find_first_zero_bit (void *addr, unsigned size)
+ {
+ 	unsigned long dummy;
+ 	int res;
+@@ -639,7 +639,7 @@
+  * @offset: The bitnumber to start searching at
+  * @size: The maximum size to search
+  */
+-extern __inline__ int find_next_zero_bit (void * addr, int size, int offset)
++static __inline__ int find_next_zero_bit (void * addr, int size, int offset)
+ {
+ 	unsigned int *p = ((unsigned int *) addr) + (offset >> 5);
+ 	int set = 0, bit = offset & 31, res;
+@@ -732,7 +732,7 @@
+  * @offset: The bitnumber to start searching at
+  * @size: The maximum size to search
+  */
+-extern __inline__ int find_next_zero_bit(void *addr, int size, int offset)
++static __inline__ int find_next_zero_bit(void *addr, int size, int offset)
+ {
+ 	unsigned long *p = ((unsigned long *) addr) + (offset >> 5);
+ 	unsigned long result = offset & ~31UL;
+@@ -792,7 +792,7 @@
+ /* Now for the ext2 filesystem bit operations and helper routines. */
+ 
+ #ifdef __MIPSEB__
+-extern __inline__ int ext2_set_bit(int nr, void * addr)
++static __inline__ int ext2_set_bit(int nr, void * addr)
+ {
+ 	int		mask, retval, flags;
+ 	unsigned char	*ADDR = (unsigned char *) addr;
+@@ -806,7 +806,7 @@
+ 	return retval;
+ }
+ 
+-extern __inline__ int ext2_clear_bit(int nr, void * addr)
++static __inline__ int ext2_clear_bit(int nr, void * addr)
+ {
+ 	int		mask, retval, flags;
+ 	unsigned char	*ADDR = (unsigned char *) addr;
+@@ -820,7 +820,7 @@
+ 	return retval;
+ }
+ 
+-extern __inline__ int ext2_test_bit(int nr, const void * addr)
++static __inline__ int ext2_test_bit(int nr, const void * addr)
+ {
+ 	int			mask;
+ 	const unsigned char	*ADDR = (const unsigned char *) addr;
+@@ -833,7 +833,7 @@
+ #define ext2_find_first_zero_bit(addr, size) \
+         ext2_find_next_zero_bit((addr), (size), 0)
+ 
+-extern __inline__ unsigned long ext2_find_next_zero_bit(void *addr, unsigned long size, unsigned long offset)
++static __inline__ unsigned long ext2_find_next_zero_bit(void *addr, unsigned long size, unsigned long offset)
+ {
+ 	unsigned long *p = ((unsigned long *) addr) + (offset >> 5);
+ 	unsigned long result = offset & ~31UL;
+--- a/include/asm-mips/delay.h	2001-07-02 13:56:40
++++ b/include/asm-mips/delay.h	2026-05-13 20:42:29
+@@ -13,7 +13,7 @@
+ 
+ extern unsigned long loops_per_jiffy;
+ 
+-extern __inline__ void
++static __inline__ void
+ __delay(unsigned long loops)
+ {
+ 	__asm__ __volatile__ (
+@@ -35,14 +35,17 @@
+  * first constant multiplications gets optimized away if the delay is
+  * a constant)
+  */
+-extern __inline__ void __udelay(unsigned long usecs, unsigned long lpj)
++static __inline__ void __udelay(unsigned long usecs, unsigned long lpj)
+ {
+ 	unsigned long lo;
+ 
+ 	usecs *= 0x00068db8;		/* 2**32 / (1000000 / HZ) */
+-	__asm__("multu\t%2,%3"
+-		:"=h" (usecs), "=l" (lo)
+-		:"r" (usecs),"r" (lpj));
++	/* Modern GCC removed the "=h"/"=l" HI/LO output constraints; do the
++	 * multiply explicitly and pull HI/LO with mfhi/mflo. */
++	__asm__("multu\t%2,%3\n\tmfhi\t%0\n\tmflo\t%1"
++		:"=r" (usecs), "=r" (lo)
++		:"r" (usecs),"r" (lpj)
++		:"hi","lo");
+ 	__delay(usecs);
+ }
+ 
+--- a/include/asm-mips/div64.h	2001-10-15 09:14:26
++++ b/include/asm-mips/div64.h	2026-05-13 20:41:25
+@@ -60,9 +60,11 @@
+ 	__upper = __high; \
+ 	\
+ 	if (__high) \
+-		__asm__("divu	$0,%z2,%z3" \
+-			: "=h" (__upper), "=l" (__high) \
+-			: "Jr" (__high), "Jr" (base)); \
++		/* Modern GCC removed =h/=l constraints; use mfhi/mflo. */ \
++		__asm__("divu	$0,%z2,%z3\n\tmfhi\t%0\n\tmflo\t%1" \
++			: "=r" (__upper), "=r" (__high) \
++			: "Jr" (__high), "Jr" (base) \
++			: "hi", "lo"); \
+ 	\
+ 	__mod = do_div64_32(__low, __upper, __low, base); \
+ 	\
+--- a/include/asm-mips/jazz.h	2001-10-31 10:26:52
++++ b/include/asm-mips/jazz.h	2026-05-13 20:42:29
+@@ -72,7 +72,7 @@
+ 
+ #ifndef _LANGUAGE_ASSEMBLY
+ 
+-extern __inline__ void pica_set_led(unsigned int bits)
++static __inline__ void pica_set_led(unsigned int bits)
+ {
+ 	volatile unsigned int *led_register = (unsigned int *) PICA_LED;
+ 
+--- a/include/asm-mips/jmr3927/jmr3927.h	2002-05-16 11:40:08
++++ b/include/asm-mips/jmr3927/jmr3927.h	2026-05-13 20:42:30
+@@ -162,7 +162,7 @@
+ #define jmr3927_isac_reg_out(d, a)	((*(volatile unsigned char *)(a)) = (d))
+ #define jmr3927_isac_reg_in(a)		(*(volatile unsigned char *)(a))
+ 
+-extern inline int jmr3927_have_isac(void)
++static inline int jmr3927_have_isac(void)
+ {
+ 	unsigned char idt;
+ 	unsigned long flags;
+--- a/include/asm-mips/page.h	2002-03-08 17:36:20
++++ b/include/asm-mips/page.h	2026-05-13 20:42:29
+@@ -95,7 +95,7 @@
+ #define __pgprot(x)	((pgprot_t) { (x) } )
+ 
+ /* Pure 2^n version of get_order */
+-extern __inline__ int get_order(unsigned long size)
++static __inline__ int get_order(unsigned long size)
+ {
+ 	int order;
+ 
+--- a/include/asm-mips/param.h	2001-07-02 13:56:40
++++ b/include/asm-mips/param.h	2026-05-13 20:41:23
+@@ -27,9 +27,11 @@
+ #  define hz_to_std(a)                            \
+    ({ unsigned int __res;			  \
+       unsigned long __lo;			  \
+-        __asm__("multu\t%2,%3\n\t"		  \
+-		:"=h" (__res), "=l" (__lo)	  \
+-		:"r" (a),"r" (QUOTIENT));         \
++      /* Modern GCC removed =h/=l constraints; use mfhi/mflo. */ \
++        __asm__("multu\t%2,%3\n\tmfhi\t%0\n\tmflo\t%1"            \
++		:"=r" (__res), "=r" (__lo)	  \
++		:"r" (a),"r" (QUOTIENT)           \
++		:"hi","lo");                      \
+         (__typeof__(a)) __res;})
+ 
+ #else /* Not a DECstation  */
+--- a/include/asm-mips/pgalloc.h	2002-01-28 10:48:10
++++ b/include/asm-mips/pgalloc.h	2026-05-13 20:42:29
+@@ -67,7 +67,7 @@
+  */
+ extern void pgd_init(unsigned long page);
+ 
+-extern __inline__ pgd_t *get_pgd_slow(void)
++static __inline__ pgd_t *get_pgd_slow(void)
+ {
+ 	pgd_t *ret = (pgd_t *)__get_free_pages(GFP_KERNEL, PGD_ORDER), *init;
+ 
+@@ -80,7 +80,7 @@
+ 	return ret;
+ }
+ 
+-extern __inline__ pgd_t *get_pgd_fast(void)
++static __inline__ pgd_t *get_pgd_fast(void)
+ {
+ 	unsigned long *ret;
+ 
+@@ -93,19 +93,19 @@
+ 	return (pgd_t *)ret;
+ }
+ 
+-extern __inline__ void free_pgd_fast(pgd_t *pgd)
++static __inline__ void free_pgd_fast(pgd_t *pgd)
+ {
+ 	*(unsigned long *)pgd = (unsigned long) pgd_quicklist;
+ 	pgd_quicklist = (unsigned long *) pgd;
+ 	pgtable_cache_size++;
+ }
+ 
+-extern __inline__ void free_pgd_slow(pgd_t *pgd)
++static __inline__ void free_pgd_slow(pgd_t *pgd)
+ {
+ 	free_pages((unsigned long)pgd, PGD_ORDER);
+ }
+ 
+-extern __inline__ pte_t *get_pte_fast(void)
++static __inline__ pte_t *get_pte_fast(void)
+ {
+ 	unsigned long *ret;
+ 
+@@ -117,29 +117,29 @@
+ 	return (pte_t *)ret;
+ }
+ 
+-extern __inline__ void free_pte_fast(pte_t *pte)
++static __inline__ void free_pte_fast(pte_t *pte)
+ {
+ 	*(unsigned long *)pte = (unsigned long) pte_quicklist;
+ 	pte_quicklist = (unsigned long *) pte;
+ 	pgtable_cache_size++;
+ }
+ 
+-extern __inline__ void free_pte_slow(pte_t *pte)
++static __inline__ void free_pte_slow(pte_t *pte)
+ {
+ 	free_page((unsigned long)pte);
+ }
+ 
+ /* We don't use pmd cache, so these are dummy routines */
+-extern __inline__ pmd_t *get_pmd_fast(void)
++static __inline__ pmd_t *get_pmd_fast(void)
+ {
+ 	return (pmd_t *)0;
+ }
+ 
+-extern __inline__ void free_pmd_fast(pmd_t *pmd)
++static __inline__ void free_pmd_fast(pmd_t *pmd)
+ {
+ }
+ 
+-extern __inline__ void free_pmd_slow(pmd_t *pmd)
++static __inline__ void free_pmd_slow(pmd_t *pmd)
+ {
+ }
+ 
+@@ -167,14 +167,14 @@
+ 	return (pte_t *)ret;
+ }
+ 
+-extern __inline__ void pte_free_fast(pte_t *pte)
++static __inline__ void pte_free_fast(pte_t *pte)
+ {
+ 	*(unsigned long *)pte = (unsigned long) pte_quicklist;
+ 	pte_quicklist = (unsigned long *) pte;
+ 	pgtable_cache_size++;
+ }
+ 
+-extern __inline__ void pte_free_slow(pte_t *pte)
++static __inline__ void pte_free_slow(pte_t *pte)
+ {
+ 	free_page((unsigned long)pte);
+ }
+--- a/include/asm-mips/ptrace.h	2002-05-09 10:22:36
++++ b/include/asm-mips/ptrace.h	2026-05-13 21:30:06
+@@ -55,6 +55,13 @@
+ #define __str2(x) #x
+ #define __str(x) __str2(x)
+ 
++/* Modern toolchain note: original macro relied on the C body `_<symbol>`
++ * being placed immediately after this wrapper in the .text section, so
++ * execution would fall through. Modern GCC (10+) reorders functions and
++ * also dead-strips `static __attribute__((unused))` bodies that have no
++ * visible C caller, breaking the fall-through. We add an explicit
++ * `j _<symbol>` tail jump so layout no longer matters; the body is also
++ * marked `used` (see static_unused below) to survive dead-strip. */
+ #define save_static_function(symbol)                                    \
+ __asm__ (                                                               \
+         ".globl\t" #symbol "\n\t"                                       \
+@@ -72,11 +79,14 @@
+         "sw\t$22,"__str(PT_R22)"($29)\n\t"                              \
+         "sw\t$23,"__str(PT_R23)"($29)\n\t"                              \
+         "sw\t$30,"__str(PT_R30)"($29)\n\t"                              \
++        "j\t_" #symbol "\n\t"                                           \
++        "nop\n\t"                                                       \
+         ".end\t" #symbol "\n\t"                                         \
+         ".size\t" #symbol",. - " #symbol)
+ 
+-/* Used in declaration of save_static functions.  */
+-#define static_unused static __attribute__((unused))
++/* See save_static_function above. Body is now jumped-to explicitly, but
++ * we still mark it `used` because nothing in the C code references it. */
++#define static_unused static __attribute__((unused, used))
+ 
+ #endif /* !(_LANGUAGE_ASSEMBLY) */
+ 
+--- a/include/asm-mips/rc32300/rc32334_dma.h	2002-05-13 13:35:26
++++ b/include/asm-mips/rc32300/rc32334_dma.h	2026-05-13 20:42:30
+@@ -162,7 +162,7 @@
+  * NOTE NOTE NOTE: ptr MUST be a logical address! it won't work on
+  * mmapped address!
+  */
+-extern inline dma_addr_t rc32334_map_single(void *hwdev, void *ptr,
++static inline dma_addr_t rc32334_map_single(void *hwdev, void *ptr,
+ 					    size_t size, int direction)
+ {
+ 	dma_cache_wback_inv((unsigned long)ptr, size);
+@@ -178,7 +178,7 @@
+  * After this call, reads by the cpu to the buffer are guarenteed to see
+  * whatever the device wrote there.
+  */
+-extern inline void rc32334_unmap_single(void *hwdev, dma_addr_t dma_addr,
++static inline void rc32334_unmap_single(void *hwdev, dma_addr_t dma_addr,
+ 					size_t size, int direction)
+ {
+ 	/* Nothing to do */
+@@ -225,7 +225,7 @@
+  * Device ownership issues as mentioned above for rc32334_map_single are
+  * the same here.
+  */
+-extern inline int rc32334_map_sg(void *hwdev, const struct scatterlist *sg,
++static inline int rc32334_map_sg(void *hwdev, const struct scatterlist *sg,
+ 				 int nents, int direction)
+ {
+ #ifndef CONFIG_COHERENT_IO
+@@ -246,7 +246,7 @@
+  * Again, cpu read rules concerning calls here are the same as for
+  * rc32334_unmap_single() above.
+  */
+-extern inline void rc32334_unmap_sg(void *hwdev, const struct scatterlist *sg,
++static inline void rc32334_unmap_sg(void *hwdev, const struct scatterlist *sg,
+ 				    int nents, int direction)
+ {
+ 	/* Nothing to do */
+@@ -262,7 +262,7 @@
+  * next point you give the PCI dma address back to the card, the
+  * device again owns the buffer.
+  */
+-extern inline void rc32334_dma_sync_single(void *hwdev,
++static inline void rc32334_dma_sync_single(void *hwdev,
+ 					   dma_addr_t dma_handle,
+ 					   size_t size, int direction)
+ {
+@@ -276,7 +276,7 @@
+  * The same as rc32334_dma_sync_single but for a scatter-gather list,
+  * same rules and usage.
+  */
+-extern inline void rc32334_dma_sync_sg(void *hwdev,
++static inline void rc32334_dma_sync_sg(void *hwdev,
+ 				       const struct scatterlist *sg,
+ 				       int nelems, int direction)
+ {
+--- a/include/asm-mips/smplock.h	2000-03-23 12:50:10
++++ b/include/asm-mips/smplock.h	2026-05-13 20:42:29
+@@ -41,13 +41,13 @@
+  * so we only need to worry about other
+  * CPU's.
+  */
+-extern __inline__ void lock_kernel(void)
++static __inline__ void lock_kernel(void)
+ {
+ 	if (!++current->lock_depth)
+ 		spin_lock(&kernel_flag);
+ }
+ 
+-extern __inline__ void unlock_kernel(void)
++static __inline__ void unlock_kernel(void)
+ {
+ 	if (--current->lock_depth < 0)
+ 		spin_unlock(&kernel_flag);
+--- a/include/asm-mips/string.h	2002-05-09 10:22:36
++++ b/include/asm-mips/string.h	2026-05-13 20:42:30
+@@ -12,7 +12,7 @@
+ #include <linux/config.h>
+ 
+ #define __HAVE_ARCH_STRCPY
+-extern __inline__ char *strcpy(char *__dest, __const__ char *__src)
++static __inline__ char *strcpy(char *__dest, __const__ char *__src)
+ {
+   char *__xdest = __dest;
+ 
+@@ -34,7 +34,7 @@
+ }
+ 
+ #define __HAVE_ARCH_STRNCPY
+-extern __inline__ char *strncpy(char *__dest, __const__ char *__src, size_t __n)
++static __inline__ char *strncpy(char *__dest, __const__ char *__src, size_t __n)
+ {
+   char *__xdest = __dest;
+ 
+@@ -62,7 +62,7 @@
+ }
+ 
+ #define __HAVE_ARCH_STRCMP
+-extern __inline__ int strcmp(__const__ char *__cs, __const__ char *__ct)
++static __inline__ int strcmp(__const__ char *__cs, __const__ char *__ct)
+ {
+   int __res;
+ 
+@@ -90,7 +90,7 @@
+ }
+ 
+ #define __HAVE_ARCH_STRNCMP
+-extern __inline__ int
++static __inline__ int
+ strncmp(__const__ char *__cs, __const__ char *__ct, size_t __count)
+ {
+ 	int __res;
+@@ -133,7 +133,7 @@
+ #define __HAVE_ARCH_BCOPY
+ 
+ #define __HAVE_ARCH_MEMSCAN
+-extern __inline__ void *memscan(void *__addr, int __c, size_t __size)
++static __inline__ void *memscan(void *__addr, int __c, size_t __size)
+ {
+ 	char *__end = (char *)__addr + __size;
+ 	unsigned char __uc = (unsigned char) __c;
+--- a/include/asm-mips/system.h	2002-05-28 13:25:38
++++ b/include/asm-mips/system.h	2026-05-13 20:47:39
+@@ -33,7 +33,7 @@
+ 	".set\tpop\n\t"
+ 	".endm");
+ 
+-extern __inline__ void
++static __inline__ void
+ __sti(void)
+ {
+ 	__asm__ __volatile__(
+@@ -65,7 +65,7 @@
+ 	".set\tpop\n\t"
+ 	".endm");
+ 
+-extern __inline__ void
++static __inline__ void
+ __cli(void)
+ {
+ 	__asm__ __volatile__(
+@@ -227,7 +227,7 @@
+  * For 32 and 64 bit operands we can take advantage of ll and sc.
+  * FIXME: This doesn't work for R3000 machines.
+  */
+-extern __inline__ unsigned long xchg_u32(volatile int * m, unsigned long val)
++static __inline__ unsigned long xchg_u32(volatile int * m, unsigned long val)
+ {
+ #ifdef CONFIG_CPU_HAS_LLSC
+ 	unsigned long dummy;
+@@ -280,9 +280,14 @@
+ extern void __die_if_kernel(const char *, struct pt_regs *, const char *where,
+ 	unsigned long line);
+ 
+-#define die(msg, regs)							\
+-	__die(msg, regs, __FILE__ ":"__FUNCTION__, __LINE__)
++/* Modern GCC treats __FUNCTION__ as a (const char[]) variable, not a
++ * string literal, so "foo" __FUNCTION__ no longer concatenates. Pass
++ * __func__ as a separate runtime arg by overloading `where` with __FILE__
++ * only — losing function name in oops output is acceptable to keep a
++ * modern-toolchain build green. */
++#define die(msg, regs)							\
++	__die(msg, regs, __FILE__, __LINE__)
+ #define die_if_kernel(msg, regs)					\
+-	__die_if_kernel(msg, regs, __FILE__ ":"__FUNCTION__, __LINE__)
++	__die_if_kernel(msg, regs, __FILE__, __LINE__)
+ 
+ #endif /* _ASM_SYSTEM_H */
+--- a/include/asm-mips/uaccess.h	2001-10-05 09:16:30
++++ b/include/asm-mips/uaccess.h	2026-05-13 20:49:05
+@@ -73,10 +73,15 @@
+  * (a) re-use the arguments for side effects (sizeof is ok)
+  * (b) require any knowledge of processes at this stage
+  */
++/* Modern GCC: the GET-side macros must NOT wrap `x` in `(__typeof__)(x)`
++ * because that produces a cast expression, and the inner macro assigns
++ * to it (`(x) = …`). A cast is not an lvalue under strict C semantics.
++ * Drop the cast for the GET_USER pair; keep it on PUT_USER where x is
++ * only read. */
+ #define put_user(x,ptr)	\
+ 	__put_user_check((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
+ #define get_user(x,ptr) \
+-	__get_user_check((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
++	__get_user_check((x),(ptr),sizeof(*(ptr)))
+ 
+ /*
+  * The "__xxx" versions do not do address space checking, useful when
+@@ -86,7 +91,7 @@
+ #define __put_user(x,ptr) \
+ 	__put_user_nocheck((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
+ #define __get_user(x,ptr) \
+-	__get_user_nocheck((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
++	__get_user_nocheck((x),(ptr),sizeof(*(ptr)))
+ 
+ struct __large_struct { unsigned long buf[100]; };
+ #define __m(x) (*(struct __large_struct *)(x))
+@@ -101,28 +106,28 @@
+ #define __GET_USER_DW __get_user_asm_ll32
+ #endif
+ 
++/* Modern GCC (12+) rejects the empty-asm "register hint" pattern when the
++ * inferred __typeof__ is const-qualified ("read-only variable used as 'asm'
++ * output") and treats `(void)x, expr` comma forms as rvalues. Drop the
++ * empty-asm hints, initialize the locals, and use a non-const long-long
++ * temp so the load-byte/halfword asm always writes a writable register;
++ * cast back to the original (possibly const) type at the assignment site. */
+ #define __get_user_nocheck(x,ptr,size) ({ \
+-long __gu_err; \
+-__typeof(*(ptr)) __gu_val; \
+-long __gu_addr; \
+-__asm__("":"=r" (__gu_val)); \
+-__gu_addr = (long) (ptr); \
+-__asm__("":"=r" (__gu_err)); \
++long __gu_err = 0; \
++unsigned long long __gu_val = 0; \
++long __gu_addr = (long) (ptr); \
+ switch (size) { \
+ case 1: __get_user_asm("lb"); break; \
+ case 2: __get_user_asm("lh"); break; \
+ case 4: __get_user_asm("lw"); break; \
+ case 8: __GET_USER_DW; break; \
+ default: __get_user_unknown(); break; \
+-} x = (__typeof__(*(ptr))) __gu_val; __gu_err; })
++} (x) = (__typeof__(*(ptr))) __gu_val; __gu_err; })
+ 
+ #define __get_user_check(x,ptr,size) ({ \
+-long __gu_err; \
+-__typeof__(*(ptr)) __gu_val; \
+-long __gu_addr; \
+-__asm__("":"=r" (__gu_val)); \
+-__gu_addr = (long) (ptr); \
+-__asm__("":"=r" (__gu_err)); \
++long __gu_err = 0; \
++unsigned long long __gu_val = 0; \
++long __gu_addr = (long) (ptr); \
+ if (__access_ok(__gu_addr,size,__access_mask)) { \
+ switch (size) { \
+ case 1: __get_user_asm("lb"); break; \
+@@ -130,7 +135,7 @@
+ case 4: __get_user_asm("lw"); break; \
+ case 8: __GET_USER_DW; break; \
+ default: __get_user_unknown(); break; \
+-} } x = (__typeof__(*(ptr))) __gu_val; __gu_err; })
++} } (x) = (__typeof__(*(ptr))) __gu_val; __gu_err; })
+ 
+ #define __get_user_asm(insn) \
+ ({ \
+@@ -184,13 +189,12 @@
+ #define __PUT_USER_DW __put_user_asm_ll32
+ #endif
+ 
++/* See __get_user_nocheck above for the rationale on dropping the empty-asm
++ * hints and using a non-const long-long temp. */
+ #define __put_user_nocheck(x,ptr,size) ({ \
+-long __pu_err; \
+-__typeof__(*(ptr)) __pu_val; \
+-long __pu_addr; \
+-__pu_val = (x); \
+-__pu_addr = (long) (ptr); \
+-__asm__("":"=r" (__pu_err)); \
++long __pu_err = 0; \
++unsigned long long __pu_val = (unsigned long long)(x); \
++long __pu_addr = (long) (ptr); \
+ switch (size) { \
+ case 1: __put_user_asm("sb"); break; \
+ case 2: __put_user_asm("sh"); break; \
+@@ -200,12 +204,9 @@
+ } __pu_err; })
+ 
+ #define __put_user_check(x,ptr,size) ({ \
+-long __pu_err; \
+-__typeof__(*(ptr)) __pu_val; \
+-long __pu_addr; \
+-__pu_val = (x); \
+-__pu_addr = (long) (ptr); \
+-__asm__("":"=r" (__pu_err)); \
++long __pu_err = 0; \
++unsigned long long __pu_val = (unsigned long long)(x); \
++long __pu_addr = (long) (ptr); \
+ if (__access_ok(__pu_addr,size,__access_mask)) { \
+ switch (size) { \
+ case 1: __put_user_asm("sb"); break; \
+--- a/include/asm-mips/unaligned.h	2001-10-31 10:26:52
++++ b/include/asm-mips/unaligned.h	2026-05-13 20:47:46
+@@ -99,29 +99,32 @@
+  *
+  * Note that unaligned accesses can be very expensive on some architectures.
+  */
++/* Modern GCC: when ptr's pointee is const-qualified, __val becomes
++ * `const T` and can't be the LHS of `=`. Use a non-const temporary, then
++ * cast to the original type when returning. */
+ #define get_unaligned(ptr)						\
+ ({									\
+-	__typeof__(*(ptr)) __val;					\
++	unsigned long long __val_raw = 0;				\
+ 									\
+ 	switch (sizeof(*(ptr))) {					\
+ 	case 1:								\
+-		__val = *(const unsigned char *)ptr;			\
++		__val_raw = *(const unsigned char *)ptr;		\
+ 		break;							\
+ 	case 2:								\
+-		__val = __ldw_u((const unsigned short *)ptr);		\
++		__val_raw = __ldw_u((const unsigned short *)ptr);	\
+ 		break;							\
+ 	case 4:								\
+-		__val = __ldl_u((const unsigned int *)ptr);		\
++		__val_raw = __ldl_u((const unsigned int *)ptr);		\
+ 		break;							\
+ 	case 8:								\
+-		__val = __ldq_u((const unsigned long long *)ptr);	\
++		__val_raw = __ldq_u((const unsigned long long *)ptr);	\
+ 		break;							\
+ 	default:							\
+ 		__get_unaligned_bad_length();				\
+ 		break;							\
+ 	}								\
+ 									\
+-	__val;								\
++	(__typeof__(*(ptr)))__val_raw;					\
+ })
+ 
+ /*
+--- a/include/asm-mips/vr4122/vr4122.h	2002-01-18 13:22:24
++++ b/include/asm-mips/vr4122/vr4122.h	2026-05-13 20:42:30
+@@ -350,7 +350,7 @@
+ 
+ #ifndef _LANGUAGE_ASSEMBLY
+ 
+-extern __inline__ unsigned char vr4122_read_gpio_bit(int bit)
++static __inline__ unsigned char vr4122_read_gpio_bit(int bit)
+ {
+ 	if (bit < 16) {
+ 		return (readw(VR4122_GIUPIODL) & (1 << bit)) ? 1 : 0;
+@@ -363,7 +363,7 @@
+ 	return 0;
+ }
+ 
+-extern __inline__ void vr4122_write_gpio_bit(unsigned char val, int bit)
++static __inline__ void vr4122_write_gpio_bit(unsigned char val, int bit)
+ {
+ 	unsigned short d;
+ 	if (bit < 16) {
+@@ -393,22 +393,22 @@
+ 	}
+ }
+ 
+-extern __inline__ unsigned short vr4122_read_gpio_low(void)
++static __inline__ unsigned short vr4122_read_gpio_low(void)
+ {
+ 	return readw(VR4122_GIUPIODL);
+ }
+ 
+-extern __inline__ unsigned short vr4122_read_gpio_high(void)
++static __inline__ unsigned short vr4122_read_gpio_high(void)
+ {
+ 	return readw(VR4122_GIUPIODH);
+ }
+ 
+-extern __inline__ void vr4122_write_gpio_low(unsigned short val)
++static __inline__ void vr4122_write_gpio_low(unsigned short val)
+ {
+ 	writew(val, VR4122_GIUPIODL);
+ }
+ 
+-extern __inline__ void vr4122_write_gpio_high(unsigned short val)
++static __inline__ void vr4122_write_gpio_high(unsigned short val)
+ {
+ 	writew(val, VR4122_GIUPIODH);
+ }
+--- a/include/asm-mips/vr41xx.h	2002-07-12 13:14:28
++++ b/include/asm-mips/vr41xx.h	2026-05-13 22:11:37
+@@ -36,6 +36,14 @@
+   #include <asm/vr4111/vr4111.h>
+ #elif defined(CONFIG_VR4121)
+   #include <asm/vr4121/vr4121.h>
++#elif defined(CONFIG_VR4131)
++  /* Linux4be 2.4.18 shipped without a VR4131 header; vr4131.h aliases
++   * the VR4122 on-chip register layout (BCU/CMU/ICU/PMU/RTC/SIU/GIU at
++   * PA 0x0F000000+) which is byte-identical, plus adds VR41XX_* aliases
++   * for the PMU/IRQ symbols the buttons/tpanel drivers reference. Must
++   * be tested before VR4122 because CONFIG_VR4131 implicitly enables
++   * CONFIG_VR4122 in autoconf.h. */
++  #include <asm/vr4131/vr4131.h>
+ #elif defined(CONFIG_VR4122)
+   #include <asm/vr4122/vr4122.h>
+ #elif defined(CONFIG_VR4181)
+--- a/include/linux/blkdev.h	2001-11-26 05:29:18
++++ b/include/linux/blkdev.h	2026-05-13 20:57:19
+@@ -151,7 +151,9 @@
+ extern void grok_partitions(struct gendisk *dev, int drive, unsigned minors, long size);
+ extern void register_disk(struct gendisk *dev, kdev_t first, unsigned minors, struct block_device_operations *ops, long size);
+ extern void generic_make_request(int rw, struct buffer_head * bh);
+-extern inline request_queue_t *blk_get_queue(kdev_t dev);
++/* Body lives in drivers/block/ll_rw_blk.c; declare extern so modern
++ * GCC doesn't demand an inline body here. */
++extern request_queue_t *blk_get_queue(kdev_t dev);
+ extern void blkdev_release_request(struct request *);
+ 
+ /*
+--- a/include/linux/i2c-proc.h	2001-10-11 08:05:48
++++ b/include/linux/i2c-proc.h	2026-05-13 20:42:29
+@@ -362,7 +362,7 @@
+ 
+ /* This macro is used to scale user-input to sensible values in almost all
+    chip drivers. */
+-extern inline int SENSORS_LIMIT(long value, long low, long high)
++static inline int SENSORS_LIMIT(long value, long low, long high)
+ {
+ 	if (value < low)
+ 		return low;
+--- a/include/linux/init.h	2001-12-21 09:42:04
++++ b/include/linux/init.h	2026-05-13 21:33:26
+@@ -75,13 +75,18 @@
+  * Mark functions and data as being only used at initialization
+  * or exit time.
+  */
++/* Modern GCC (10+) dead-strips static data with `__attribute__((unused))`
++ * when there is no C reference. The kernel relies on these section-tagged
++ * pointers being present so do_initcalls(), the setup-table walker, and
++ * the module exit-call walker can iterate over them. Add `used` so the
++ * objects survive dead-strip even though no C code names them. */
+ #define __init		__attribute__ ((__section__ (".text.init")))
+-#define __exit		__attribute__ ((unused, __section__(".text.exit")))
++#define __exit		__attribute__ ((unused, used, __section__(".text.exit")))
+ #define __initdata	__attribute__ ((__section__ (".data.init")))
+-#define __exitdata	__attribute__ ((unused, __section__ (".data.exit")))
+-#define __initsetup	__attribute__ ((unused,__section__ (".setup.init")))
+-#define __init_call	__attribute__ ((unused,__section__ (".initcall.init")))
+-#define __exit_call	__attribute__ ((unused,__section__ (".exitcall.exit")))
++#define __exitdata	__attribute__ ((unused, used, __section__ (".data.exit")))
++#define __initsetup	__attribute__ ((unused, used, __section__ (".setup.init")))
++#define __init_call	__attribute__ ((unused, used, __section__ (".initcall.init")))
++#define __exit_call	__attribute__ ((unused, used, __section__ (".exitcall.exit")))
+ 
+ /* For assembly routines */
+ #define __INIT		.section	".text.init","ax"
+--- a/include/linux/irq_cpustat.h	2001-11-22 11:46:18
++++ b/include/linux/irq_cpustat.h	2026-05-13 20:44:12
+@@ -22,8 +22,12 @@
+ #ifdef CONFIG_SMP
+ #define __IRQ_STAT(cpu, member)	(irq_stat[cpu].member)
+ #else
+-#define __IRQ_STAT(cpu, member)	((void)(cpu), irq_stat[0].member)
+-#endif	
++/* Modern GCC treats `((void)x, expr)` as an rvalue, breaking ++/-- on
++ * the macro expansion (used in asm-mips/softirq.h's local_bh_count++).
++ * Drop the silence cast — UP builds will warn about unused `cpu`, which
++ * is harmless. */
++#define __IRQ_STAT(cpu, member)	(irq_stat[0].member)
++#endif
+ 
+   /* arch independent irq_stat fields */
+ #define softirq_pending(cpu)	__IRQ_STAT((cpu), __softirq_pending)
+--- a/include/linux/parport_pc.h	2001-11-14 14:52:48
++++ b/include/linux/parport_pc.h	2026-05-13 20:42:29
+@@ -41,7 +41,7 @@
+ 	struct pci_dev *dev;
+ };
+ 
+-extern __inline__ void parport_pc_write_data(struct parport *p, unsigned char d)
++static __inline__ void parport_pc_write_data(struct parport *p, unsigned char d)
+ {
+ #ifdef DEBUG_PARPORT
+ 	printk (KERN_DEBUG "parport_pc_write_data(%p,0x%02x)\n", p, d);
+@@ -49,7 +49,7 @@
+ 	outb(d, DATA(p));
+ }
+ 
+-extern __inline__ unsigned char parport_pc_read_data(struct parport *p)
++static __inline__ unsigned char parport_pc_read_data(struct parport *p)
+ {
+ 	unsigned char val = inb (DATA (p));
+ #ifdef DEBUG_PARPORT
+@@ -60,7 +60,7 @@
+ }
+ 
+ #ifdef DEBUG_PARPORT
+-extern __inline__ void dump_parport_state (char *str, struct parport *p)
++static __inline__ void dump_parport_state (char *str, struct parport *p)
+ {
+ 	/* here's hoping that reading these ports won't side-effect anything underneath */
+ 	unsigned char ecr = inb (ECONTROL (p));
+@@ -124,17 +124,17 @@
+ 	return ctr;
+ }
+ 
+-extern __inline__ void parport_pc_data_reverse (struct parport *p)
++static __inline__ void parport_pc_data_reverse (struct parport *p)
+ {
+ 	__parport_pc_frob_control (p, 0x20, 0x20);
+ }
+ 
+-extern __inline__ void parport_pc_data_forward (struct parport *p)
++static __inline__ void parport_pc_data_forward (struct parport *p)
+ {
+ 	__parport_pc_frob_control (p, 0x20, 0x00);
+ }
+ 
+-extern __inline__ void parport_pc_write_control (struct parport *p,
++static __inline__ void parport_pc_write_control (struct parport *p,
+ 						 unsigned char d)
+ {
+ 	const unsigned char wm = (PARPORT_CONTROL_STROBE |
+@@ -152,7 +152,7 @@
+ 	__parport_pc_frob_control (p, wm, d & wm);
+ }
+ 
+-extern __inline__ unsigned char parport_pc_read_control(struct parport *p)
++static __inline__ unsigned char parport_pc_read_control(struct parport *p)
+ {
+ 	const unsigned char rm = (PARPORT_CONTROL_STROBE |
+ 				  PARPORT_CONTROL_AUTOFD |
+@@ -162,7 +162,7 @@
+ 	return priv->ctr & rm; /* Use soft copy */
+ }
+ 
+-extern __inline__ unsigned char parport_pc_frob_control (struct parport *p,
++static __inline__ unsigned char parport_pc_frob_control (struct parport *p,
+ 							 unsigned char mask,
+ 							 unsigned char val)
+ {
+@@ -189,18 +189,18 @@
+ 	return __parport_pc_frob_control (p, mask, val);
+ }
+ 
+-extern __inline__ unsigned char parport_pc_read_status(struct parport *p)
++static __inline__ unsigned char parport_pc_read_status(struct parport *p)
+ {
+ 	return inb(STATUS(p));
+ }
+ 
+ 
+-extern __inline__ void parport_pc_disable_irq(struct parport *p)
++static __inline__ void parport_pc_disable_irq(struct parport *p)
+ {
+ 	__parport_pc_frob_control (p, 0x10, 0x00);
+ }
+ 
+-extern __inline__ void parport_pc_enable_irq(struct parport *p)
++static __inline__ void parport_pc_enable_irq(struct parport *p)
+ {
+ 	__parport_pc_frob_control (p, 0x10, 0x10);
+ }
+--- a/include/linux/quotaops.h	2001-11-22 11:46:52
++++ b/include/linux/quotaops.h	2026-05-13 20:42:29
+@@ -174,7 +174,7 @@
+ #define DQUOT_SYNC(dev)				do { } while(0)
+ #define DQUOT_OFF(sb)				do { } while(0)
+ #define DQUOT_TRANSFER(inode, iattr)		(0)
+-extern __inline__ int DQUOT_PREALLOC_BLOCK_NODIRTY(struct inode *inode, int nr)
++static __inline__ int DQUOT_PREALLOC_BLOCK_NODIRTY(struct inode *inode, int nr)
+ {
+ 	lock_kernel();
+ 	inode->i_blocks += nr << (inode->i_sb->s_blocksize_bits - 9);
+@@ -182,14 +182,14 @@
+ 	return 0;
+ }
+ 
+-extern __inline__ int DQUOT_PREALLOC_BLOCK(struct inode *inode, int nr)
++static __inline__ int DQUOT_PREALLOC_BLOCK(struct inode *inode, int nr)
+ {
+ 	DQUOT_PREALLOC_BLOCK_NODIRTY(inode, nr);
+ 	mark_inode_dirty(inode);
+ 	return 0;
+ }
+ 
+-extern __inline__ int DQUOT_ALLOC_BLOCK_NODIRTY(struct inode *inode, int nr)
++static __inline__ int DQUOT_ALLOC_BLOCK_NODIRTY(struct inode *inode, int nr)
+ {
+ 	lock_kernel();
+ 	inode->i_blocks += nr << (inode->i_sb->s_blocksize_bits - 9);
+@@ -197,21 +197,21 @@
+ 	return 0;
+ }
+ 
+-extern __inline__ int DQUOT_ALLOC_BLOCK(struct inode *inode, int nr)
++static __inline__ int DQUOT_ALLOC_BLOCK(struct inode *inode, int nr)
+ {
+ 	DQUOT_ALLOC_BLOCK_NODIRTY(inode, nr);
+ 	mark_inode_dirty(inode);
+ 	return 0;
+ }
+ 
+-extern __inline__ void DQUOT_FREE_BLOCK_NODIRTY(struct inode *inode, int nr)
++static __inline__ void DQUOT_FREE_BLOCK_NODIRTY(struct inode *inode, int nr)
+ {
+ 	lock_kernel();
+ 	inode->i_blocks -= nr << (inode->i_sb->s_blocksize_bits - 9);
+ 	unlock_kernel();
+ }
+ 
+-extern __inline__ void DQUOT_FREE_BLOCK(struct inode *inode, int nr)
++static __inline__ void DQUOT_FREE_BLOCK(struct inode *inode, int nr)
+ {
+ 	DQUOT_FREE_BLOCK_NODIRTY(inode, nr);
+ 	mark_inode_dirty(inode);
+--- a/include/linux/reiserfs_fs.h	2002-02-25 11:38:14
++++ b/include/linux/reiserfs_fs.h	2026-05-13 20:42:29
+@@ -1574,26 +1574,26 @@
+ 
+ /* stree.c */
+ int B_IS_IN_TREE(const struct buffer_head *);
+-extern inline void copy_short_key (void * to, const void * from);
+-extern inline void copy_item_head(struct item_head * p_v_to, 
++static inline void copy_short_key (void * to, const void * from);
++static inline void copy_item_head(struct item_head * p_v_to, 
+ 								  const struct item_head * p_v_from);
+ 
+ // first key is in cpu form, second - le
+-extern inline int comp_keys (const struct key * le_key, 
+-			     const struct cpu_key * cpu_key);
+-extern inline int  comp_short_keys (const struct key * le_key, 
++static inline int comp_keys (const struct key * le_key, 
++			     const struct cpu_key * cpu_key);
++static inline int  comp_short_keys (const struct key * le_key, 
+ 				    const struct cpu_key * cpu_key);
+-extern inline void le_key2cpu_key (struct cpu_key * to, const struct key * from);
++static inline void le_key2cpu_key (struct cpu_key * to, const struct key * from);
+ 
+ // both are cpu keys
+-extern inline int comp_cpu_keys (const struct cpu_key *, const struct cpu_key *);
+-extern inline int comp_short_cpu_keys (const struct cpu_key *, 
++static inline int comp_cpu_keys (const struct cpu_key *, const struct cpu_key *);
++static inline int comp_short_cpu_keys (const struct cpu_key *, 
+ 				       const struct cpu_key *);
+-extern inline void cpu_key2cpu_key (struct cpu_key *, const struct cpu_key *);
++static inline void cpu_key2cpu_key (struct cpu_key *, const struct cpu_key *);
+ 
+ // both are in le form
+-extern inline int comp_le_keys (const struct key *, const struct key *);
+-extern inline int comp_short_le_keys (const struct key *, const struct key *);
++static inline int comp_le_keys (const struct key *, const struct key *);
++static inline int comp_short_le_keys (const struct key *, const struct key *);
+ 
+ //
+ // get key version from on disk key - kludge
+@@ -1628,7 +1628,7 @@
+ int search_for_position_by_key (struct super_block * p_s_sb, 
+ 								const struct cpu_key * p_s_cpu_key, 
+ 								struct path * p_s_search_path);
+-extern inline void decrement_bcount (struct buffer_head * p_s_bh);
++static inline void decrement_bcount (struct buffer_head * p_s_bh);
+ void decrement_counters_in_path (struct path * p_s_search_path);
+ void pathrelse (struct path * p_s_search_path);
+ int reiserfs_check_path(struct path *p) ;
+--- a/include/linux/sched.h	2002-01-05 12:35:10
++++ b/include/linux/sched.h	2026-05-13 20:57:17
+@@ -755,8 +755,11 @@
+ extern struct mm_struct * start_lazy_tlb(void);
+ extern void end_lazy_tlb(struct mm_struct *mm);
+ 
+-/* mmdrop drops the mm and the page tables */
+-extern inline void FASTCALL(__mmdrop(struct mm_struct *));
++/* mmdrop drops the mm and the page tables. The body lives in
++ * kernel/fork.c; modern GCC treats `static inline ... fn(...);` as
++ * "inline body required" and emits an undefined ref, so declare it as
++ * a plain extern instead. */
++extern void FASTCALL(__mmdrop(struct mm_struct *));
+ static inline void mmdrop(struct mm_struct * mm)
+ {
+ 	if (atomic_dec_and_test(&mm->mm_count))
+--- a/include/linux/sysrq.h	2002-02-25 11:38:14
++++ b/include/linux/sysrq.h	2026-05-13 20:42:29
+@@ -56,7 +56,7 @@
+ struct sysrq_key_op *__sysrq_get_key_op (int key);
+ void __sysrq_put_key_op (int key, struct sysrq_key_op *op_p);
+ 
+-extern __inline__ int
++static __inline__ int
+ __sysrq_swap_key_ops_nolock(int key, struct sysrq_key_op *insert_op_p,
+ 				struct sysrq_key_op *remove_op_p)
+ {
+@@ -70,7 +70,7 @@
+ 	return retval;
+ }
+ 
+-extern __inline__ int
++static __inline__ int
+ __sysrq_swap_key_ops(int key, struct sysrq_key_op *insert_op_p,
+ 				struct sysrq_key_op *remove_op_p) {
+ 	int retval;
+--- a/init/main.c	2002-02-25 11:38:14
++++ b/init/main.c	2026-05-13 21:35:36
+@@ -536,7 +536,7 @@
+ 	unlock_kernel();
+ 	current->need_resched = 1;
+  	cpu_idle();
+-} 
++}
+ 
+ /*
+  *	Activate the first processor.
+@@ -731,7 +731,7 @@
+ 	tc_init();
+ #endif
+ 
+-	/* Networking initialization needs a process context */ 
++	/* Networking initialization needs a process context */
+ 	sock_init();
+ 
+ 	start_context_thread();
+--- a/kernel/exit.c	2002-02-25 11:38:14
++++ b/kernel/exit.c	2026-05-13 20:49:55
+@@ -25,7 +25,9 @@
+ 
+ int getrusage(struct task_struct *, int, struct rusage *);
+ 
+-static void release_task(struct task_struct * p)
++/* Modern GCC errors on `static` here because sched.h:612 has
++ * `extern void release_task(...)`. Keep external linkage. */
++void release_task(struct task_struct * p)
+ {
+ 	if (p != current) {
+ #ifdef CONFIG_SMP
+--- a/kernel/fork.c	2002-02-25 11:38:14
++++ b/kernel/fork.c	2026-05-13 21:36:21
+@@ -249,7 +249,10 @@
+  * is dropped: either by a lazy thread or by
+  * mmput. Free the page directory and the mm.
+  */
+-inline void __mmdrop(struct mm_struct *mm)
++/* Plain (non-inline) so modern GCC C99-inline semantics emit a real
++ * symbol — the prototype in sched.h is extern, callers will link to
++ * this body. */
++void __mmdrop(struct mm_struct *mm)
+ {
+ 	if (mm == &init_mm) BUG();
+ 	pgd_free(mm->pgd);
+--- a/kernel/sched.c	2001-12-21 09:42:04
++++ b/kernel/sched.c	2026-05-13 21:36:19
+@@ -553,7 +553,6 @@
+ 	struct list_head *tmp;
+ 	int this_cpu, c;
+ 
+-
+ 	spin_lock_prefetch(&runqueue_lock);
+ 
+ 	if (!current->active_mm) BUG();
