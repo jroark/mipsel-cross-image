@@ -1,0 +1,19 @@
+# BE-300 PicoGUI identity touch calibration.
+#
+# The BE-300 touch driver (touch_be300.c) already reports calibrated coordinates
+# in screen space, so pgserver only needs an identity affine to pass them
+# through unchanged. This file is shipped to /etc/picogui/calibration when
+# BE300_PICOGUI_DEFAULT_CALIBRATION=1 (the default) so that emulator and CI
+# runs do not block on first-boot interactive calibration.
+#
+# Format follows the picogui tpcal output: 7 whitespace-separated tokens
+#   <a> <b> <c> <d> <e> <f> <denominator>
+# applying the transform
+#   x_screen = (a*x_raw + b*y_raw + c) / denominator
+#   y_screen = (d*x_raw + e*y_raw + f) / denominator
+#
+# Replace this file with `tpcal`'s output after running it interactively on
+# real hardware to capture the panel's actual transform; pgserver overwrites
+# this calibration file when tpcal exits cleanly.
+
+1 0 0 0 1 0 1

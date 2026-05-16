@@ -1,0 +1,24 @@
+// US keymap for Xfbdev, pre-compiled at build time by the host xkbcomp.
+//
+// The `include` directives below resolve against the xkb-data package on
+// the build host (Debian/Ubuntu `xkb-data` installs them under
+// /usr/share/X11/xkb/{keycodes,types,compat,symbols,geometry}/).  Only
+// the resulting binary `us.xkm` is shipped into the rootfs at
+// /usr/share/X11/xkb/compiled/us.xkm; the source rule files are NOT.
+//
+// At runtime Xfbdev locates the compiled keymap via:
+//     -xkbdir /usr/share/X11/xkb/compiled -xkbmap us
+//
+// Inputs (Stowaway keyboard scancodes from kdrive's LinuxKeyboard driver)
+// follow the standard evdev keycode mapping, so pc+us(basic)+inet(evdev)
+// is the right combination.  The Stowaway Fn-modified keys land on the
+// same scancodes as a normal PC keyboard, so no custom symbols overlay
+// is needed.
+
+xkb_keymap {
+    xkb_keycodes  { include "evdev+aliases(qwerty)" };
+    xkb_types     { include "complete" };
+    xkb_compat    { include "complete" };
+    xkb_symbols   { include "pc+us+inet(evdev)" };
+    xkb_geometry  { include "pc(pc104)" };
+};

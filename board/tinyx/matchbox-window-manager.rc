@@ -1,0 +1,16 @@
+# BE-300 matchbox-window-manager runtime config.
+# Installed at /etc/matchbox/matchbox-window-manager.rc by
+# board/tinyx/build_tinyx_rootfs.sh.
+#
+# matchbox-window-manager 1.2 reads simple key=value lines.  We disable
+# the titlebar entirely so the full 240x320 belongs to the active client
+# (xterm in the v1 launch), and pin the default font to the 6x13 PCF we
+# ship under /usr/share/X11/fonts/misc/.
+
+titlebar = 0
+titlebar_font = -misc-fixed-medium-r-normal--13-120-75-75-c-60-iso8859-1
+use_cursor = 1
+display_cursor = 1
+low_hcolor = #000000
+hilight_color = #ffffff
+text_color = #ffffff

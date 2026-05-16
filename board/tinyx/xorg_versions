@@ -1,0 +1,74 @@
+# Version pins for the BE-300 TinyX profile.
+# Sourced by board/tinyx/build_tinyx_rootfs.sh.
+#
+# Comments and blank lines are ignored. Values are intentionally
+# pinned to X.Org modular releases that pair cleanly with
+# xorg-server-1.6.5.901 (the last release with kdrive's Xfbdev
+# server intact).
+
+# Build-time helpers
+UTIL_MACROS=1.19.3
+
+# Protocol header packages (header-only — no compiled code)
+XPROTO=7.0.31
+XEXTPROTO=7.3.0
+KBPROTO=1.0.7
+INPUTPROTO=2.3.2
+FONTSPROTO=2.1.3
+RANDRPROTO=1.5.0
+RENDERPROTO=0.11.1
+FIXESPROTO=5.0
+DAMAGEPROTO=1.2.1
+XCMISCPROTO=1.2.2
+BIGREQSPROTO=1.1.2
+RESOURCEPROTO=1.2.0
+COMPOSITEPROTO=0.4.2
+RECORDPROTO=1.14.2
+XTRANS=1.4.0
+
+# Auth + XCB transport
+XAU=1.0.9
+XDMCP=1.1.3
+XCBPROTO=1.14
+LIBXCB=1.14
+PTHREAD_STUBS=0.4
+
+# Core X11 libraries
+LIBX11=1.6.12
+LIBXEXT=1.3.5
+LIBICE=1.0.10
+LIBSM=1.2.3
+LIBXRENDER=0.9.10
+LIBXFONT=1.5.4
+LIBFONTENC=1.1.4
+LIBXKBFILE=1.1.0
+LIBXPM=3.5.9
+LIBXFIXES=5.0.3
+LIBXI=1.7.10
+LIBXTST=1.2.3
+LIBXT=1.2.1
+LIBXMU=1.1.3
+LIBXAW=1.0.13
+
+# Rendering
+PIXMAN=0.16.6
+
+# XKB tooling (host-only)
+XKBCOMP=1.2.4
+
+# Xorg server (kdrive Xfbdev is intact through 1.6.x; dropped in 1.7+).
+# 1.6.5 is the final 1.6.x stable release on x.org/releases/individual/xserver/.
+XORG_SERVER=1.6.5
+
+# Window manager
+MATCHBOX_COMMON=1.9
+MATCHBOX_WM=1.2
+
+# Terminal (rxvt is fallback only; default builds xterm)
+XTERM=253
+RXVT=2.7.10
+
+# Fonts (PCF bitmaps only; no freetype/TTF/Xft)
+FONT_UTIL=1.3.2
+FONT_MISC_MISC=1.1.2
+FONT_CURSOR_MISC=1.0.3

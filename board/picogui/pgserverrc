@@ -1,0 +1,55 @@
+#
+# BE-300 PicoGUI runtime config.
+#
+# Installed to /etc/picogui/pgserverrc by board/picogui/build_picogui_rootfs.sh.
+# Loaded by `pgserver -c /etc/picogui/pgserverrc`.
+#
+# Format: section header `[name]` then `key = value` lines.  Pgserver reads
+# config keys via get_param_str("section","key",default) — see
+# pg1/server/gcore/configfile.c.  The set of recognized keys is fixed by the
+# pgserver source (no docs); the keys here are taken from grep'ing the
+# upstream tree.
+
+[pgserver]
+# Video driver to load.  Must match a name in pg1/server/gcore/videodrivers.inc
+# (DRV("name", &name_regfunc)).  Without this set, pgserver iterates the
+# table and picks the first one whose init() succeeds, which for our profile
+# is "null" — and then nothing displays.
+video = fbdev
+
+# Initial screen mode: WidthxHeightxDepth.  240x320 RGB565 matches the
+# BE-300 sfb framebuffer.
+mode = 240x320x16
+
+# Space-separated list of input drivers to load (pg1/server/input/input_drivers.c
+# parses this).  Driver names match DRV("name",...) entries in
+# pg1/server/gcore/inputdrivers.inc — we added "evdev" via
+# board/picogui/patch_picogui_sources.py.
+input = evdev
+
+# No `session = ...` — start-picogui launches the requested clients
+# (pgboard, omnibar, canvastst) directly so we can pass per-app args
+# (notably `pgboard /usr/share/pgboard/us_qwerty_scalable_color.kb`).
+
+# Initial themes: pgserver's reload_initial_themes() walks this
+# space-separated list and pgLoadTheme()s each.  aqua is the obligatory
+# pre-OSX glass look every PicoGUI port ships; classique.th stays as a
+# small fallback in case the aqua bitmap textures hit a renderer issue.
+themes = /usr/share/picogui/themes/aqua.th
+
+[video-fbdev]
+# Linux fbdev device.  Default in pg1/server/video/fbdev.c is /dev/fb0
+# already; spelled out here for clarity.
+device = /dev/fb0
+
+[timers]
+# Disable the cursor-hide timer.  Default is 5000ms, which schedules a
+# SIGALRM that fires during select() in net_iteration; on the BE-300 +
+# uClibc-ng + soft-float MIPS soft-float build the sigreturn from that
+# SIGALRM lands the user code on a NULL+8 SEGV (see breadcrumbs in
+# board/picogui/patch_picogui_sources.py:patch_signals_kmsg_dump trace).
+# 0 disables the timer entirely; the cursor stays where it is.
+cursorhide = 0
+backlightoff = 0
+sleep = 0
+vidblank = 0
