@@ -5,10 +5,11 @@
 # (matching the BusyBox build path in build_be300_kernel.sh).
 #
 # Shared Nano-X server mode so launcher, terminal, browser, and soft keyboard
-# can run together as separate client apps.
+# can run together as separate client apps. NX11 is enabled so FLTK/Dillo can
+# link against Nano-X through Microwindows' X11 compatibility layer.
 #
-# No libpng/libjpeg/libfreetype dependencies (we have not cross-built
-# them yet) — only built-in BMP/GIF/PCF/FNT support.
+# No Microwindows libpng/libjpeg/libfreetype dependencies — only built-in
+# BMP/GIF/PCF/FNT support. Dillo supplies its own minimal image path.
 ####################################################################
 ARCH                     = LINUX-MIPS
 SHAREDLIBS               = N
@@ -29,6 +30,7 @@ SCREEN_WIDTH             = 240
 SCREEN_HEIGHT            = 320
 SCREEN_DEPTH             = 16
 SCREEN_PIXTYPE           = MWPF_TRUECOLOR565
+X11HDRLOCATION           = $(MW_DIR_SRC)/nx11/X11-local
 
 ####################################################################
 # Libraries to build
@@ -36,7 +38,7 @@ SCREEN_PIXTYPE           = MWPF_TRUECOLOR565
 MICROWIN                 = N
 NANOX                    = Y
 NUKLEARUI                = N
-NX11                     = N
+NX11                     = Y
 ENGINE                   = N
 TINYWIDGETS              = N
 
@@ -94,9 +96,8 @@ MIPSTOOLSPREFIX          = mipsel-linux-gnu-
 HOSTCC                   = gcc
 
 ####################################################################
-# Pass our musl/mips2 flags via EXTRAFLAGS. -mfpxx overrides Arch.rules's
-# default `-msoft-float` for LINUX-MIPS so we match musl's hard-float ABI
-# (no actual FPU instructions used; mfpxx is float-ABI-flexible). The BE-300
-# touchscreen reports native framebuffer coordinates, so leave them unrotated.
+# Pass the default musl/MIPS2 flags via EXTRAFLAGS. The main build script
+# overrides this for alternate libc/ABI profiles. The BE-300 touchscreen
+# reports native framebuffer coordinates, so leave them unrotated.
 ####################################################################
 EXTRAFLAGS               = -march=mips2 -mfpxx -isystem /work/musl-khdrs/include -DBE300_TOUCHSCREEN=1 -DFLIP_MOUSE_IN_PORTRAIT_MODE=0

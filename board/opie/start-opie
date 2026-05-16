@@ -10,23 +10,13 @@ export QWS_SIZE="240x320"
 export QWS_MOUSE_PROTO="${QWS_MOUSE_PROTO:-TPanel:/dev/input/event1}"
 export QWS_KEYBOARD="${QWS_KEYBOARD:-USB:/dev/input/event0 USB:/dev/input/event2}"
 export OPIE_NO_SOUND=1
+export LD_BIND_NOW=1
 
 /bin/be300-vtmode graphics >/dev/null 2>&1 || true
-trap '/bin/be300-vtmode text >/dev/null 2>&1 || true' EXIT
+[ -w /proc/sys/vm/min_free_kbytes ] && echo 128 >/proc/sys/vm/min_free_kbytes 2>/dev/null || true
+[ -w /proc/sys/vm/drop_caches ] && echo 3 >/proc/sys/vm/drop_caches 2>/dev/null || true
 
 exec </dev/null
 
-: > /tmp/opie.log
-/opt/QtPalmtop/bin/qpe -qws >/tmp/opie.log 2>&1
-rc=$?
-echo "[opie] qpe exited rc=$rc" >/dev/kmsg 2>/dev/null || true
-if [ "$rc" -ne 0 ]; then
-    /bin/be300-vtmode text >/dev/null 2>&1 || true
-    {
-        echo
-        echo "OPIE exited rc=$rc"
-        echo "Last /tmp/opie.log lines:"
-        tail -20 /tmp/opie.log 2>/dev/null
-    } >/dev/tty0 2>/dev/null || true
-fi
-exit "$rc"
+# The 16 MiB profile cannot afford a resident shell while QPE maps Qt/OPIE.
+exec /opt/QtPalmtop/bin/qpe -qws >/dev/kmsg 2>&1

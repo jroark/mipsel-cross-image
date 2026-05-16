@@ -282,6 +282,8 @@ def patch_mouse():
         return
 
     text = strip_be300_fprintf(read_text(path))
+    text = text.replace('\tprintf("\\033[?25l"); fflush(stdout);\n', "")
+    text = text.replace('    printf("\\033[?25l"); fflush(stdout); // VT100 cursor off\n', "")
     text = text.replace(
         "\tif ( n < 0 && errno != EAGAIN )\n"
         "\t    qWarning(\"touch read error %s\", strerror(errno));\n"
@@ -410,6 +412,27 @@ def patch_mouse():
     )
     if old in text and "BE300_TOUCH_MOVE_MIN_DELTA" in text:
         text = text.replace(old, new, 1)
+    old = (
+        "    QSocketNotifier *mouseNotifier;\n"
+        "    mouseNotifier = new QSocketNotifier( mouseFD, QSocketNotifier::Read,\n"
+        "\t\t\t\t\t this );\n"
+        "    connect(mouseNotifier, SIGNAL(activated(int)),this, SLOT(readMouseData()));\n"
+        "\n"
+        "    rtimer = new QTimer( this );\n"
+        "    connect( rtimer, SIGNAL(timeout()), this, SLOT(sendRelease()));\n"
+        "    mouseIdx = 0;\n"
+        "    setFilterSize( 3 );\n"
+    )
+    new = (
+        "    /* BE300_RAW_TPANEL_NO_QOBJECT_CONNECT\n"
+        "       Keep the raw 2.4 touch panel open/configured, but do not install\n"
+        "       Qt signal connections here.  On the BE-300 16 MiB OPIE image this\n"
+        "       old Qt/MIPS path faults inside QObject::connect() before the server\n"
+        "       reaches the launcher.  Touch input can be restored after boot is\n"
+        "       stable. */\n"
+    )
+    if old in text and "BE300_RAW_TPANEL_NO_QOBJECT_CONNECT" not in text:
+        text = text.replace(old, new, 1)
     write_text(path, text)
 
 
@@ -468,6 +491,273 @@ def patch_time64_redirects():
         write_text(path, text.replace(old, new, 1))
 
 
+def patch_be300_locale_paths():
+    path = ROOT / "src/kernel/qapplication_qws.cpp"
+    if path.exists():
+        text = read_text(path)
+        old = (
+            "    setlocale( LC_ALL, \"\" );\t\t// use correct char set mapping\n"
+            "    setlocale( LC_NUMERIC, \"C\" );\t// make sprintf()/scanf() work\n"
+        )
+        new = (
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    setlocale( LC_ALL, \"C\" );\t\t// avoid locale env scanning on 2.4\n"
+            "#else\n"
+            "    setlocale( LC_ALL, \"\" );\t\t// use correct char set mapping\n"
+            "#endif\n"
+            "    setlocale( LC_NUMERIC, \"C\" );\t// make sprintf()/scanf() work\n"
+        )
+        if old in text and "avoid locale env scanning on 2.4" not in text:
+            text = text.replace(old, new, 1)
+            write_text(path, text)
+
+    path = ROOT / "src/tools/qstring.cpp"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+    old = (
+        "#ifdef _WS_QWS_\n"
+        "    QTextCodec* codec = QTextCodec::codecForLocale();\n"
+        "    return codec\n"
+        "\t    ? codec->fromUnicode(*this)\n"
+        "\t    : utf8();\n"
+        "    //return latin1(); // ##### if there is ANY 8 bit format supported?\n"
+        "#endif\n"
+    )
+    new = (
+        "#ifdef _WS_QWS_\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    return latin1();\n"
+        "#else\n"
+        "    QTextCodec* codec = QTextCodec::codecForLocale();\n"
+        "    return codec\n"
+        "\t    ? codec->fromUnicode(*this)\n"
+        "\t    : utf8();\n"
+        "    //return latin1(); // ##### if there is ANY 8 bit format supported?\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    if old in text and "return latin1();\n#else\n    QTextCodec* codec = QTextCodec::codecForLocale();" not in text:
+        text = text.replace(old, new, 1)
+
+    old = (
+        "#ifdef _WS_QWS_\n"
+        "    QTextCodec* codec = QTextCodec::codecForLocale();\n"
+        "    if( len < 0) len = qstrlen(local8Bit);\n"
+        "    return codec\n"
+        "\t    ? codec->toUnicode(local8Bit, len)\n"
+        "\t    : QString::fromUtf8(local8Bit,len);\n"
+        "//    return fromLatin1(local8Bit,len);\n"
+        "#endif\n"
+    )
+    new = (
+        "#ifdef _WS_QWS_\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    return fromLatin1(local8Bit, len);\n"
+        "#else\n"
+        "    QTextCodec* codec = QTextCodec::codecForLocale();\n"
+        "    if( len < 0) len = qstrlen(local8Bit);\n"
+        "    return codec\n"
+        "\t    ? codec->toUnicode(local8Bit, len)\n"
+        "\t    : QString::fromUtf8(local8Bit,len);\n"
+        "//    return fromLatin1(local8Bit,len);\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    if old in text and "return fromLatin1(local8Bit, len);" not in text:
+        text = text.replace(old, new, 1)
+
+    write_text(path, text)
+
+
+def patch_be300_message_output():
+    path = ROOT / "src/tools/qglobal.cpp"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+    if "#include <unistd.h>" not in text:
+        text = text.replace("#include <limits.h>\n", "#include <limits.h>\n#include <unistd.h>\n", 1)
+
+    old = (
+        "static void qtMessageOutput(QtMsgType msgType, const char *msg, va_list ap)\n"
+        "{\n"
+        "    if ( handler ) {\n"
+        "        char buf[1024];\n"
+        "#if (defined __GLIBC__ || (defined __STDC_VERSION__ && __STDC_VERSION__ >= 199901L))\n"
+        " \tvsnprintf(buf, 1024, msg, ap);\n"
+        "#else\n"
+        " \tvsprintf(buf, msg, ap); // vsnprintf would be safer here if all platforms supported it\n"
+        "#endif\n"
+        "\t(*handler)(msgType, buf);\n"
+        "    } else {\n"
+        "#ifdef _OS_MAC_\n"
+        "\tFILE *mac_debug = fopen(\"debug.txt\", \"a+\");\n"
+        "        if (mac_debug) {\n"
+        " \t    vfprintf(mac_debug, msg, ap);\n"
+        " \t    fprintf(mac_debug, \"\\n\"); // add newline\n"
+        " \t    fflush(mac_debug);\n"
+        " \t    fclose(mac_debug);\n"
+        " \t}\n"
+        "#else\n"
+        "        vfprintf(stderr, msg, ap);\n"
+        "        fprintf(stderr, \"\\n\"); // add newline\n"
+        "#endif\n"
+        "\tif (msgType == QtFatalMsg) {\n"
+        "#if defined(_OS_UNIX_) && defined(DEBUG)\n"
+        "\t    abort(); // trap; generates core dump\n"
+        "#else\n"
+        "\t    exit(1); // goodbye cruel world\n"
+        "#endif\n"
+        " \t}\n"
+        "    }\n"
+        "}\n"
+    )
+    new = (
+        "static void qtMessageOutput(QtMsgType msgType, const char *msg, va_list ap)\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    /* BE300_QT_MESSAGE_NO_VFPRINTF\n"
+        "       The 16 MiB Linux 2.4 image has repeatedly crashed in uClibc\n"
+        "       vfprintf while formatting Qt startup diagnostics.  Do not let\n"
+        "       warning text block the server from reaching the launcher. */\n"
+        "    const char *line = msgType == QtFatalMsg ? \"Qt fatal\\n\" :\n"
+        "                       msgType == QtWarningMsg ? \"Qt warning\\n\" :\n"
+        "                       \"Qt debug\\n\";\n"
+        "    unsigned int len = msgType == QtFatalMsg ? 9 :\n"
+        "                       msgType == QtWarningMsg ? 11 : 9;\n"
+        "    (void)msg;\n"
+        "    (void)ap;\n"
+        "    write( 2, line, len );\n"
+        "    if ( msgType == QtFatalMsg )\n"
+        "\texit(1);\n"
+        "    return;\n"
+        "#endif\n"
+        "    if ( handler ) {\n"
+        "        char buf[1024];\n"
+        "#if (defined __GLIBC__ || (defined __STDC_VERSION__ && __STDC_VERSION__ >= 199901L))\n"
+        " \tvsnprintf(buf, 1024, msg, ap);\n"
+        "#else\n"
+        " \tvsprintf(buf, msg, ap); // vsnprintf would be safer here if all platforms supported it\n"
+        "#endif\n"
+        "\t(*handler)(msgType, buf);\n"
+        "    } else {\n"
+        "#ifdef _OS_MAC_\n"
+        "\tFILE *mac_debug = fopen(\"debug.txt\", \"a+\");\n"
+        "        if (mac_debug) {\n"
+        " \t    vfprintf(mac_debug, msg, ap);\n"
+        " \t    fprintf(mac_debug, \"\\n\"); // add newline\n"
+        " \t    fflush(mac_debug);\n"
+        " \t    fclose(mac_debug);\n"
+        " \t}\n"
+        "#else\n"
+        "        vfprintf(stderr, msg, ap);\n"
+        "        fprintf(stderr, \"\\n\"); // add newline\n"
+        "#endif\n"
+        "\tif (msgType == QtFatalMsg) {\n"
+        "#if defined(_OS_UNIX_) && defined(DEBUG)\n"
+        "\t    abort(); // trap; generates core dump\n"
+        "#else\n"
+        "\t    exit(1); // goodbye cruel world\n"
+        "#endif\n"
+        " \t}\n"
+        "    }\n"
+        "}\n"
+    )
+    if old in text and "BE300_QT_MESSAGE_NO_VFPRINTF" not in text:
+        text = text.replace(old, new, 1)
+        write_text(path, text)
+
+
+def patch_be300_qfile_destructor():
+    path = ROOT / "src/tools/qfile.cpp"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+    old = (
+        "QFile::~QFile()\n"
+        "{\n"
+        "    close();\n"
+        "}\n"
+    )
+    new = (
+        "QFile::~QFile()\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    /* BE300_QFILE_DTOR_NO_CLOSE\n"
+        "       QFile::close() returns with the generated destructor's saved\n"
+        "       this pointer clobbered on the 16 MiB Linux 2.4 OPIE image.\n"
+        "       Explicit close() calls still work; the destructor must only\n"
+        "       tear down Qt members. */\n"
+        "    return;\n"
+        "#else\n"
+        "    close();\n"
+        "#endif\n"
+        "}\n"
+    )
+    old_open_only = (
+        "QFile::~QFile()\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    /* BE300_QFILE_DTOR_OPEN_ONLY\n"
+        "       Closed temporary QFile objects were re-entering close(), then\n"
+        "       faulting in generated member destructors on the 16 MiB Linux\n"
+        "       2.4 OPIE image.  Only close live file handles here. */\n"
+        "    if ( isOpen() )\n"
+        "\tclose();\n"
+        "#else\n"
+        "    close();\n"
+        "#endif\n"
+        "}\n"
+    )
+    if old_open_only in text:
+        text = text.replace(old_open_only, new, 1)
+        write_text(path, text)
+    elif old in text and "BE300_QFILE_DTOR_NO_CLOSE" not in text:
+        text = text.replace(old, new, 1)
+        write_text(path, text)
+
+
+def patch_be300_qstring_destructor_null_guard():
+    path = ROOT / "src/tools/qstring.h"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+    old = (
+        "inline QString::~QString()\n"
+        "{\n"
+        "    if ( d->deref() ) {\n"
+        "\tif ( d == shared_null )\n"
+        "\t    shared_null = 0;\n"
+        "\td->deleteSelf();\n"
+        "    }\n"
+        "}\n"
+    )
+    new = (
+        "inline QString::~QString()\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    /* BE300_QSTRING_DTOR_NULL_GUARD\n"
+        "       The 16 MiB Linux 2.4 OPIE image can reach QFile member\n"
+        "       teardown with an already-null QString data pointer. */\n"
+        "    if ( !d )\n"
+        "\treturn;\n"
+        "#endif\n"
+        "    if ( d->deref() ) {\n"
+        "\tif ( d == shared_null )\n"
+        "\t    shared_null = 0;\n"
+        "\td->deleteSelf();\n"
+        "    }\n"
+        "}\n"
+    )
+    if old in text and "BE300_QSTRING_DTOR_NULL_GUARD" not in text:
+        text = text.replace(old, new, 1)
+        write_text(path, text)
+
+
 def patch_widget_regions():
     path = ROOT / "src/kernel/qwidget_qws.cpp"
     if not path.exists():
@@ -488,6 +778,250 @@ def patch_widget_regions():
     if old in text:
         text = text.replace(old, new, 1)
         write_text(path, text)
+
+
+def patch_be300_disable_qws_screensaver():
+    path = ROOT / "src/kernel/qwindowsystem_qws.cpp"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+
+    old = (
+        "void QWSServer::setScreenSaverIntervals(int* ms, int eventBlockLevel)\n"
+        "{\n"
+        "    if ( !qwsServer )\n"
+        "\treturn;\n"
+    )
+    new = (
+        "void QWSServer::setScreenSaverIntervals(int* ms, int eventBlockLevel)\n"
+        "{\n"
+        "    if ( !qwsServer )\n"
+        "\treturn;\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    /* BE300_DISABLE_QWS_SCREENSAVER\n"
+        "       The 2.4/uClibc build uses a synthetic Qt timer source to avoid\n"
+        "       the unsafe gettimeofday wrapper.  That makes inactivity timers\n"
+        "       advance faster than wall time, so keep QWS from blanking the\n"
+        "       framebuffer while Opie is booting. */\n"
+        "    delete [] qwsServer->d->screensaverintervals;\n"
+        "    qwsServer->d->screensaverintervals = 0;\n"
+        "    qwsServer->d->screensavereventblocklevel = -1;\n"
+        "    qwsServer->screensaverinterval = 0;\n"
+        "    qwsServer->d->screensavertimer->stop();\n"
+        "    qt_screen->blank(FALSE);\n"
+        "    extern bool qt_disable_lowpriority_timers;\n"
+        "    qt_disable_lowpriority_timers = FALSE;\n"
+        "    return;\n"
+        "#endif\n"
+    )
+    if old in text and "BE300_DISABLE_QWS_SCREENSAVER" not in text:
+        text = text.replace(old, new, 1)
+    text = text.replace(
+        "    qt_screen->blank(FALSE);\n"
+        "    qt_disable_lowpriority_timers = FALSE;\n"
+        "    return;\n"
+        "#endif\n"
+        "    delete [] qwsServer->d->screensaverintervals;\n",
+        "    qt_screen->blank(FALSE);\n"
+        "    extern bool qt_disable_lowpriority_timers;\n"
+        "    qt_disable_lowpriority_timers = FALSE;\n"
+        "    return;\n"
+        "#endif\n"
+        "    delete [] qwsServer->d->screensaverintervals;\n",
+        1,
+    )
+
+    old = "void QWSServer::screenSaverWake()\n{\n"
+    new = (
+        "void QWSServer::screenSaverWake()\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    if ( d->screensavertimer )\n"
+        "\td->screensavertimer->stop();\n"
+        "    qt_screen->blank(FALSE);\n"
+        "    screensaverinterval = 0;\n"
+        "    d->screensaverblockevents = FALSE;\n"
+        "    qt_disable_lowpriority_timers = FALSE;\n"
+        "    return;\n"
+        "#endif\n"
+    )
+    if old in text and "d->screensavertimer->stop();" not in text[text.find(old):text.find(old) + 260]:
+        text = text.replace(old, new, 1)
+
+    old = "void QWSServer::screenSaverSleep()\n{\n"
+    new = (
+        "void QWSServer::screenSaverSleep()\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    qt_screen->blank(FALSE);\n"
+        "    if ( d->screensavertimer )\n"
+        "\td->screensavertimer->stop();\n"
+        "    screensaverinterval = 0;\n"
+        "    d->screensaverblockevents = FALSE;\n"
+        "    qt_disable_lowpriority_timers = FALSE;\n"
+        "    return;\n"
+        "#endif\n"
+    )
+    if old in text and "void QWSServer::screenSaverSleep()\n{\n#ifdef QT_QWS_CASSIOPEIA" not in text:
+        text = text.replace(old, new, 1)
+
+    old = "void QWSServer::screenSave(int level)\n{\n"
+    new = (
+        "void QWSServer::screenSave(int level)\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    if ( qwsServer )\n"
+        "\tqwsServer->screenSaverWake();\n"
+        "    return;\n"
+        "#endif\n"
+    )
+    if old in text and "void QWSServer::screenSave(int level)\n{\n#ifdef QT_QWS_CASSIOPEIA" not in text:
+        text = text.replace(old, new, 1)
+
+    old = "void QWSServer::screenSaverTimeout()\n{\n"
+    new = (
+        "void QWSServer::screenSaverTimeout()\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    if ( qwsServer )\n"
+        "\tqwsServer->screenSaverWake();\n"
+        "    return;\n"
+        "#endif\n"
+    )
+    if old in text and "void QWSServer::screenSaverTimeout()\n{\n#ifdef QT_QWS_CASSIOPEIA" not in text:
+        text = text.replace(old, new, 1)
+
+    old = "bool QWSServer::screenSaverActive()\n{\n"
+    new = (
+        "bool QWSServer::screenSaverActive()\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    return FALSE;\n"
+        "#endif\n"
+    )
+    if old in text and "bool QWSServer::screenSaverActive()\n{\n#ifdef QT_QWS_CASSIOPEIA" not in text:
+        text = text.replace(old, new, 1)
+
+    old = "void QWSServer::screenSaverActivate(bool activate)\n{\n"
+    new = (
+        "void QWSServer::screenSaverActivate(bool activate)\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    screenSaverWake();\n"
+        "    return;\n"
+        "#endif\n"
+    )
+    if old in text and "void QWSServer::screenSaverActivate(bool activate)\n{\n#ifdef QT_QWS_CASSIOPEIA" not in text:
+        text = text.replace(old, new, 1)
+
+    old = "void QWSServer::restartScreenSaverTimer()\n{\n"
+    new = (
+        "void QWSServer::restartScreenSaverTimer()\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    screenSaverWake();\n"
+        "    return;\n"
+        "#endif\n"
+    )
+    if old in text and "void QWSServer::restartScreenSaverTimer()\n{\n#ifdef QT_QWS_CASSIOPEIA" not in text:
+        text = text.replace(old, new, 1)
+
+    text = text.replace(
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    screenSaverWake();\n"
+        "    return;\n"
+        "#endif\n"
+        "    if ( activate )\n",
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    if ( qwsServer )\n"
+        "\tqwsServer->screenSaverWake();\n"
+        "    return;\n"
+        "#endif\n"
+        "    if ( activate )\n",
+        1,
+    )
+    text = text.replace(
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    screenSaverWake();\n"
+        "    return;\n"
+        "#endif\n"
+        "    if ( qwsServer->screensaverinterval",
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    if ( qwsServer )\n"
+        "\tqwsServer->screenSaverWake();\n"
+        "    return;\n"
+        "#endif\n"
+        "    if ( qwsServer->screensaverinterval",
+        1,
+    )
+
+    write_text(path, text)
+
+
+def patch_metaobject_pools():
+    path = ROOT / "src/kernel/qmetaobject.cpp"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+    old = (
+        "QMetaData *QMetaObject::new_metadata( int numEntries )\n"
+        "{\n"
+        "    return numEntries > 0 ? new QMetaData[numEntries] : 0;\n"
+        "}\n"
+    )
+    new = (
+        "QMetaData *QMetaObject::new_metadata( int numEntries )\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    enum { be300_metadata_pool_entries = 2048 };\n"
+        "    static QMetaData be300_metadata_pool[be300_metadata_pool_entries];\n"
+        "    static int be300_metadata_used = 0;\n"
+        "\n"
+        "    if ( numEntries <= 0 )\n"
+        "\treturn 0;\n"
+        "    if ( be300_metadata_used + numEntries <= be300_metadata_pool_entries ) {\n"
+        "\tQMetaData *data = be300_metadata_pool + be300_metadata_used;\n"
+        "\tbe300_metadata_used += numEntries;\n"
+        "\treturn data;\n"
+        "    }\n"
+        "#endif\n"
+        "    return numEntries > 0 ? new QMetaData[numEntries] : 0;\n"
+        "}\n"
+    )
+    if old in text and "be300_metadata_pool_entries" not in text:
+        text = text.replace(old, new, 1)
+
+    old = (
+        "QMetaData::Access *QMetaObject::new_metaaccess( int numEntries )\n"
+        "{\n"
+        "    return numEntries > 0 ? new QMetaData::Access[numEntries] : 0;\n"
+        "}\n"
+    )
+    new = (
+        "QMetaData::Access *QMetaObject::new_metaaccess( int numEntries )\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    enum { be300_metaaccess_pool_entries = 1024 };\n"
+        "    static QMetaData::Access be300_metaaccess_pool[be300_metaaccess_pool_entries];\n"
+        "    static int be300_metaaccess_used = 0;\n"
+        "\n"
+        "    if ( numEntries <= 0 )\n"
+        "\treturn 0;\n"
+        "    if ( be300_metaaccess_used + numEntries <= be300_metaaccess_pool_entries ) {\n"
+        "\tQMetaData::Access *access = be300_metaaccess_pool + be300_metaaccess_used;\n"
+        "\tbe300_metaaccess_used += numEntries;\n"
+        "\treturn access;\n"
+        "    }\n"
+        "#endif\n"
+        "    return numEntries > 0 ? new QMetaData::Access[numEntries] : 0;\n"
+        "}\n"
+    )
+    if old in text and "be300_metaaccess_pool_entries" not in text:
+        text = text.replace(old, new, 1)
+
+    write_text(path, text)
 
 
 def replace_linuxfb_accel_block(text):
@@ -539,13 +1073,242 @@ def patch_linuxfb_accel():
     write_text(path, text)
 
 
+def patch_be300_stretchblt_integer_scale():
+    path = ROOT / "src/kernel/qgfxraster_qws.cpp"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+
+    if "BE300_STRETCHBLT_INTEGER_SCALE" not in text:
+        old = (
+            "void QGfxRaster<depth,type>::stretchBlt( int rx,int ry,int w,int h,\n"
+            "\t\t\t\t\t int sw,int sh )\n"
+            "{\n"
+            "    if((*optype))\n"
+        )
+        new = (
+            "void QGfxRaster<depth,type>::stretchBlt( int rx,int ry,int w,int h,\n"
+            "\t\t\t\t\t int sw,int sh )\n"
+            "{\n"
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300_STRETCHBLT_INTEGER_SCALE\n"
+            "       Keep 2.4/16 MiB OPIE startup out of libgcc soft-float\n"
+            "       helpers while scaling launcher bitmaps. */\n"
+            "    if ( w <= 0 || h <= 0 || sw <= 0 || sh <= 0 )\n"
+            "\treturn;\n"
+            "    if ( depth != 8 && depth != 16 && depth != 24 && depth != 32 )\n"
+            "\treturn;\n"
+            "#endif\n"
+            "    if((*optype))\n"
+        )
+        if old in text:
+            text = text.replace(old, new, 1)
+
+    old = (
+        "    double xfac=sw;\n"
+        "    xfac=xfac/((double)w);\n"
+        "    double yfac=sh;\n"
+        "    yfac=yfac/((double)h);\n"
+    )
+    new = (
+        "#ifndef QT_QWS_CASSIOPEIA\n"
+        "    double xfac=sw;\n"
+        "    xfac=xfac/((double)w);\n"
+        "    double yfac=sh;\n"
+        "    yfac=yfac/((double)h);\n"
+        "#endif\n"
+    )
+    if old in text and new not in text:
+        text = text.replace(old, new, 1)
+
+    old = "\tint yp=(int) ( ( (double) j )*yfac );\n"
+    new = (
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "\tint yp = ( j * sh ) / h;\n"
+        "#else\n"
+        "\tint yp=(int) ( ( (double) j )*yfac );\n"
+        "#endif\n"
+    )
+    if old in text and new not in text:
+        text = text.replace(old, new, 1)
+
+    old = "\t\tint sp=(int) ( ( (double) loopc )*xfac );\n"
+    new = (
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "\t\tint sp = ( loopc * sw ) / w;\n"
+        "#else\n"
+        "\t\tint sp=(int) ( ( (double) loopc )*xfac );\n"
+        "#endif\n"
+    )
+    if old in text and new not in text:
+        text = text.replace(old, new, 1)
+
+    write_text(path, text)
+
+
+def patch_be300_wait_timer_null_guard():
+    path = ROOT / "src/kernel/qapplication_qws.cpp"
+    if not path.exists():
+        return
+
+    text = read_text(path)
+    old = (
+        "static inline void getTime( timeval &t )\t// get time of day\n"
+        "{\n"
+        "    gettimeofday( &t, 0 );\n"
+        "    while ( t.tv_usec >= 1000000 ) {\t\t// NTP-related fix\n"
+        "\tt.tv_usec -= 1000000;\n"
+        "\tt.tv_sec++;\n"
+        "    }\n"
+        "    while ( t.tv_usec < 0 ) {\n"
+        "\tif ( t.tv_sec > 0 ) {\n"
+        "\t    t.tv_usec += 1000000;\n"
+        "\t    t.tv_sec--;\n"
+        "\t} else {\n"
+        "\t    t.tv_usec = 0;\n"
+        "\t    break;\n"
+        "\t}\n"
+        "    }\n"
+        "}\n"
+    )
+    new = (
+        "static inline void getTime( timeval &t )\t// get time of day\n"
+        "{\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    /* BE300_TIMER_FAKE_GETTIME\n"
+        "       The uClibc gettimeofday wrapper used by the 2.4/16 MiB OPIE\n"
+        "       image clobbers saved registers on this Qt startup path.  Timers\n"
+        "       only need a monotonic source to drive the event loop here. */\n"
+        "    static unsigned int be300_timer_msec = 0;\n"
+        "    be300_timer_msec += 20;\n"
+        "    t.tv_sec = be300_timer_msec / 1000;\n"
+        "    t.tv_usec = ( be300_timer_msec % 1000 ) * 1000;\n"
+        "#else\n"
+        "    gettimeofday( &t, 0 );\n"
+        "    while ( t.tv_usec >= 1000000 ) {\t\t// NTP-related fix\n"
+        "\tt.tv_usec -= 1000000;\n"
+        "\tt.tv_sec++;\n"
+        "    }\n"
+        "    while ( t.tv_usec < 0 ) {\n"
+        "\tif ( t.tv_sec > 0 ) {\n"
+        "\t    t.tv_usec += 1000000;\n"
+        "\t    t.tv_sec--;\n"
+        "\t} else {\n"
+        "\t    t.tv_usec = 0;\n"
+        "\t    break;\n"
+        "\t}\n"
+        "    }\n"
+        "#endif\n"
+        "}\n"
+    )
+    if old in text and "BE300_TIMER_FAKE_GETTIME" not in text:
+        text = text.replace(old, new, 1)
+
+    old = (
+        "\tif ( first ) {\n"
+        "\t    if ( currentTime < watchtime )\t// clock was turned back\n"
+        "\t\trepairTimer( currentTime );\n"
+        "\t    first = FALSE;\n"
+        "\t    watchtime = currentTime;\n"
+        "\t}\n"
+    )
+    new = (
+        "\tif ( first ) {\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "\t    /* BE300_WAIT_TIMER_POINTER_SAFE\n"
+        "\t       Avoid the out-of-line timeval comparison helper during early\n"
+        "\t       OPIE startup; the 2.4/16 MiB image has trapped there with a\n"
+        "\t       null first argument while entering the event loop. */\n"
+        "\t    watchtime = currentTime;\n"
+        "#else\n"
+        "\t    if ( currentTime < watchtime )\t// clock was turned back\n"
+        "\t\trepairTimer( currentTime );\n"
+        "\t    watchtime = currentTime;\n"
+        "#endif\n"
+        "\t    first = FALSE;\n"
+        "\t}\n"
+    )
+    if old in text and "BE300_WAIT_TIMER_POINTER_SAFE" not in text:
+        text = text.replace(old, new, 1)
+
+    old = (
+        "\tTimerInfo *t = timerList->first();\t// first waiting timer\n"
+        "\tif ( currentTime < t->timeout ) {\t// time to wait\n"
+    )
+    new = (
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "\tTimerInfo *t = timerList ? timerList->first() : 0;\t// first waiting timer\n"
+        "\t/* BE300_WAIT_TIMER_NULL_GUARD\n"
+        "\t   The 2.4/16 MiB OPIE image can observe timerList becoming null\n"
+        "\t   between the count() probe and this first() call during startup. */\n"
+        "\tif ( !t ) {\n"
+        "\t    if ( qt_wait_timer_max ) {\n"
+        "\t\ttm = *qt_wait_timer_max;\n"
+        "\t\treturn &tm;\n"
+        "\t    }\n"
+        "\t    return 0;\n"
+        "\t}\n"
+        "#else\n"
+        "\tTimerInfo *t = timerList->first();\t// first waiting timer\n"
+        "#endif\n"
+        "\tif ( currentTime < t->timeout ) {\t// time to wait\n"
+    )
+    if old in text and "BE300_WAIT_TIMER_NULL_GUARD" not in text:
+        text = text.replace(old, new, 1)
+
+    old = "\tif ( currentTime < t->timeout ) {\t// time to wait\n"
+    new = (
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "\tbool be300_timer_wait =\n"
+        "\t    currentTime.tv_sec < t->timeout.tv_sec ||\n"
+        "\t    ( currentTime.tv_sec == t->timeout.tv_sec &&\n"
+        "\t      currentTime.tv_usec < t->timeout.tv_usec );\n"
+        "\tif ( be300_timer_wait ) {\t\t// time to wait\n"
+        "#else\n"
+        "\tif ( currentTime < t->timeout ) {\t// time to wait\n"
+        "#endif\n"
+    )
+    if old in text and "be300_timer_wait" not in text:
+        text = text.replace(old, new, 1)
+
+    old = (
+        "\tif ( qt_wait_timer_max && *qt_wait_timer_max < tm )\n"
+        "\t    tm = *qt_wait_timer_max;\n"
+    )
+    new = (
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "\tif ( qt_wait_timer_max &&\n"
+        "\t     ( qt_wait_timer_max->tv_sec < tm.tv_sec ||\n"
+        "\t       ( qt_wait_timer_max->tv_sec == tm.tv_sec &&\n"
+        "\t\t qt_wait_timer_max->tv_usec < tm.tv_usec ) ) )\n"
+        "\t    tm = *qt_wait_timer_max;\n"
+        "#else\n"
+        "\tif ( qt_wait_timer_max && *qt_wait_timer_max < tm )\n"
+        "\t    tm = *qt_wait_timer_max;\n"
+        "#endif\n"
+    )
+    if old in text and "qt_wait_timer_max->tv_sec" not in text:
+        text = text.replace(old, new, 1)
+
+    write_text(path, text)
+
+
 def main():
     patch_file("src/kernel/qapplication_qws.cpp")
     patch_file("src/kernel/qwindowsystem_qws.cpp")
     patch_time64_redirects()
+    patch_be300_locale_paths()
+    patch_be300_message_output()
+    patch_be300_qfile_destructor()
+    patch_be300_qstring_destructor_null_guard()
+    patch_metaobject_pools()
     patch_mouse()
     patch_widget_regions()
+    patch_be300_disable_qws_screensaver()
     patch_linuxfb_accel()
+    patch_be300_stretchblt_integer_scale()
+    patch_be300_wait_timer_null_guard()
 
 
 if __name__ == "__main__":

@@ -12,23 +12,52 @@ QT_ARCHIVE="$ARCHIVES/qt-embedded-${QT_VERSION}-free.tar.gz"
 OPIE_ARCHIVE="$ARCHIVES/opie-${OPIE_VERSION}.tar.bz2"
 QT_URL="https://download.qt.io/archive/qt/2/qt-embedded-${QT_VERSION}-free.tar.gz"
 OPIE_URL="https://downloads.sourceforge.net/project/opie/opie-${OPIE_VERSION}.tar.bz2"
-QT_SRC="/work/qt-${QT_VERSION}-be300"
 QT_HOST_SRC="/work/qt-${QT_VERSION}-host"
-OPIE_SRC="/work/opie-${OPIE_VERSION}-be300"
 BE300_LIBS="/tmp/be300-opie-libs"
 LOG_DIR="/work/build-opie"
 QT_BUILD_LOG="$LOG_DIR/be300_qte_build.log"
 QT_HOST_BUILD_LOG="$LOG_DIR/be300_qte_host_tools.log"
 OPIE_BUILD_LOG="$LOG_DIR/be300_opie_build.log"
+BE300_LIBC="${BE300_LIBC:-musl}"
 OPIE_CONFIG="${OPIE_CONFIG:-/work/board/opie/opie-be300.config}"
-OPIE_BUILD_STAMP="${OPIE_BUILD_STAMP:-.be300-opie-built-v45}"
+OPIE_BUILD_STAMP="${OPIE_BUILD_STAMP:-.be300-opie-built-v100}"
 OPIE_PROFILE="${OPIE_PROFILE:-base}"
 OPIE_EXTRA_DEFS="${OPIE_EXTRA_DEFS:-}"
 
 CROSS="mipsel-linux-gnu-"
-COMMON_CFLAGS="-march=mips2 -mfpxx -DQT_QWS_CASSIOPEIA ${OPIE_EXTRA_DEFS} -Os -fomit-frame-pointer -specs ${MUSL_SPECS} -isystem ${KHDRS}/include -B/tmp/libgcc_patched -L/tmp/libgcc_patched -I${BE300_LIBS}/include"
+TARGET_CC="${BE300_TARGET_CC:-${CROSS}gcc}"
+TARGET_CXX="${BE300_TARGET_CXX:-${CROSS}g++}"
+TARGET_AR="${BE300_TARGET_AR:-${CROSS}ar}"
+TARGET_RANLIB="${BE300_TARGET_RANLIB:-${CROSS}ranlib}"
+TARGET_STRIP="${BE300_TARGET_STRIP:-${CROSS}strip}"
+TARGET_CROSS_COMPILE="${BE300_TARGET_CROSS_COMPILE:-${CROSS}}"
+ARCH_CFLAGS="${BE300_ARCH_CFLAGS:--march=mips2 -mfpxx}"
+DEFAULT_LIBC_CFLAGS="-specs ${MUSL_SPECS} -isystem ${KHDRS}/include -B/tmp/libgcc_patched -L/tmp/libgcc_patched"
+DEFAULT_LIBC_LDFLAGS="-specs ${MUSL_SPECS} -B/tmp/libgcc_patched -L/tmp/libgcc_patched"
+LIBC_CFLAGS="${BE300_LIBC_CFLAGS:-$DEFAULT_LIBC_CFLAGS}"
+LIBC_LDFLAGS="${BE300_LIBC_LDFLAGS:-$DEFAULT_LIBC_LDFLAGS}"
+OPIE_BIND_NOW_LDFLAGS="${BE300_OPIE_BIND_NOW_LDFLAGS:-}"
+if [ "$BE300_LIBC" = "uclibc" ] && [ -z "$OPIE_BIND_NOW_LDFLAGS" ]; then
+	OPIE_BIND_NOW_LDFLAGS="-Wl,-z,now"
+fi
+OPIE_NO_RELAX_CFLAGS="${BE300_OPIE_NO_RELAX_CFLAGS:-}"
+if [ "$BE300_LIBC" = "uclibc" ] && [ -z "$OPIE_NO_RELAX_CFLAGS" ]; then
+	OPIE_NO_RELAX_CFLAGS="-mno-relax-pic-calls"
+fi
+OPIE_NO_RELAX_LDFLAGS="${BE300_OPIE_NO_RELAX_LDFLAGS:-}"
+if [ "$BE300_LIBC" = "uclibc" ] && [ -z "$OPIE_NO_RELAX_LDFLAGS" ]; then
+	OPIE_NO_RELAX_LDFLAGS="-Wl,--no-relax"
+fi
+if [ "$BE300_LIBC" = "musl" ]; then
+	QT_SRC="/work/qt-${QT_VERSION}-be300"
+	OPIE_SRC="/work/opie-${OPIE_VERSION}-be300"
+else
+	QT_SRC="/work/qt-${QT_VERSION}-be300-${BE300_LIBC}"
+	OPIE_SRC="/work/opie-${OPIE_VERSION}-be300-${BE300_LIBC}"
+fi
+COMMON_CFLAGS="${ARCH_CFLAGS} -DQT_QWS_CASSIOPEIA ${OPIE_EXTRA_DEFS} ${OPIE_NO_RELAX_CFLAGS} -Os -fomit-frame-pointer ${LIBC_CFLAGS} -I${BE300_LIBS}/include"
 COMMON_CXXFLAGS="${COMMON_CFLAGS} -nostdinc++ -std=gnu++98 -fno-exceptions -fno-rtti -fpermissive -Wno-write-strings"
-COMMON_LFLAGS="-specs ${MUSL_SPECS} -B/tmp/libgcc_patched -L/tmp/libgcc_patched -L${BE300_LIBS}/lib"
+COMMON_LFLAGS="${LIBC_LDFLAGS} ${OPIE_BIND_NOW_LDFLAGS} ${OPIE_NO_RELAX_LDFLAGS} -L${BE300_LIBS}/lib"
 COMMON_LIBS="-lbe300cxx -lbe300gcc"
 
 mkdir -p "$LOG_DIR"
@@ -64,13 +93,13 @@ prepare_support_libs() {
 	mkdir -p "$BE300_LIBS/include/sysfs" "$BE300_LIBS/lib"
 	cp /work/board/opie/libsysfs.h "$BE300_LIBS/include/sysfs/libsysfs.h"
 
-	${CROSS}gcc $COMMON_CFLAGS -fPIC -c \
+	${TARGET_CC} $COMMON_CFLAGS -fPIC -c \
 		/work/board/opie/be300_cxx_abi.c -o /tmp/be300_cxx_abi.o
-	${CROSS}ar rcs "$BE300_LIBS/lib/libbe300cxx.a" /tmp/be300_cxx_abi.o
+	${TARGET_AR} rcs "$BE300_LIBS/lib/libbe300cxx.a" /tmp/be300_cxx_abi.o
 
-	${CROSS}gcc $COMMON_CFLAGS -fPIC -c \
+	${TARGET_CC} $COMMON_CFLAGS -fPIC -c \
 		/work/board/opie/be300_sysfs_stub.c -o /tmp/be300_sysfs_stub.o
-	${CROSS}ar rcs "$BE300_LIBS/lib/libsysfs.a" /tmp/be300_sysfs_stub.o
+	${TARGET_AR} rcs "$BE300_LIBS/lib/libsysfs.a" /tmp/be300_sysfs_stub.o
 }
 
 prepare_qt_source() {
@@ -95,10 +124,10 @@ prepare_qt_source() {
 
 write_qt_config() {
 	cat >"$QT_SRC/configs/linux-be300-g++-shared" <<EOF
-# BE-300 mipsel/musl shared Qt/Embedded build.
+# BE-300 mipsel/${BE300_LIBC} shared Qt/Embedded build.
 INTERFACE_DECL_PATH = .
-SYSCONF_CXX = ${CROSS}g++
-SYSCONF_CC = ${CROSS}gcc
+SYSCONF_CXX = ${TARGET_CXX}
+SYSCONF_CC = ${TARGET_CC}
 DASHCROSS =
 SYSCONF_CXXFLAGS_X11 =
 SYSCONF_CXXFLAGS_QT = -I\$(QTDIR)/include
@@ -118,7 +147,7 @@ SYSCONF_LIBS_QT_OPENGL =
 SYSCONF_LFLAGS_OPENGL =
 SYSCONF_LIBS_OPENGL =
 SYSCONF_LIBS_YACC =
-SYSCONF_LINK = ${CROSS}gcc
+SYSCONF_LINK = ${TARGET_CC}
 SYSCONF_LFLAGS = ${COMMON_LFLAGS}
 SYSCONF_LIBS = ${COMMON_LIBS}
 SYSCONF_LFLAGS_SHOBJ = -shared
@@ -128,7 +157,7 @@ SYSCONF_LFLAGS_THREAD =
 SYSCONF_LIBS_THREAD = -lpthread
 SYSCONF_MOC = \$(QTDIR)/bin/moc
 SYSCONF_UIC = \$(QTDIR)/bin/uic
-SYSCONF_LINK_SHLIB = ${CROSS}gcc
+SYSCONF_LINK_SHLIB = ${TARGET_CC}
 SYSCONF_LINK_TARGET_SHARED = lib\$(TARGET).so.\$(VER_MAJ).\$(VER_MIN).\$(VER_PATCH)
 SYSCONF_LINK_LIB_SHARED = \$(SYSCONF_LINK_SHLIB) -shared -Wl,-soname,lib\$(TARGET).so.\$(VER_MAJ) \\
 				     \$(LFLAGS) -o \$(SYSCONF_LINK_TARGET_SHARED) \\
@@ -139,7 +168,7 @@ SYSCONF_LINK_LIB_SHARED = \$(SYSCONF_LINK_SHLIB) -shared -Wl,-soname,lib\$(TARGE
 				 ln -s \$(SYSCONF_LINK_TARGET_SHARED) lib\$(TARGET).so; \\
 				 ln -s \$(SYSCONF_LINK_TARGET_SHARED) lib\$(TARGET).so.\$(VER_MAJ); \\
 				 ln -s \$(SYSCONF_LINK_TARGET_SHARED) lib\$(TARGET).so.\$(VER_MAJ).\$(VER_MIN)
-SYSCONF_AR = ${CROSS}ar cqs
+SYSCONF_AR = ${TARGET_AR} cqs
 SYSCONF_LINK_TARGET_STATIC = lib\$(TARGET).a
 SYSCONF_LINK_LIB_STATIC = rm -f \$(DESTDIR)\$(SYSCONF_LINK_TARGET_STATIC) ; \\
 				 \$(SYSCONF_AR) \$(DESTDIR)\$(SYSCONF_LINK_TARGET_STATIC) \$(OBJECTS) \$(OBJMOC)
@@ -183,11 +212,14 @@ patch_qt_source() {
 		touch "$QT_SRC/.be300-opie-patched-v2"
 	fi
 	write_qt_config
-	python3 - <<'PY'
+	QT_SRC="$QT_SRC" python3 - <<'PY'
+import os
 import re
 from pathlib import Path
 
-path = Path("/work/qt-2.3.10-be300/src/kernel/qwindowsystem_qws.h")
+qt_root = Path(os.environ["QT_SRC"])
+
+path = qt_root / "src/kernel/qwindowsystem_qws.h"
 text = path.read_text()
 needle = "class QWSMouseHandler;\nstruct QWSCommandStruct;\n"
 replacement = (
@@ -200,7 +232,7 @@ if needle in text and replacement not in text:
     text = text.replace(needle, replacement, 1)
 path.write_text(text)
 
-path = Path("/work/qt-2.3.10-be300/src/kernel/qpixmapcache.cpp")
+path = qt_root / "src/kernel/qpixmapcache.cpp"
 text = path.read_text()
 old = "# include <asm/page.h> // PAGE_SIZE,PAGE_MASK,PAGE_ALIGN\n"
 new = (
@@ -215,7 +247,85 @@ if old in text:
     text = text.replace(old, new, 1)
 path.write_text(text)
 
-path = Path("/work/qt-2.3.10-be300/src/kernel/qapplication_qws.cpp")
+path = qt_root / "src/kernel/qimage.cpp"
+text = path.read_text()
+old = "    dst.create(d->newcols, d->newrows, 32);\n    dst.setAlphaBuffer(d->hasAlpha);\n"
+new = (
+    "    int dstcols = d->newcols > 0 ? d->newcols + 1 : d->newcols;\n"
+    "    dst.create(dstcols, d->newrows, 32);\n"
+    "    dst.setAlphaBuffer(d->hasAlpha);\n"
+)
+if old in text and new not in text:
+    text = text.replace(old, new, 1)
+old = "	    nxP = (QRgb*)dst.scanLine(rowswritten++);\n	    fraccoltofill = SCALE;\n"
+new = (
+    "	    nxP = (QRgb*)dst.scanLine(rowswritten++);\n"
+    "	    QRgb *dstend = nxP + d->newcols;\n"
+    "	    fraccoltofill = SCALE;\n"
+)
+if old in text and new not in text:
+    text = text.replace(old, new, 1)
+old = (
+    "		    if (as) {\n"
+    "\t\t\ta /= SCALE;\n"
+    "\t\t\tif ( a > maxval ) a = maxval;\n"
+    "\t\t\t*nxP = qRgba( (int)r, (int)g, (int)b, (int)a );\n"
+    "\t\t    } else {\n"
+    "\t\t\t*nxP = qRgb( (int)r, (int)g, (int)b );\n"
+    "\t\t    }\n"
+    "\t\t    fraccolleft -= fraccoltofill;\n"
+)
+new = (
+    "		    if ( nxP < dstend ) {\n"
+    "\t\t\tif (as) {\n"
+    "\t\t\t    a /= SCALE;\n"
+    "\t\t\t    if ( a > maxval ) a = maxval;\n"
+    "\t\t\t    *nxP = qRgba( (int)r, (int)g, (int)b, (int)a );\n"
+    "\t\t\t} else {\n"
+    "\t\t\t    *nxP = qRgb( (int)r, (int)g, (int)b );\n"
+    "\t\t\t}\n"
+    "\t\t    }\n"
+    "\t\t    fraccolleft -= fraccoltofill;\n"
+)
+if old in text and new not in text:
+    text = text.replace(old, new, 1)
+old = (
+    "\t\tif (as) {\n"
+    "\t\t    a /= SCALE;\n"
+    "\t\t    if ( a > maxval ) a = maxval;\n"
+    "\t\t    *nxP = qRgba( (int)r, (int)g, (int)b, (int)a );\n"
+    "\t\t} else {\n"
+    "\t\t    *nxP = qRgb( (int)r, (int)g, (int)b );\n"
+    "\t\t}\n"
+    "\t    }\n"
+)
+new = (
+    "\t\tif ( nxP < dstend ) {\n"
+    "\t\t    if (as) {\n"
+    "\t\t\ta /= SCALE;\n"
+    "\t\t\tif ( a > maxval ) a = maxval;\n"
+    "\t\t\t*nxP = qRgba( (int)r, (int)g, (int)b, (int)a );\n"
+    "\t\t    } else {\n"
+    "\t\t\t*nxP = qRgb( (int)r, (int)g, (int)b );\n"
+    "\t\t    }\n"
+    "\t\t}\n"
+    "\t    }\n"
+)
+if old in text and new not in text:
+    text = text.replace(old, new, 1)
+old = "    return dst;\n}\n#endif // QT_NO_IMAGE_SMOOTHSCALE\n"
+new = (
+    "    if (dstcols != d->newcols)\n"
+    "\treturn dst.copy(0, 0, d->newcols, d->newrows);\n"
+    "    return dst;\n"
+    "}\n"
+    "#endif // QT_NO_IMAGE_SMOOTHSCALE\n"
+)
+if old in text and new not in text:
+    text = text.replace(old, new, 1)
+path.write_text(text)
+
+path = qt_root / "src/kernel/qapplication_qws.cpp"
 text = path.read_text()
 if "[be300-qt]" not in text:
     text = text.replace(
@@ -244,7 +354,7 @@ if "[be300-qt]" not in text:
     )
     path.write_text(text)
 
-path = Path("/work/qt-2.3.10-be300/src/kernel/qwscursor_qws.cpp")
+path = qt_root / "src/kernel/qwscursor_qws.cpp"
 text = path.read_text()
 old = "    setMouse(QPoint(swidth/2, sheight/2), 0);\n"
 new = "    mousePosition = QPoint(swidth/2, sheight/2);\n"
@@ -265,7 +375,7 @@ if old in text and "if ( !qt_screencursor )" not in text:
     text = text.replace(old, new, 1)
 path.write_text(text)
 
-path = Path("/work/qt-2.3.10-be300/src/kernel/qwindowsystem_qws.cpp")
+path = qt_root / "src/kernel/qwindowsystem_qws.cpp"
 text = path.read_text()
 old = "    qt_screencursor->move(pos.x(),pos.y());\n"
 new = "    if ( qt_screencursor )\n\tqt_screencursor->move(pos.x(),pos.y());\n"
@@ -326,7 +436,7 @@ else:
     path.write_text(text)
 
 for rel in ("include/qvaluestack.h", "src/tools/qvaluestack.h"):
-    path = Path("/work/qt-2.3.10-be300") / rel
+    path = qt_root / rel
     text = path.read_text()
     text = text.replace("this->this->append", "this->append")
     text = text.replace("this->this->remove", "this->remove")
@@ -338,7 +448,7 @@ for rel in ("include/qvaluestack.h", "src/tools/qvaluestack.h"):
     text = text.replace("this->this->remove", "this->remove")
     path.write_text(text)
 
-path = Path("/work/qt-2.3.10-be300/src/kernel/qkeyboard_qws.cpp")
+path = qt_root / "src/kernel/qkeyboard_qws.cpp"
 text = path.read_text()
 old = (
     "    Myinputevent event;\n"
@@ -358,7 +468,7 @@ if old in text and new not in text:
     text = text.replace(old, new, 1)
 path.write_text(text)
 
-path = Path("/work/qt-2.3.10-be300/src/kernel/qwsmouse_qws.cpp")
+path = qt_root / "src/kernel/qwsmouse_qws.cpp"
 text = path.read_text()
 old = (
     "#ifdef QT_QWS_CASSIOPEIA\n"
@@ -555,7 +665,7 @@ PY
 }
 
 build_qt() {
-	if [ ! -f "$QT_SRC/.be300-qt-built-v12" ] || [ ! -f "$QT_SRC/lib/libqte.so.${QT_VERSION}" ]; then
+	if [ ! -f "$QT_SRC/.be300-qt-built-v30" ] || [ ! -f "$QT_SRC/lib/libqte.so.${QT_VERSION}" ]; then
 		echo "=== Building Qt/Embedded ${QT_VERSION} for BE-300 ==="
 		(
 			cd "$QT_SRC"
@@ -570,7 +680,7 @@ build_qt() {
 				-no-xkb -no-sm -no-xft -no-qvfb \
 				>"$QT_BUILD_LOG" 2>&1 || exit 1
 			make -j"$(nproc)" >>"$QT_BUILD_LOG" 2>&1 || exit 1
-			touch "$QT_SRC/.be300-qt-built-v12"
+			touch "$QT_SRC/.be300-qt-built-v30"
 		) || {
 			tail -80 "$QT_BUILD_LOG"
 			exit 1
@@ -585,10 +695,11 @@ build_qt() {
 
 patch_qt_host_source() {
 	cp "$OPIE_SRC/qt/qconfig-qpe.h" "$QT_HOST_SRC/src/tools/qconfig-qpe.h"
-	python3 - <<'PY'
+	QT_HOST_SRC="$QT_HOST_SRC" python3 - <<'PY'
+import os
 from pathlib import Path
 
-root = Path("/work/qt-2.3.10-host")
+root = Path(os.environ["QT_HOST_SRC"])
 
 path = root / "configs/linux-generic-g++-shared"
 text = path.read_text()
@@ -702,12 +813,22 @@ build_qt_host_tools() {
 
 patch_opie_source() {
 	make_generated_tree_writable "$OPIE_SRC"
-	python3 - <<'PY'
+	OPIE_SRC="$OPIE_SRC" python3 - <<'PY'
+import os
 import re
 from pathlib import Path
 
+root = Path(os.environ["OPIE_SRC"])
+
+path = root / "Makefile"
+if path.exists():
+    text = path.read_text()
+    text = text.replace("./scripts/kconfig/conf -s ./config.in",
+                        "./scripts/kconfig/conf -o ./config.in")
+    path.write_text(text)
+
 for rel in ("qmake/include/qvaluestack.h",):
-    path = Path("/work/opie-1.2.5-be300") / rel
+    path = root / rel
     if not path.exists():
         continue
     text = path.read_text()
@@ -721,7 +842,7 @@ for rel in ("qmake/include/qvaluestack.h",):
     text = text.replace("this->this->remove", "this->remove")
     path.write_text(text)
 
-path = Path("/work/opie-1.2.5-be300/library/qpeapplication.cpp")
+path = root / "library/qpeapplication.cpp"
 if path.exists():
     text = path.read_text()
     if "#include <fcntl.h>" not in text:
@@ -762,7 +883,7 @@ if path.exists():
             "    d->loadTextCodecs();\n"
             "    fprintf(stderr, \"[be300-qpeapp] load image codecs\\n\");\n"
             "    d->loadImageCodecs();\n\n"
-            "    fprintf(stderr, \"[be300-qpeapp] set font %s %d\\n\", (const char *)d->fontFamily, d->fontSize);\n"
+            "    fprintf(stderr, \"[be300-qpeapp] set font size=%d\\n\", d->fontSize);\n"
             "    setFont( QFont( d->fontFamily, d->fontSize ) );\n"
             "    fprintf(stderr, \"[be300-qpeapp] font set\\n\");\n",
             1,
@@ -822,7 +943,7 @@ if path.exists():
         )
     path.write_text(text)
 
-path = Path("/work/opie-1.2.5-be300/library/alarmserver.cpp")
+path = root / "library/alarmserver.cpp"
 if path.exists():
     text = path.read_text()
     text = text.replace(
@@ -835,7 +956,7 @@ if path.exists():
     )
     path.write_text(text)
 
-path = Path("/work/opie-1.2.5-be300/library/qmath.c")
+path = root / "library/qmath.c"
 if path.exists():
     text = path.read_text()
     if "#define MAXDOUBLE DBL_MAX" not in text:
@@ -846,12 +967,12 @@ if path.exists():
         )
     path.write_text(text)
 
-path = Path("/work/opie-1.2.5-be300/library/power.cpp")
+path = root / "library/power.cpp"
 if path.exists():
     text = path.read_text().replace("#include <cmath>", "#include <math.h>")
     path.write_text(text)
 
-path = Path("/work/opie-1.2.5-be300/core/pim/todo/tableview.cpp")
+path = root / "core/pim/todo/tableview.cpp"
 if path.exists():
     text = path.read_text()
     text = text.replace("#include <cmath>", "#include <math.h>")
@@ -910,15 +1031,13 @@ for rel, replacements in {
          "QString::number((long)t)"),
     ),
 }.items():
-    path = Path("/work/opie-1.2.5-be300") / rel
+    path = root / rel
     if not path.exists():
         continue
     text = path.read_text()
     for old, new in replacements:
         text = text.replace(old, new)
     path.write_text(text)
-
-root = Path("/work/opie-1.2.5-be300")
 
 path = root / "core/launcher/main.cpp"
 if path.exists():
@@ -1018,6 +1137,39 @@ if path.exists():
             "    BE300_QPE_STAGE(\"create_pidfile\");\n",
             1,
         )
+    text = text.replace(
+        "    char buf[128];\n"
+        "    int n = snprintf(buf, sizeof(buf),\n"
+        "        \"D'oh! qpe got SIG %d code=%d si_addr=%p stage=%s\\n\",\n"
+        "        sig, info ? info->si_code : -1,\n"
+        "        info ? info->si_addr : (void*)0, be300_qpe_stage);\n"
+        "    write(2, buf, n);\n",
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    const char msg[] = \"D'oh! qpe got signal\\n\";\n"
+        "    write(2, msg, sizeof(msg) - 1);\n"
+        "#else\n"
+        "    char buf[128];\n"
+        "    int n = snprintf(buf, sizeof(buf),\n"
+        "        \"D'oh! qpe got SIG %d code=%d si_addr=%p stage=%s\\n\",\n"
+        "        sig, info ? info->si_code : -1,\n"
+        "        info ? info->si_addr : (void*)0, be300_qpe_stage);\n"
+        "    write(2, buf, n);\n"
+        "#endif\n",
+    )
+    text = text.replace(
+        "        sigaction(SIGSEGV, &sa, 0);\n"
+        "        sigaction(SIGBUS, &sa, 0);\n"
+        "        sigaction(SIGILL, &sa, 0);\n"
+        "        sigaction(SIGTERM, &sa, 0);\n"
+        "        sigaction(SIGINT, &sa, 0);\n",
+        "#ifndef QT_QWS_CASSIOPEIA\n"
+        "        sigaction(SIGSEGV, &sa, 0);\n"
+        "        sigaction(SIGBUS, &sa, 0);\n"
+        "        sigaction(SIGILL, &sa, 0);\n"
+        "#endif\n"
+        "        sigaction(SIGTERM, &sa, 0);\n"
+        "        sigaction(SIGINT, &sa, 0);\n",
+    )
     path.write_text(text)
 
 path = root / "core/launcher/serverapp.cpp"
@@ -1345,6 +1497,25 @@ if path.exists():
             "#endif\n",
             1,
         )
+    if "[be300-server] skip AppLauncher" not in text:
+        text = text.replace(
+            "    docList = new DocumentList( serverGui );\n"
+            "    appLauncher = new AppLauncher(this);\n"
+            "    connect(appLauncher, SIGNAL(launched(int,const QString&)), this, SLOT(applicationLaunched(int,const QString&)) );\n"
+            "    connect(appLauncher, SIGNAL(terminated(int,const QString&)), this, SLOT(applicationTerminated(int,const QString&)) );\n"
+            "    connect(appLauncher, SIGNAL(connected(const QString&)), this, SLOT(applicationConnected(const QString&)) );\n",
+            "    docList = new DocumentList( serverGui );\n"
+            "#ifndef QT_QWS_CASSIOPEIA\n"
+            "    appLauncher = new AppLauncher(this);\n"
+            "    connect(appLauncher, SIGNAL(launched(int,const QString&)), this, SLOT(applicationLaunched(int,const QString&)) );\n"
+            "    connect(appLauncher, SIGNAL(terminated(int,const QString&)), this, SLOT(applicationTerminated(int,const QString&)) );\n"
+            "    connect(appLauncher, SIGNAL(connected(const QString&)), this, SLOT(applicationConnected(const QString&)) );\n"
+            "#else\n"
+            "    fprintf(stderr, \"[be300-server] skip AppLauncher\\n\");\n"
+            "    appLauncher = 0;\n"
+            "#endif\n",
+            1,
+        )
     if "[be300-server] skip optional services" not in text:
         text = text.replace(
             "    fprintf(stderr, \"[be300-server] soundServerExited\\n\");\n"
@@ -1420,16 +1591,151 @@ if path.exists():
     )
     path.write_text(text)
 
+path = root / "library/backend/palmtopuidgen.h"
+if path.exists():
+    text = path.read_text(encoding="latin-1")
+    if "BE300 lightweight UidGen" not in text:
+        text = text.replace(
+            "    int generate() const\n"
+            "\t{\n"
+            "\t    int id = sign * (int) ::time(NULL);\n"
+            "\t    while ( ids.contains( id ) ) {\n"
+            "\t\tid += sign;\n"
+            "\n"
+            "\t\t// check for overflow cases; if so, wrap back to beginning of\n"
+            "\t\t// set ( -1 or 1 )\n"
+            "\t\tif ( ( sign == -1 && id > 0 ) || ( sign == 1 && id < 0 ) )\n"
+            "\t\t    id = sign;\n"
+            "\t    }\n"
+            "\t    return id;\n"
+            "\t}\n"
+            "\n"
+            "    void store(int id) { ids.insert(id, TRUE); }\n"
+            "    bool isUnique(int id) const { return (!ids.contains(id)); }\n",
+            "    int generate() const\n"
+            "\t{\n"
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "\t    /* BE300 lightweight UidGen: avoid the global QMap<int,bool>\n"
+            "\t       during early qpe startup on the 16 MiB Linux 2.4 image. */\n"
+            "\t    int id = sign * (int) ::time(NULL);\n"
+            "\t    return id ? id : sign;\n"
+            "#else\n"
+            "\t    int id = sign * (int) ::time(NULL);\n"
+            "\t    while ( ids.contains( id ) ) {\n"
+            "\t\tid += sign;\n"
+            "\n"
+            "\t\t// check for overflow cases; if so, wrap back to beginning of\n"
+            "\t\t// set ( -1 or 1 )\n"
+            "\t\tif ( ( sign == -1 && id > 0 ) || ( sign == 1 && id < 0 ) )\n"
+            "\t\t    id = sign;\n"
+            "\t    }\n"
+            "\t    return id;\n"
+            "#endif\n"
+            "\t}\n"
+            "\n"
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    void store(int) { }\n"
+            "    bool isUnique(int) const { return true; }\n"
+            "#else\n"
+            "    void store(int id) { ids.insert(id, TRUE); }\n"
+            "    bool isUnique(int id) const { return (!ids.contains(id)); }\n"
+            "#endif\n",
+            1,
+        )
+        if "BE300 lightweight UidGen" not in text:
+            pattern = (
+                r"    int generate\(\) const\s*\{\n"
+                r".*?"
+                r"    void store\(int id\) \{ ids\.insert\(id, TRUE\); \}\n"
+                r"    bool isUnique\(int id\) const \{ return \(!ids\.contains\(id\)\); \}\n"
+            )
+            replacement = """    int generate() const
+{
+#ifdef QT_QWS_CASSIOPEIA
+    /* BE300 lightweight UidGen: avoid the global QMap<int,bool>
+       during early qpe startup on the 16 MiB Linux 2.4 image. */
+    int id = sign * (int) ::time(NULL);
+    return id ? id : sign;
+#else
+    int id = sign * (int) ::time(NULL);
+    while ( ids.contains( id ) ) {
+	id += sign;
+
+	// check for overflow cases; if so, wrap back to beginning of
+	// set ( -1 or 1 )
+	if ( ( sign == -1 && id > 0 ) || ( sign == 1 && id < 0 ) )
+	    id = sign;
+    }
+    return id;
+#endif
+}
+
+#ifdef QT_QWS_CASSIOPEIA
+    void store(int) { }
+    bool isUnique(int) const { return true; }
+#else
+    void store(int id) { ids.insert(id, TRUE); }
+    bool isUnique(int id) const { return (!ids.contains(id)); }
+#endif
+"""
+            text, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+            if count != 1:
+                raise RuntimeError("failed to patch BE-300 UidGen")
+    path.write_text(text, encoding="latin-1")
+
+path = root / "library/timestring.cpp"
+if path.exists():
+    text = path.read_text(encoding="latin-1")
+    if "BE300 simple DateFormat::wordDate" not in text:
+        text = text.replace(
+            "QString DateFormat::wordDate(const QDate &d, int v) const\n"
+            "{\n",
+            "QString DateFormat::wordDate(const QDate &d, int v) const\n"
+            "{\n"
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300 simple DateFormat::wordDate: avoid the translated\n"
+            "       QString-heavy path during 16 MiB qpe startup. */\n"
+            "    (void)v;\n"
+            "    QString date;\n"
+            "    date.sprintf(\"%04d-%02d-%02d\", d.year(), d.month(), d.day());\n"
+            "    return date;\n"
+            "#else\n",
+            1,
+        )
+        if "BE300 simple DateFormat::wordDate" not in text:
+            raise RuntimeError("failed to patch BE-300 DateFormat::wordDate")
+    if "BE300 simple DateFormat::wordDate" in text and "#endif\n}\n\n#ifndef QT_NO_DATASTREAM" not in text:
+        text = text.replace(
+            "\n}\n\n#ifndef QT_NO_DATASTREAM\nvoid DateFormat::save(QDataStream &d) const\n",
+            "\n#endif\n}\n\n#ifndef QT_NO_DATASTREAM\nvoid DateFormat::save(QDataStream &d) const\n",
+            1,
+        )
+        if "#endif\n}\n\n#ifndef QT_NO_DATASTREAM" not in text:
+            raise RuntimeError("failed to close BE-300 DateFormat::wordDate")
+    if "BE300 simple DateFormat::wordDate" in text and "#else\n    // for each part of the order" in text.split("void DateFormat::save", 1)[0] and "#endif\n}\n\n#ifndef QT_NO_DATASTREAM" not in text:
+        raise RuntimeError("failed to close BE-300 DateFormat::wordDate")
+    path.write_text(text, encoding="latin-1")
+
 path = root / "library/global.cpp"
 if path.exists():
     text = path.read_text(encoding="latin-1")
-    if "BE300 direct Global::execute" not in text:
+    if "BE300 no-op Global::invoke" not in text:
         text = text.replace(
-            "void Global::execute( const QString &c, const QString& document )\n"
+            "void Global::invoke(const QString &c)\n"
+            "{\n",
+            "void Global::invoke(const QString &c)\n"
             "{\n"
-            "    // ask the server to do the work\n",
-            "void Global::execute( const QString &c, const QString& document )\n"
-            "{\n"
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300 no-op Global::invoke: the 16 MiB Linux 2.4 profile\n"
+            "       boots the desktop first and avoids fork/vfork child launch\n"
+            "       from qpe, which corrupts the parent stack on this target. */\n"
+            "    (void)c;\n"
+            "    return;\n"
+            "#endif\n",
+            1,
+        )
+    if "BE300 no-op Global::execute" not in text:
+        text = text.replace(
             "#ifdef QT_QWS_CASSIOPEIA\n"
             "    /* BE300 direct Global::execute: the lightweight launcher\n"
             "       skips AppLauncher during startup. */\n"
@@ -1440,6 +1746,92 @@ if path.exists():
             "    return;\n"
             "#endif\n"
             "    // ask the server to do the work\n",
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300 no-op Global::execute: application launching is\n"
+            "       disabled while bringing up the 16 MiB OPIE desktop. */\n"
+            "    (void)c;\n"
+            "    (void)document;\n"
+            "    return;\n"
+            "#endif\n"
+            "    // ask the server to do the work\n",
+            1,
+        )
+    if "BE300 no-op Global::execute" not in text and "BE300 direct Global::execute" not in text:
+        text = text.replace(
+            "void Global::execute( const QString &c, const QString& document )\n"
+            "{\n"
+            "    // ask the server to do the work\n",
+            "void Global::execute( const QString &c, const QString& document )\n"
+            "{\n"
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300 no-op Global::execute: application launching is\n"
+            "       disabled while bringing up the 16 MiB OPIE desktop. */\n"
+            "    (void)c;\n"
+            "    (void)document;\n"
+            "    return;\n"
+            "#endif\n"
+            "    // ask the server to do the work\n",
+            1,
+        )
+    if "BE300 no-op Global::invoke" not in text:
+        raise RuntimeError("failed to patch BE-300 Global::invoke")
+    if "BE300 no-op Global::execute" not in text:
+        raise RuntimeError("failed to patch BE-300 Global::execute")
+    if "BE300 simple Global::helpPath" not in text:
+        text = text.replace(
+            "QStringList Global::helpPath()\n"
+            "{\n",
+            "QStringList Global::helpPath()\n"
+            "{\n"
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300 simple Global::helpPath: avoid QString path\n"
+            "       concatenation during 16 MiB qpe startup. */\n"
+            "    return QStringList();\n"
+            "#endif\n",
+            1,
+        )
+    else:
+        text = text.replace(
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300 simple Global::helpPath: avoid QString path\n"
+            "       concatenation during 16 MiB qpe startup. */\n"
+            "    QStringList path;\n"
+            "    return path;\n"
+            "#endif\n",
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "    /* BE300 simple Global::helpPath: avoid QString path\n"
+            "       concatenation during 16 MiB qpe startup. */\n"
+            "    return QStringList();\n"
+            "#endif\n",
+            1,
+        )
+    if "BE300 simple Global::helpPath" not in text:
+        raise RuntimeError("failed to patch BE-300 Global::helpPath")
+    if "BE300 vfork Global::invoke" not in text:
+        text = text.replace(
+            "        pid_t pid = ::fork ( );\n",
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "        /* BE300 vfork Global::invoke: 16 MiB Linux 2.4 has\n"
+            "           shown unstable full-fork returns from qpe.  Build\n"
+            "           child data before vfork and only make syscalls in\n"
+            "           the child before exec/_exit. */\n"
+            "        QString be300ExecPath = qpeDir() + \"/bin/\" + args[0];\n"
+            "        QCString be300ExecPath8 = be300ExecPath.utf8();\n"
+            "        pid_t pid = ::vfork();\n"
+            "#else\n"
+            "        pid_t pid = ::fork ( );\n"
+            "#endif\n",
+            1,
+        )
+        text = text.replace(
+            "            ::execv ( qpeDir ( ) + \"/bin/\" + args [0], (char * const *) args );\n"
+            "            ::execvp ( args [0], (char * const *) args );\n",
+            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "            ::execv ( be300ExecPath8.data(), (char * const *) args );\n"
+            "#else\n"
+            "            ::execv ( qpeDir ( ) + \"/bin/\" + args [0], (char * const *) args );\n"
+            "#endif\n"
+            "            ::execvp ( args [0], (char * const *) args );\n",
             1,
         )
     path.write_text(text, encoding="latin-1")
@@ -3443,10 +3835,15 @@ PY
 	python3 /work/board/opie/patch_opie_sources.py "$OPIE_SRC"
 	if [ ! -f "$OPIE_SRC/.be300-opie-patched" ]; then
 		echo "=== Applying BE-300 OPIE build patches ==="
-		python3 - <<'PY'
+		OPIE_SRC="$OPIE_SRC" \
+		BE300_OPIE_ARCH_CFLAGS="$ARCH_CFLAGS" \
+		BE300_OPIE_TARGET_STRIP="$TARGET_STRIP" \
+			python3 - <<'PY'
+import os
 from pathlib import Path
 
-root = Path("/work/opie-1.2.5-be300")
+root = Path(os.environ["OPIE_SRC"])
+arch_cflags = os.environ.get("BE300_OPIE_ARCH_CFLAGS", "-march=mips2 -mfpxx")
 
 path = root / "config.in"
 text = path.read_text()
@@ -3465,7 +3862,7 @@ text = text.replace(
 )
 text = text.replace(
     '  default "-march=armv4 -mtune=strongarm1100 -mapcs-32 -fexpensive-optimizations -fomit-frame-pointer -O2" if TARGET_IPAQ\n',
-    '  default "-march=mips2 -mfpxx -Os -fomit-frame-pointer" if TARGET_BE300\n'
+    f'  default "{arch_cflags} -Os -fomit-frame-pointer" if TARGET_BE300\n'
     '  default "-march=armv4 -mtune=strongarm1100 -mapcs-32 -fexpensive-optimizations -fomit-frame-pointer -O2" if TARGET_IPAQ\n',
     1,
 )
@@ -3491,7 +3888,7 @@ if "CONFIG_TARGET_BE300" not in text:
         "ifeq ($(STRIP),)\n",
         "ifeq ($(STRIP),)\n"
         "    ifneq ($(CONFIG_TARGET_BE300),)\n"
-        "        STRIP=mipsel-linux-gnu-strip\n"
+        "        STRIP=" + os.environ.get("BE300_OPIE_TARGET_STRIP", "mipsel-linux-gnu-strip") + "\n"
         "    endif\n",
         1,
     )
@@ -3536,7 +3933,7 @@ PY
 MAKEFILE_GENERATOR = UNIX
 TEMPLATE = app
 CONFIG += qt link_prl
-QMAKE_CC = ${CROSS}gcc
+QMAKE_CC = ${TARGET_CC}
 QMAKE_LEX = flex
 QMAKE_LEXFLAGS =
 QMAKE_YACC = yacc
@@ -3549,7 +3946,7 @@ QMAKE_CFLAGS_DEBUG = -g
 QMAKE_CFLAGS_SHLIB = -fPIC
 QMAKE_CFLAGS_YACC = -Wno-unused -Wno-parentheses
 QMAKE_CFLAGS_THREAD = -D_REENTRANT
-QMAKE_CXX = ${CROSS}g++
+QMAKE_CXX = ${TARGET_CXX}
 QMAKE_CXXFLAGS = -pipe -DQWS ${COMMON_CXXFLAGS}
 QMAKE_CXXFLAGS_WARN_ON = \$\$QMAKE_CFLAGS_WARN_ON
 QMAKE_CXXFLAGS_WARN_OFF =
@@ -3568,8 +3965,8 @@ QMAKE_INCDIR_OPENGL =
 QMAKE_LIBDIR_OPENGL =
 QMAKE_INCDIR_QTOPIA = \$(QPEDIR)/include
 QMAKE_LIBDIR_QTOPIA = \$(QPEDIR)/lib
-QMAKE_LINK = ${CROSS}gcc
-QMAKE_LINK_SHLIB = ${CROSS}gcc
+QMAKE_LINK = ${TARGET_CC}
+QMAKE_LINK_SHLIB = ${TARGET_CC}
 QMAKE_LFLAGS = ${COMMON_LFLAGS}
 QMAKE_LFLAGS_RELEASE =
 QMAKE_LFLAGS_DEBUG =
@@ -3589,8 +3986,8 @@ QMAKE_LIBS_QTOPIA = -lqpe -lsysfs
 QMAKE_LIBS_THREAD = -lpthread
 QMAKE_MOC = \$(QTDIR)/bin/moc
 QMAKE_UIC = \$(QTDIR)/bin/uic
-QMAKE_AR = ${CROSS}ar cqs
-QMAKE_RANLIB =
+QMAKE_AR = ${TARGET_AR} cqs
+QMAKE_RANLIB = ${TARGET_RANLIB}
 QMAKE_TAR = tar -cf
 QMAKE_GZIP = gzip -9f
 QMAKE_COPY = cp -f
@@ -3621,9 +4018,22 @@ build_opie() {
 		export CXXFLAGS_EXTRA=
 		export LFLAGS_EXTRA=
 		export LIBS_EXTRA=
-		export STRIP="${CROSS}strip"
+		export STRIP="$TARGET_STRIP"
 		: >"$OPIE_BUILD_LOG"
 		cp "$OPIE_CONFIG" .config
+		for cfg in \
+			CONFIG_TARGET_MACOSX CONFIG_TARGET_C700 CONFIG_TARGET_RAMSES \
+			CONFIG_TARGET_SIMPAD CONFIG_TARGET_YOPY CONFIG_TARGET_HTC \
+			CONFIG_TARGET_64BIT; do
+			if ! grep -q "^${cfg}=\|^# ${cfg} is not set" .config; then
+				echo "# ${cfg} is not set" >> .config
+			fi
+		done
+		if [ "$BE300_LIBC" = "uclibc" ]; then
+			sed -i \
+				"s@^CONFIG_OPTIMIZATIONS=.*@CONFIG_OPTIMIZATIONS=\"${ARCH_CFLAGS} -Os -fomit-frame-pointer\"@" \
+				.config
+		fi
 		rm -f .depends
 		rm -f lib/lib*.so*
 		find . -name .obj -type d -prune -exec rm -rf {} +
@@ -3659,6 +4069,7 @@ build_opie() {
 		' .config >/tmp/be300-opie-config-pruned
 		mv /tmp/be300-opie-config-pruned .config
 		rm -f .depends gen.pro
+		make -C qmake >>"$OPIE_BUILD_LOG" 2>&1 || exit 1
 		find . -name Makefile -type f -print | while read -r mf; do
 			case "$mf" in
 				./Makefile|./qmake/Makefile|./scripts/kconfig/Makefile)
@@ -3670,6 +4081,8 @@ build_opie() {
 			fi
 		done
 		make "$OPIE_SRC/gen.pro" >>"$OPIE_BUILD_LOG" 2>&1 || exit 1
+		make "$QT_SRC/stamp-headers" "$OPIE_SRC/stamp-headers" \
+			>>"$OPIE_BUILD_LOG" 2>&1 || exit 1
 		while read -r dir pro; do
 			[ -n "$dir" ] || continue
 			(
@@ -3810,12 +4223,17 @@ install_opie_rootfs() {
 	mkdir -p "$ROOTFS/lib" "$ROOTFS/etc" "$ROOTFS/opt/QtPalmtop"/{bin,lib,plugins,apps,pics,help,etc,share} \
 		"$ROOTFS/opt/QtPalmtop/lib/fonts" "$ROOTFS/root/Settings"
 
-	if [ ! -e /work/musl-mipsel/lib/ld-musl-mipsel.so.1 ]; then
-		echo "ERROR: musl shared loader missing; rebuild musl with shared support" >&2
+	if [ "$BE300_LIBC" = "musl" ]; then
+		if [ ! -e /work/musl-mipsel/lib/ld-musl-mipsel.so.1 ]; then
+			echo "ERROR: musl shared loader missing; rebuild musl with shared support" >&2
+			exit 1
+		fi
+		cp -a /work/musl-mipsel/lib/ld-musl-mipsel.so.1 "$ROOTFS/lib/"
+		cp -a /work/musl-mipsel/lib/libc.so "$ROOTFS/lib/"
+	elif [ ! -e "$ROOTFS/lib/ld-uClibc.so.0" ]; then
+		echo "ERROR: uClibc-ng runtime missing from rootfs" >&2
 		exit 1
 	fi
-	cp -a /work/musl-mipsel/lib/ld-musl-mipsel.so.1 "$ROOTFS/lib/"
-	cp -a /work/musl-mipsel/lib/libc.so "$ROOTFS/lib/"
 
 	cp -a "$QT_SRC/lib"/libqte.so* "$ROOTFS/opt/QtPalmtop/lib/"
 	for font in fixed_120_50.qpf fixed_120_50_t5.qpf \
@@ -3895,14 +4313,14 @@ FONTDIR
 
 	mkdir -p "$ROOTFS/root/Applications" "$ROOTFS/root/Documents" \
 		"$ROOTFS/root/Settings"
-	${CROSS}gcc $COMMON_CFLAGS /work/board/opie/be300_vtmode.c \
+	${TARGET_CC} $COMMON_CFLAGS $COMMON_LFLAGS /work/board/opie/be300_vtmode.c \
 		-o "$ROOTFS/bin/be300-vtmode"
 	cp /work/board/opie/start-opie "$ROOTFS/bin/start-opie"
 	chmod +x "$ROOTFS/bin/start-opie"
 
 	find "$ROOTFS/opt/QtPalmtop" -type f \( -perm -111 -o -name 'lib*.so*' \) -print |
 		while read -r f; do
-			${CROSS}strip "$f" >/dev/null 2>&1 || true
+			${TARGET_STRIP} "$f" >/dev/null 2>&1 || true
 		done
 
 	du -sh "$ROOTFS" "$ROOTFS/opt/QtPalmtop"

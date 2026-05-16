@@ -1,11 +1,17 @@
 # BE-300 OPIE Profile
 
-This directory contains source overlays for the optional OPIE NAND image:
+This directory contains source overlays for the stock 16 MiB RAM OPIE NAND
+image:
 
 ```sh
 docker-compose run --rm mips-dev bash -c "./build_be300_opie_nand.sh"
 ./bin/be300 --nand linux-4.2.9/be300-opie.nand --speed 0
 ```
+
+The stock profile emits `linux-4.2.9/be300-opie.nand`, uses
+`board/opie/opie-be300.config`, and leaves
+`CONFIG_CASIO_BE300_SDRAM_MB=16` in the generated kernel `.config`. Do not boot
+this image with `--sdram 64`; use the `opie64` image for that emulator mode.
 
 The expanded emulator profile builds the same stack with a larger Opie
 allowlist and a kernel configured for 64 MiB SDRAM:
@@ -29,6 +35,17 @@ commonly shipped by OpenZaurus-era images. The profile trims nonessential
 SysInfo device artwork so the JFFS2 image still fits the fixed rootfs partition.
 It must be booted with the emulator's `--sdram 64` flag so Linux's registered
 memory size matches the emulated hardware.
+
+The 16 MiB profile was last verified on May 2, 2026 with:
+
+```sh
+./bin/be300 --nand linux-4.2.9/be300-opie.nand --speed 0 --detect-stall
+```
+
+The boot registered 16 MiB SDRAM, detected the Samsung 16 MiB NAND, mounted
+JFFS2 from `/dev/mtdblock3`, and displayed the OPIE launcher. The generated
+artifacts were a 16 MiB `be300-opie.nand`, an 11 MiB `rootfs-opie.jffs2`, and a
+4.7 MiB `vmlinux`.
 
 The BE-300 launcher patches force the category tab bar to use equal
 positive-width tabs with direct, high-contrast painting. The stock Opie compact
