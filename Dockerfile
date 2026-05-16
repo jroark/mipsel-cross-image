@@ -31,6 +31,10 @@ RUN apt-get update && apt-get install -y \
     libsdl2-dev \
     ripgrep \
     mtd-utils \
+    autoconf \
+    automake \
+    libtool \
+    m4 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install MIPS and MIPS64 cross-compilers (little-endian)
