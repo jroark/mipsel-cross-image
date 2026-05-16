@@ -60,47 +60,6 @@ index 38902bf..f74f059 100644
  #endif
  }
  
-diff --git a/arch/mips/kernel/vdso.c b/arch/mips/kernel/vdso.c
-index ed2a278..e3d2ef1 100644
---- a/arch/mips/kernel/vdso.c
-+++ b/arch/mips/kernel/vdso.c
-@@ -85,35 +85,8 @@ static unsigned long vdso_addr(unsigned long start)
- 
- int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
- {
--	int ret;
--	unsigned long addr;
--	struct mm_struct *mm = current->mm;
--
--	down_write(&mm->mmap_sem);
--
--	addr = vdso_addr(mm->start_stack);
--
--	addr = get_unmapped_area(NULL, addr, PAGE_SIZE, 0, 0);
--	if (IS_ERR_VALUE(addr)) {
--		ret = addr;
--		goto up_fail;
--	}
--
--	ret = install_special_mapping(mm, addr, PAGE_SIZE,
--				      VM_READ|VM_EXEC|
--				      VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
--				      &vdso_page);
--
--	if (ret)
--		goto up_fail;
--
--	mm->context.vdso = (void *)addr;
--
--up_fail:
--	up_write(&mm->mmap_sem);
--	return ret;
-+	return 0;
- }
--
- const char *arch_vma_name(struct vm_area_struct *vma)
- {
- 	if (vma->vm_mm && vma->vm_start == (long)vma->vm_mm->context.vdso)
 diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
 index 198a314..2ea2874 100644
 --- a/arch/mips/mm/init.c

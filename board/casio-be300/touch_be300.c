@@ -201,10 +201,10 @@ static void be300_touch_report_page(struct be300_touch *t, unsigned page_off)
 
 	piu_decode_page(t, page_off, &x, &y);
 	t->pen_down = true;
-	input_report_key(t->input, BTN_TOUCH, 1);
 	input_report_abs(t->input, ABS_X, x);
 	input_report_abs(t->input, ABS_Y, y);
 	input_report_abs(t->input, ABS_PRESSURE, 1);
+	input_report_key(t->input, BTN_TOUCH, 1);
 	input_sync(t->input);
 }
 

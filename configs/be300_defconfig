@@ -12,8 +12,21 @@ CONFIG_CASIO_BE300=y
 # CONFIG_MODULES is not set
 CONFIG_EMBEDDED=y
 CONFIG_SYSVIPC=y
-# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set
-CONFIG_LOG_BUF_SHIFT=14
+CONFIG_EXPERT=y
+CONFIG_CC_OPTIMIZE_FOR_SIZE=y
+CONFIG_BASE_SMALL=1
+CONFIG_LOG_BUF_SHIFT=12
+# CONFIG_AIO is not set
+# CONFIG_EPOLL is not set
+# CONFIG_SIGNALFD is not set
+# CONFIG_TIMERFD is not set
+# CONFIG_EVENTFD is not set
+# CONFIG_SECCOMP is not set
+# CONFIG_SECCOMP_FILTER is not set
+# CONFIG_ELF_CORE is not set
+# CONFIG_CORE_DUMP_DEFAULT_ELF_HEADERS is not set
+# CONFIG_VM_EVENT_COUNTERS is not set
+# CONFIG_SYSFS_SYSCALL is not set
 
 # Use SLAB instead of SLUB (matches 2.4/2.6 era)
 # CONFIG_SLUB is not set
@@ -24,9 +37,9 @@ CONFIG_BINFMT_ELF=y
 CONFIG_BINFMT_SCRIPT=y
 # CONFIG_BINFMT_MISC is not set
 
-# Block devices — only RAM disk
-CONFIG_BLK_DEV_RAM=y
-CONFIG_BLK_DEV_RAM_SIZE=4096
+# Block devices — NAND browser images do not need ramdisk or CF block drivers.
+# CF boot adds its block stack through configs/be300_cf.config.
+# CONFIG_BLK_DEV_RAM is not set
 # CONFIG_BLK_DEV_INITRD is not set
 # CONFIG_BLK_DEV_LOOP is not set
 
@@ -49,28 +62,39 @@ CONFIG_EARLY_PRINTK=y
 # UART, while printk also mirrors to fbcon during boot. GUI launchers switch
 # the active VT to KD_GRAPHICS before owning /dev/fb0.
 CONFIG_CMDLINE_BOOL=y
-CONFIG_CMDLINE="earlyprintk console=tty0 console=ttyVR0,115200 consoleblank=0 vt.global_cursor_default=0 root=/dev/mtdblock3 rootfstype=jffs2 rootwait ro"
+CONFIG_CMDLINE="earlyprintk console=tty0 consoleblank=0 vt.global_cursor_default=0 root=/dev/mtdblock3 rootfstype=jffs2 rootwait ro"
 
-# Framebuffer — minimal (sfb built into board support)
+# Framebuffer — minimal (sfb built into board support). Nano-X owns /dev/fb0
+# directly, so the 16 MiB browser profile omits fbcon/logo/font payloads.
 CONFIG_FB=y
 CONFIG_FB_CFB_FILLRECT=y
 CONFIG_FB_CFB_COPYAREA=y
 CONFIG_FB_CFB_IMAGEBLIT=y
-CONFIG_FRAMEBUFFER_CONSOLE=y
-CONFIG_FONTS=y
-CONFIG_FONT_8x8=y
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
+# CONFIG_FONTS is not set
+# CONFIG_FONT_8x8 is not set
 # CONFIG_FONT_8x16 is not set
-CONFIG_LOGO=y
+# CONFIG_LOGO is not set
 # CONFIG_LOGO_LINUX_MONO is not set
 # CONFIG_LOGO_LINUX_VGA16 is not set
 # CONFIG_LOGO_LINUX_CLUT224 is not set
 # CONFIG_LOGO_TINYCORE_CLUT224 is not set
-CONFIG_LOGO_LINUX4BE_CLUT224=y
+# CONFIG_LOGO_LINUX4BE_CLUT224 is not set
 
-# Serial: VR41xx SIU. The BE300 emulator's VR4131 SIU at 0xAF000800 is
-# ns16550-compatible and wired to VRIP 9. The mainline VR41xx common code
-# auto-registers a platform device at the right address.
-# CONFIG_SERIAL_8250 is not set
+# Serial: two UARTs, neither a kernel console (console=tty0 stays authoritative
+# so the askfirst shells never read kernel printk as their stdin).
+#  - VR41xx SIU: VR4131 main SIU at 0x0F000800 -> ttyVR0 (--serial0-bridge).
+#    Mainline VR41xx common code auto-registers the platform device.
+#  - 8250: VRC4173 companion dock UART at 0x0A008680 -> ttyS0
+#    (--serial1-bridge). Registered as a polled platform device in
+#    board/casio-be300/setup.c so the same serial command works on the 2.4
+#    kernel (which only drives the VRC4173 UART) too.
+CONFIG_SERIAL_8250=y
+# CONFIG_SERIAL_8250_DEPRECATED_OPTIONS is not set
+# CONFIG_SERIAL_8250_CONSOLE is not set
+CONFIG_SERIAL_8250_NR_UARTS=1
+CONFIG_SERIAL_8250_RUNTIME_UARTS=1
+# CONFIG_SERIAL_8250_EXTENDED is not set
 CONFIG_SERIAL_VR41XX=y
 CONFIG_SERIAL_VR41XX_CONSOLE=y
 
@@ -78,10 +102,10 @@ CONFIG_SERIAL_VR41XX_CONSOLE=y
 CONFIG_PROC_FS=y
 CONFIG_SYSFS=y
 CONFIG_TMPFS=y
-CONFIG_DEVMEM=y
+# CONFIG_DEVMEM is not set
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
-CONFIG_EXT2_FS=y
+# CONFIG_EXT2_FS is not set
 
 # GPIO/GIU: drives the VR41xx GIU GPIO unit AND the per-pin IRQ chips for
 # GIU_IRQ_BASE..GIU_IRQ_LAST. Required so that board/casio-be300/irq.c's
@@ -108,23 +132,30 @@ CONFIG_JFFS2_FS_WRITEBUFFER=y
 CONFIG_NET=y
 CONFIG_PACKET=y
 CONFIG_UNIX=y
+# CONFIG_XFRM is not set
 CONFIG_INET=y
+# CONFIG_INET_XFRM_MODE_TRANSPORT is not set
+# CONFIG_INET_XFRM_MODE_TUNNEL is not set
+# CONFIG_INET_XFRM_MODE_BEET is not set
+# CONFIG_INET_LRO is not set
+# CONFIG_INET_DIAG is not set
 # CONFIG_IPV6 is not set
 CONFIG_NETDEVICES=y
 CONFIG_ETHERNET=y
 CONFIG_NET_VENDOR_8390=y
 CONFIG_NE2000=y
 
-# CompactFlash via pata_platform (drivers/ata/pata_platform.c). Wired up
-# by board/casio-be300/setup.c. SCSI midlayer + sd are required because
-# libata feeds through SCSI.
-CONFIG_ATA=y
-CONFIG_PATA_PLATFORM=y
-CONFIG_SCSI=y
-CONFIG_BLK_DEV_SD=y
-CONFIG_VFAT_FS=y
-CONFIG_NLS_CODEPAGE_437=y
-CONFIG_NLS_ISO8859_1=y
+# CompactFlash/libata/SCSI/VFAT are intentionally excluded from the default
+# NAND browser kernel. build_be300_cf_image.sh merges configs/be300_cf.config
+# when building a CF-root kernel.
+# CONFIG_ATA is not set
+# CONFIG_PATA_PLATFORM is not set
+# CONFIG_SCSI is not set
+# CONFIG_BLK_DEV_SD is not set
+# CONFIG_VFAT_FS is not set
+# CONFIG_NLS is not set
+# CONFIG_NLS_CODEPAGE_437 is not set
+# CONFIG_NLS_ISO8859_1 is not set
 
 # Disable EVERYTHING not needed
 # CONFIG_SOUND is not set
@@ -154,6 +185,7 @@ CONFIG_INPUT_TOUCHSCREEN=y
 # CONFIG_MISC_DEVICES is not set
 # CONFIG_INPUT_MISC is not set
 # CONFIG_NEW_LEDS is not set
+# CONFIG_HW_RANDOM is not set
 CONFIG_RTC_CLASS=y
 CONFIG_RTC_HCTOSYS=y
 CONFIG_RTC_HCTOSYS_DEVICE="rtc0"
@@ -181,6 +213,7 @@ CONFIG_APM_EMULATION=y
 
 # Printk/debug — minimal
 CONFIG_PRINTK=y
-CONFIG_KALLSYMS=y
+# CONFIG_KALLSYMS is not set
 # CONFIG_DEBUG_KERNEL is not set
 # CONFIG_FTRACE is not set
+# CONFIG_SLABINFO is not set

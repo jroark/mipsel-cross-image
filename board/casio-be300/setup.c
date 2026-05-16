@@ -20,10 +20,13 @@
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  */
-#include <linux/ata_platform.h>
 #include <linux/init.h>
 #include <linux/ioport.h>
 #include <linux/platform_device.h>
+#include <linux/serial_8250.h>
+#ifdef CONFIG_ATA
+#include <linux/ata_platform.h>
+#endif
 
 #include <asm/io.h>
 #include <asm/idle.h>
@@ -143,6 +146,7 @@ void prom_putchar(char c)
  * VRC4173_IRQ(0). Probe will fail cleanly when the emulator is invoked
  * without --cf (or with --ne2000, which steals the same window).
  */
+#ifdef CONFIG_ATA
 #define BE300_CF_CMD_PA		0x0a00c170
 #define BE300_CF_CMD_LEN	8
 #define BE300_CF_CTL_PA		0x0a00c376
@@ -178,6 +182,7 @@ static struct platform_device be300_cf_device = {
 		.platform_data = &be300_cf_pdata,
 	},
 };
+#endif
 
 /*
  * NE2000 (NS8390) shares the VRC4173 PCMCIA window with CF; the emulator
@@ -213,6 +218,51 @@ static struct platform_device be300_ne2000_device = {
 };
 
 /*
+ * VRC4173 companion dock UART at PA 0x0A008680 exposed as ttyS0 via the
+ * generic 8250 driver. The emulator models it as an ns16550 with
+ * addr_mult=4, so the register stride is 4 bytes -> regshift = 2.
+ *
+ * irq = 0: run polled, exactly like the 2.4 serial_be300 driver and like
+ * CF on this board. The VRC4173 SIU IRQ multiplexes onto GIU pin 0, which
+ * CF/NE2000 already own (see casio_be300_register_devices below); polled
+ * mode keeps this UART off that contended cascade. uartclk is nominal —
+ * the emulated ns16550 does not rate-limit on the divisor.
+ * UPF_FIXED_TYPE|UPF_SKIP_TEST skips the loopback autoconfig probe that
+ * an emulated UART can fail.
+ *
+ * This UART is also written by prom_putchar() (earlyprintk, TX-only,
+ * stops once a real console is up) and, when CONFIG_KEYBOARD_STOWAWAY is
+ * active, polled by stowaway_serio.c. stowaway_serio uses bare ioremap()
+ * with no request_mem_region(), so there is no resource conflict; the
+ * only real conflict is passing --serial1-bridge together with
+ * --stowaway-keyboard, which is already an unsupported combination (see
+ * the stowaway_serio.c header). This is NOT a kernel console
+ * (console=tty0); inittab runs an askfirst shell on ttyS0.
+ */
+static struct plat_serial8250_port be300_serial8250_ports[] = {
+	{
+		.mapbase	= 0x0a008680,
+		.membase	= (void __iomem *)KSEG1ADDR(0x0a008680),
+		.irq		= 0,
+		.uartclk	= 1843200,
+		.regshift	= 2,
+		.iotype		= UPIO_MEM,
+		.flags		= UPF_BOOT_AUTOCONF | UPF_SKIP_TEST |
+				  UPF_FIXED_TYPE,
+		.type		= PORT_16550A,
+	},
+	{ .flags = 0 },
+};
+
+static struct platform_device be300_serial8250_device = {
+	.name	= "serial8250",
+	.id	= PLAT8250_DEV_PLATFORM,
+	.dev	= {
+		.platform_data = be300_serial8250_ports,
+	},
+};
+
+/*
  * CF and NE2000 share VRC4173_IRQ(0); the emulator makes them mutually
  * exclusive (--cf vs --ne2000). Register both pdevs unconditionally,
  * but only NE2000 carries IORESOURCE_IRQ — pata_platform's resource
@@ -226,7 +276,10 @@ static struct platform_device be300_ne2000_device = {
  */
 static struct platform_device *be300_devices[] __initdata = {
 	&be300_ne2000_device,
+	&be300_serial8250_device,
+#ifdef CONFIG_ATA
 	&be300_cf_device,
+#endif
 };
 
 static int __init casio_be300_register_devices(void)

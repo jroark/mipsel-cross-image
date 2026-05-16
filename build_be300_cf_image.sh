@@ -11,6 +11,7 @@ VMLINUX=${VMLINUX:-"$KERNEL_DIR/vmlinux"}
 OUT=${OUT:-"$KERNEL_DIR/linux_cf.img"}
 BUILD_DIR=${BUILD_DIR:-"$KERNEL_DIR/cf_linux_build"}
 PATCH_SERIES=${PATCH_SERIES:-"$WORK/patches/linux-4.2.9/be300/series"}
+DEFCONFIG=${DEFCONFIG:-"$WORK/configs/be300_defconfig"}
 CF_CONFIG=${CF_CONFIG:-"$WORK/configs/be300_cf.config"}
 SIZE_MIB=${SIZE_MIB:-64}
 FAT_SIZE_MIB=${FAT_SIZE_MIB:-16}
@@ -32,9 +33,19 @@ fi
 
 ensure_kernel_patched() {
 	if grep -q "CASIO_BE300" "$KERNEL_DIR/arch/mips/vr41xx/Kconfig" 2>/dev/null; then
+		if [ -f "$DEFCONFIG" ]; then
+			cp "$DEFCONFIG" "$KERNEL_DIR/arch/mips/configs/be300_defconfig"
+		fi
+		cp "$WORK/board/casio-be300/setup.c" \
+			"$KERNEL_DIR/arch/mips/vr41xx/casio-be300/setup.c"
 		return
 	fi
 	"$WORK/scripts/apply_patch_series.sh" "$PATCH_SERIES" "$KERNEL_DIR"
+	if [ -f "$DEFCONFIG" ]; then
+		cp "$DEFCONFIG" "$KERNEL_DIR/arch/mips/configs/be300_defconfig"
+	fi
+	cp "$WORK/board/casio-be300/setup.c" \
+		"$KERNEL_DIR/arch/mips/vr41xx/casio-be300/setup.c"
 }
 
 prepare_cf_rootfs() {
