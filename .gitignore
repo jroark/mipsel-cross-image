@@ -25,8 +25,10 @@
 /fltk-*-be300/
 /dillo-*-be300/
 /qt-2.3.10-be300/
+/qt-2.3.10-be300-uclibc/
 /qt-2.3.10-host/
 /opie-1.2.5-be300/
+/opie-1.2.5-be300-uclibc/
 /rootfs_be300/
 /rootfs_be300_opie/
 /rootfs_be300_opie64/
@@ -61,8 +63,12 @@
 /mipsel-uclibc-objdump
 /mipsel-uclibc-readelf
 /mipsel-uclibc-nm
+/mipsel-uclibc-g++
 /uclibc-gcc.specs
 /ramdisk-pgui-full.gz
+# Large hardware reference PDFs (kept local only; see docs/hw_notes.txt)
+/docs/Vr4131-um_200203.pdf
+/docs/Vrc4173.pdf
 
 # Generated images, logs, screenshots, and scratch files
 *.nand
@@ -70,6 +76,8 @@
 *.jffs2
 *.ext2
 *.log
+*.log.[0-9]*
+*.log.r[0-9]*
 *.err
 *.out
 screenshot_*.bmp
