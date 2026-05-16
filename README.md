@@ -24,7 +24,7 @@ For deep hardware / porting notes see [`CLAUDE.md`](CLAUDE.md).
 docker-compose build
 ```
 The container provides the `mipsel-linux-gnu` cross toolchain plus the
-utilities needed to build the kernel, musl, and BusyBox.
+utilities needed to build the kernel, musl/uClibc-ng, and BusyBox.
 
 ### 2. Build the BE-300 NAND image
 ```bash
@@ -47,14 +47,12 @@ The kernel command line baked into the NAND image carries `console=tty0`,
 `console=ttyVR0,115200`, `consoleblank=0`, `vt.global_cursor_default=0`, and
 the NAND rootfs arguments.
 
-Kernel messages mirror to both the framebuffer console and the companion-chip
-serial UART, and fbcon displays the 2.6-era Linux4BE 240x80 boot banner before
-userspace starts. The banner is reconstructed from the old 2.6 framebuffer
-capture with its green-channel cast corrected. Serial is listed last, so
-`/dev/console` remains the UART.
-The GUI launchers switch tty0 to `KD_GRAPHICS` before opening `/dev/fb0`, which
-keeps fbcon available for boot/crash text without repainting over the running
-Microwindows or OPIE UI.
+The stock 16 MiB Microwindows browser kernel is built for RAM headroom, so it
+does not include fbcon, the boot logo, or the framebuffer font payload.
+Kernel messages remain available on the companion-chip serial UART, and Nano-X
+opens `/dev/fb0` directly after userspace starts. Re-enable fbcon/logo in
+`configs/be300_defconfig` only when boot-time framebuffer diagnostics matter
+more than browser memory.
 
 To exercise the NE2000 networking smoke test (DHCP + DNS + wget), boot
 with `--ne2000` attached:
@@ -66,6 +64,103 @@ When `--ne2000` is present, `/bin/start-network` brings `eth0` up during
 boot and starts DHCP in the background. Run `/bin/ne2000-net-test` from the
 serial shell for the blocking DHCP/DNS/HTTP smoke test.
 
+The default NAND kernel no longer includes the CompactFlash/libata/SCSI/ext2/
+VFAT/NLS stack. Build `linux-4.2.9/linux_cf.img` with
+`./build_be300_cf_image.sh` when testing the CF recovery/root path.
+
+### Default Microwindows browser
+The default `BE300_UI=microwindows` image now builds Nano-X plus Dillo 3.2.0
+through FLTK 1.3.8 on Microwindows' NXlib X11 compatibility layer. `/bin/mw-browser`
+launches Dillo by default, with no startup URL when no argument is supplied, and
+falls back to the older `/bin/nxweb` smoke-test browser if Dillo is absent or
+`MW_BROWSER_ENGINE=nxweb` is set in the runtime environment.
+
+The Dillo profile is intentionally small and biased toward 16 MiB RAM: HTTP
+browsing is enabled, while TLS, cookies, GIF, JPEG, PNG, WebP, SVG, threaded
+DNS, and XEmbed are disabled. The installed `dillorc` also disables external
+stylesheets, embedded CSS, background images, image loading, persistent HTTP
+connections, and parallel HTTP connections. The build strips installed
+binaries, prunes Dillo docs and large Microwindows font payloads, keeps only
+the browser-oriented Nano-X apps by default, and leaves the serial shell in
+`askfirst` mode so an idle shell is not resident until requested. Build with
+`BE300_BUILD_DILLO=0 ./build_be300_kernel.sh` inside the Docker container to
+skip Dillo while debugging the base Nano-X image.
+
+The BE-300 Dillo build caps decoded page data at 512 KiB by default so a large
+page is rejected before it consumes all RAM. Override the build-time cap with
+`BE300_DILLO_MAX_PAGE_BYTES=<bytes>` if you are testing a larger-memory image.
+
+Stowaway keyboard input depends on Nano-X focus, not only FLTK widget focus.
+The build patches Nano-X so a touch/button-down inside a client moves keyboard
+focus to the window under the pointer before the click is delivered. Dillo is
+also patched so the first unhandled printable key focuses the location entry
+and inserts that key; this lets a hardware keyboard start typing a URL even
+when the page area, rather than the URL field, has FLTK focus. The URL entry
+also handles Enter explicitly so NXlib/FLTK shortcut delivery does not have to
+trigger `FL_WHEN_ENTER_KEY` for the page load to start. Loading external HTTP
+sites still requires booting the emulator with `--ne2000`.
+
+For URL arguments such as `/bin/mw-browser http://frogfind.com/`, the browser
+wrapper waits briefly for DHCP to write `/tmp/resolv.conf` before launching the
+client. The BE-300 Dillo DNS patch also passes service `"80"` to
+`getaddrinfo()` and ignores the returned port, matching the known-working
+`/bin/wget` helper path and avoiding the uClibc-ng NULL-service resolver path.
+
+An experimental dynamic uClibc-ng userspace is available for the Microwindows
+profile:
+```bash
+docker-compose run --rm mips-dev bash -c "BE300_LIBC=uclibc ./build_be300_kernel.sh"
+```
+This keeps the default UI/browser stack but links BusyBox, Nano-X tools, Dillo,
+and helper utilities against uClibc-ng 1.0.51 with `/lib/ld-uClibc.so.0` as the
+runtime loader. It is intended to test whether shared libc text pages reduce
+the resident memory cost of running Nano-X plus browser clients. The profile is
+Microwindows-only for now; OPIE remains on the default musl path. uClibc-ng is
+built in Docker `/tmp` because its dynamic build produces both `.os` and `.oS`
+objects, which collide on the default macOS case-insensitive workspace.
+
+The uClibc-ng profile uses a soft-float ABI for target objects because
+Microwindows contains floating-point transform code. The Debian cross compiler
+has no soft-float multilib, so link warnings about `crtbegin.o`/`libgcc.a`
+being tagged hard-float are expected; some libgcc/math helper paths can still
+contain FPU opcodes and rely on the kernel math emulator if reached. The
+produced BusyBox, Nano-X apps, Dillo, and uClibc runtime report
+`Tag_GNU_MIPS_ABI_FP: Soft float`; the final image scan is clean for
+VR4131-unsupported integer opcodes, including the `movt` instruction that
+previously crashed Dillo at launch.
+
+Known-good Microwindows/Dillo evidence from May 3, 2026:
+`docker compose run --rm mips-dev bash -c "./build_be300_kernel.sh"` produced a
+16 MiB `linux-4.2.9/be300.nand`, an 11 MiB padded
+`linux-4.2.9/rootfs.jffs2`, a 3.9 MiB unpacked `rootfs_be300/`, a 1.6 MiB
+static `/usr/bin/dillo`, and a kernel flat payload of `0x2E95AC` bytes.
+Booting with `./bin/be300 --nand linux-4.2.9/be300.nand --ne2000
+--net-mac 02:de:ad:be:ef:01 --speed 0 --detect-stall` registered 16 MiB RAM
+with `12980K/16384K available`, mounted JFFS2 from `/dev/mtdblock3`, configured
+DHCP on `eth0`, launched Dillo to `http://example.com/`, and exited with
+`[BE300_STALL_SUMMARY] fired=0`.
+
+Known-good dynamic uClibc-ng evidence from May 3, 2026:
+`docker compose run --rm mips-dev bash -c "BE300_LIBC=uclibc ./build_be300_kernel.sh"`
+produced a 16 MiB `linux-4.2.9/be300.nand`, an 11 MiB padded
+`linux-4.2.9/rootfs.jffs2`, a 3.4 MiB unpacked `rootfs_be300/`, dynamic
+`/usr/bin/dillo` at 1.4 MiB, `libuClibc-1.0.51.so` at 540 KiB, and the same
+`0x2E95AC` kernel flat payload. `readelf` showed `/lib/ld-uClibc.so.0` as the
+interpreter for BusyBox, Nano-X tools, and Dillo, with Dillo reporting
+`Tag_GNU_MIPS_ABI_FP: Soft float`. The rootfs scan found no unsupported
+VR4131 integer opcodes, and a targeted scan confirmed the previous crash word
+`00151001` was absent from Dillo, BusyBox, and `libuClibc-1.0.51.so`. After the
+Stowaway URL-entry and uClibc DNS-service patches,
+`BE300_LIBC=uclibc ./build_be300_kernel.sh` rebuilt the 16 MiB NAND with the
+Dillo fallback key path and explicit URL-entry Enter handler present in
+`src/ui.cc`, the `"80"` service `getaddrinfo()` path present in `src/dns.c`,
+`/bin/mw-browser` launching Dillo blank by default and waiting briefly for DHCP
+only when an HTTP(S) URL argument is supplied, and the rootfs opcode scan still
+clean. A temporary diagnostic NAND booted with `--ne2000 --net-mac
+02:de:ad:be:ef:08 --speed 0 --detect-stall`, configured DHCP on `eth0`, and
+confirmed `/bin/wget -T 25 -O /tmp/frogfind.html http://frogfind.com/` fetched
+a 1163-byte response without a stall.
+
 ### Optional OPIE images
 The build can also replace the default Microwindows UI with Qt/Embedded 2.3.10
 and OPIE 1.2.5.
@@ -75,6 +170,13 @@ For the stock 16 MiB RAM profile:
 docker-compose run --rm mips-dev bash -c "./build_be300_opie_nand.sh"
 ./bin/be300 --nand linux-4.2.9/be300-opie.nand --speed 0
 ```
+
+This profile uses the emulator's default 16 MiB SDRAM size and the compact
+`board/opie/opie-be300.config` allowlist. It does not merge
+`configs/be300_64m.config`; a completed stock build should leave
+`CONFIG_CASIO_BE300_SDRAM_MB=16` in `linux-4.2.9/.config`, produce a 16 MiB
+`linux-4.2.9/be300-opie.nand`, and pack an 11 MiB
+`linux-4.2.9/rootfs-opie.jffs2`.
 
 For the expanded emulator-only profile:
 ```bash
@@ -90,6 +192,31 @@ with `--sdram 64`; do not substitute a `mem=` kernel argument.
 The BE-300 launcher also overrides Opie's compact category tab geometry so the
 top tabs remain visible and have positive-width click targets on the 240 pixel
 display.
+
+Known-good 16 MiB OPIE boot evidence from May 2, 2026:
+`./bin/be300 --nand linux-4.2.9/be300-opie.nand --speed 0 --detect-stall`
+registered `memory: 01000000 @ 00000000`, detected the Samsung 16 MiB NAND,
+mounted `rootfs` from `/dev/mtdblock3` as JFFS2, and reached the OPIE launcher.
+
+### 3b. Build an experimental TinyX image
+For the kdrive `Xfbdev` + matchbox-window-manager + terminal profile (real X11
+stack over the BE-300 framebuffer):
+```bash
+docker-compose run --rm mips-dev bash -c "./build_be300_tinyx_nand.sh"
+./bin/be300 --nand linux-4.2.9/be300-tinyx.nand --speed 0 --detect-stall --stowaway-keyboard
+```
+
+This profile fits the 16 MiB stock SDRAM target and defaults to
+`BE300_LIBC=uclibc` dynamic linking. The rootfs builder pulls X.Org
+modular sources (xproto..pixman..xorg-server-1.6.5..matchbox-window-manager-1.2..rxvt-2.7.10 by default, xterm-253 optional)
+into `archives/` on first run, applies `board/tinyx/patch_xorg_sources.py`
+for autoconf modernization, XACE callback lifetime, and kdrive evdev
+touchscreen support. The launcher starts `/bin/be300-fbrefresh` for emulator
+framebuffer dirtying, then `Xfbdev :0 -fb /dev/fb0 -ac -kb -noreset` with the
+touchscreen and Stowaway keyboard event nodes pinned by device name. It also
+pre-compiles a US XKB keymap for future full-XKB experiments and ships PCF
+bitmap fonts only (`6x13`, `fixed`, `cursor`). Inittab launches
+`/bin/start-tinyx` on tty0 with `respawn`; the serial shell stays on ttyVR0.
 
 ### 4. Build a CompactFlash recovery image
 After the NAND build has populated `linux-4.2.9/` and `rootfs_be300/`:
@@ -120,36 +247,49 @@ At a high level:
   from linux-4.2.9 into `/work/musl-khdrs`. musl doesn't ship `linux/*.h`,
   and the older `uclibc-kernel-headers/` set lacks the `__UAPI_DEF_*` guards
   so it collides with musl's own `netinet/in.h`.
-- **Phase 1** — Build BusyBox linked against the BE-300 musl toolchain:
+- **Phase 0b** — When `BE300_LIBC=uclibc`, build dynamic uClibc-ng 1.0.51
+  for MIPS2/soft-float into `/work/uclibc-sysroot`, generate the
+  `/work/mipsel-uclibc-*` wrapper tools, and install its shared runtime into
+  the rootfs. The classic uClibc 2012 source is not carried here; this path uses
+  uClibc-ng from the local archive or downloads it if missing.
+- **Phase 1** — Build BusyBox linked against the selected BE-300 libc toolchain:
   1. `make distclean && defconfig`, keep the selected networking applets used
-     by the NE2000 smoke test, and disable only applets that still need niche
-     headers or unsupported runtime pieces (runit, WTMP/UTMP, NFS/RPC, TC,
-     `FEATURE_SYSLOGD_CFG`).
+     by the NE2000 smoke test, and trim shell/editor/diagnostic/network applets
+     that are not needed by the 16 MiB browser image.
   2. Patch a private copy of `libgcc.a` at `/tmp/libgcc_patched/`: the Debian
      cross toolchain's libgcc is built with `-march=mips32r2` and its 64-bit
      helpers (`__divdi3`, `__moddi3`, `__udivdi3`, `__umoddi3`, `__fixdfdi`,
      `__fixunsdfdi`, `__floatdidf`, `__floatundidf`, `__lshrdi3`, `__ashldi3`,
-     `__ashrdi3`, `__negdi2`) use SPECIAL2 `mul`. Strip those objects and
-     add mips2-compiled replacements from
+     `__ashrdi3`, `__negdi2`) use SPECIAL2 `mul`, while its float/double
+     comparison helpers can use `movf`/`movt`. Strip those objects and add
+     mips2-compiled replacements from
      [`board/casio-be300/libgcc_helpers.c`](board/casio-be300/libgcc_helpers.c).
   3. `make busybox EXTRA_CFLAGS="-march=mips2 ..." EXTRA_LDFLAGS="... -B/tmp/libgcc_patched"`.
-  4. Populate `$ROOTFS` (`bin/busybox`, applet symlinks, `/init → /bin/busybox`,
-     `/etc/inittab` that mounts proc/sys/dev and spawns a shell on tty0).
+     For `BE300_LIBC=uclibc`, BusyBox is dynamically linked and its applet set
+     is trimmed further to avoid unused legacy applets and uClibc-only symbol
+     gaps.
+  4. Populate `$ROOTFS` (`bin/busybox`, the reduced applet symlink set,
+     `/sbin/init -> /bin/busybox`, `/etc/inittab` that mounts proc/sys/dev and
+     starts the serial shell with `askfirst`).
 - **UI profile** — Build the selected user interface into `$ROOTFS`:
-  the default `BE300_UI=microwindows` path builds Nano-X/Microwindows tools,
-  `BE300_UI=opie` builds the curated 16 MiB OPIE profile, and
-  `BE300_UI=opie64` builds the expanded OPIE profile and merges
-  `configs/be300_64m.config`.
+  the default `BE300_UI=microwindows` path builds Nano-X/Microwindows tools and
+  Dillo/FLTK/NXlib unless `BE300_BUILD_DILLO=0` is set, `BE300_UI=opie` builds
+  the curated 16 MiB OPIE profile, and `BE300_UI=opie64` builds the expanded
+  OPIE profile and merges `configs/be300_64m.config`.
 - **Phase 2–3** — Extract linux-4.2.9 and apply
   `patches/linux-4.2.9/be300/series`. The series contains the GCC/UAPI
   compatibility fixes, BE-300 board support, VR41xx TLB/PTE fixes, VR4131
   cache-bug split, 32-bit page-operation forcing, VDSO disable,
   interrupt/GPIO fixes, NE2000 autoprobe suppression, the Linux4BE fbcon logo
-  selection, and `be300_defconfig`. The color-corrected 240x80 logo source lives at
+  selection, and `be300_defconfig`. `build_be300_kernel.sh` then overlays the
+  current `configs/be300_defconfig` and board sources into the extracted tree so
+  the repo config remains the effective build input. The color-corrected 240x80 logo source lives at
   [`board/casio-be300/logo_linux4be_clut224.ppm`](board/casio-be300/logo_linux4be_clut224.ppm)
   and is copied into the extracted kernel tree before configuration.
 - **Phase 5–6** — Configure with `configs/be300_defconfig`
-  from the applied patch series and build `vmlinux`. The kernel mounts the
+  and build `vmlinux`. The default NAND/browser config disables CF/libata/SCSI,
+  ext2/VFAT/NLS, fbcon/logo/fonts, KALLSYMS, ramdisk, old generic syscalls, and
+  other unused kernel paths to keep resident memory low. The kernel mounts the
   JFFS2 root filesystem from NAND mtd3 directly.
 
 ## Repository Layout
@@ -158,6 +298,8 @@ At a high level:
 build_be300_kernel.sh        Full BE-300 build (kernel + musl + BusyBox)
 build_be300_opie_nand.sh     OPIE image for the stock 16 MiB RAM profile
 build_be300_opie64_nand.sh   Emulator OPIE image with 64 MiB SDRAM config
+build_be300_picogui_nand.sh  Experimental PicoGUI image (BusyBox + jserv/picogui)
+build_be300_tinyx_nand.sh    Experimental TinyX image (kdrive Xfbdev + matchbox + terminal)
 build_be300_cf_image.sh      CompactFlash recovery image build
 configs/be300_defconfig      Kernel defconfig
 configs/be300_64m.config     64 MiB BE-300 kernel config overlay
@@ -172,7 +314,10 @@ board/casio-be300/           SPL, CF loader, and userspace helper sources
   test_c_init.c              Diagnostic musl C /init
   test_page2.S               Diagnostic multi-page asm init
   Makefile
+board/microwindows/          Nano-X config, apps, and Dillo rootfs builder
 board/opie/                  Qt/Embedded and OPIE source overlays/configs
+board/picogui/               jserv/picogui server, drivers, configs, builder
+board/tinyx/                 kdrive Xfbdev + matchbox + terminal builder/configs
 bin/be300                    BE-300 emulator (macOS arm64)
 kernels/vmlinux-2.4          Known-good Linux 2.4.18 reference
 kernels/vmlinux-2.6          Known-good Linux 2.6.8.1 reference
@@ -182,7 +327,7 @@ CLAUDE.md                    Deep technical notes and gotchas
 ```
 
 Generated and vendored build trees such as `linux-4.2.9/`, `rootfs_be300/`,
-`musl-*`, `busybox-1.24.2/`, `microwindows/`, `qt-*-be300/`,
+`musl-*`, `uclibc-sysroot/`, `uclibc-kernel-headers/`, `busybox-1.24.2/`, `microwindows/`, `qt-*-be300/`,
 `opie-*-be300/`, and `rootfs_be300*` are ignored locally. Edit the source
 inputs and patch series instead of generated outputs.
 
