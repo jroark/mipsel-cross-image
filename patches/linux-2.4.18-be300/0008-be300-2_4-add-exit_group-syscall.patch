@@ -1,0 +1,77 @@
+BE-300 2.4.18: backport the exit_group(2) syscall (alias of sys_exit).
+
+Root cause of the "every dynamically-linked program dies with
+Trace/breakpoint trap" failure on the BE-300 2.4.18 + uClibc-ng
+userspace (busybox, Opie/qpe, ...):
+
+uClibc-ng 1.0.51's _exit() unconditionally issues syscall 4246
+(exit_group), which was added upstream in Linux 2.5.35. Stock 2.4.18
+has no such syscall, so the call returns -ENOSYS and uClibc-ng falls
+through to its "_exit must never return" guard:
+
+    li   v0, 4246          # __NR_exit_group
+    syscall
+    ...
+    break 0xff             # <- reached on ENOSYS -> SIGTRAP
+
+do_bp() then delivers SIGTRAP, so the shell reports "Trace/breakpoint
+trap" for every process that terminates normally. main()/write()/
+fprintf() all work — only termination traps — which is why the symptom
+looked like a fork/exec or copy_page corruption but was not (a static
+bare-syscall binary using __NR_exit (4001) directly works perfectly).
+
+Confirmed empirically: a one-line do_bp printk showed
+  comm=test_dyn epc=<libuClibc _exit+0x44> op=00ff000d (break 0xff)
+and after this patch the SIGTRAP is gone and qpe/Opie boots through
+its full init to mainloop with zero traps.
+
+Fix: register exit_group at its upstream o32 number (__NR_Linux + 246)
+pointing at sys_exit. For the BE-300 userspace (busybox single-threaded;
+2.4 LinuxThreads are separate tasks anyway) exit_group is semantically
+identical to exit. The 4236..4245 gap is filled with sys_ni_syscall and
+__NR_Linux_syscalls is bumped so the o32 dispatcher bounds check
+(scall_o32.S: sltiu v0, MAX_SYSCALL_NO+1) accepts 4246.
+
+--- a/arch/mips/kernel/syscalls.h
++++ b/arch/mips/kernel/syscalls.h
+@@ -250,3 +250,22 @@
+ SYS(sys_ni_syscall, 0)				/* reserved for removexattr */
+ SYS(sys_ni_syscall, 0)				/* reserved for lremovexattr */
+ SYS(sys_ni_syscall, 0)				/* 4235 res. for fremovexattr */
++SYS(sys_ni_syscall, 0)				/* 4236 */
++SYS(sys_ni_syscall, 0)				/* 4237 */
++SYS(sys_ni_syscall, 0)				/* 4238 */
++SYS(sys_ni_syscall, 0)				/* 4239 */
++SYS(sys_ni_syscall, 0)				/* 4240 */
++SYS(sys_ni_syscall, 0)				/* 4241 */
++SYS(sys_ni_syscall, 0)				/* 4242 */
++SYS(sys_ni_syscall, 0)				/* 4243 */
++SYS(sys_ni_syscall, 0)				/* 4244 */
++SYS(sys_ni_syscall, 0)				/* 4245 */
++/*
++ * BE-300 backport: exit_group (added upstream in 2.5.35) aliased to
++ * sys_exit. uClibc-ng 1.0.51's _exit unconditionally uses exit_group;
++ * on a stock 2.4.18 it returns -ENOSYS and uClibc falls through to a
++ * `break 0xff` guard -> SIGTRAP on every program termination. For the
++ * single-threaded (LinuxThreads = separate tasks) BE-300 userspace,
++ * exit_group is semantically identical to exit.
++ */
++SYS(sys_exit, 1)				/* 4246  exit_group */
+--- a/include/asm-mips/unistd.h
++++ b/include/asm-mips/unistd.h
+@@ -245,11 +245,14 @@
+ #define __NR_removexattr		(__NR_Linux + 233)
+ #define __NR_lremovexattr		(__NR_Linux + 234)
+ #define __NR_fremovexattr		(__NR_Linux + 235)
++/* BE-300 backport: exit_group (upstream 2.5.35) aliased to sys_exit so
++ * uClibc-ng 1.0.51's _exit() works on 2.4.18 (see syscalls.h). */
++#define __NR_exit_group			(__NR_Linux + 246)
+ 
+ /*
+  * Offset of the last Linux flavoured syscall
+  */
+-#define __NR_Linux_syscalls		235
++#define __NR_Linux_syscalls		246
+ 
+ #ifndef _LANGUAGE_ASSEMBLY
+ 

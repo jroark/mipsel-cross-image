@@ -1,0 +1,72 @@
+BE-300 2.4.18: install a default kernel cmdline and fix the serial banner.
+
+The SPL hands off with a0..a3 == 0 (see board/casio-be300/spl_start.S),
+so prom_init() sees argc == 0 and builds an empty arcs_cmdline. Without
+a cmdline the kernel binds /dev/console to the last-registered console
+(BE-300 SIU serial, CONFIG_SERIAL_BE300_CONSOLE=y), so userspace stdout
+goes to the host stderr printk channel instead of the framebuffer VT.
+The fbcon also blanks the LCD after ~60 s of inactivity, which can look
+like a boot failure in late-autostop screenshots.
+
+Install a default cmdline:
+    console=tty0 consoleblank=0 root=/dev/ram rootfstype=ext2 init=/sbin/init
+This matches the prebuilt kernels/vmlinux-2.4 boot behavior (visible
+BusyBox prompt on the LCD). Keep argv-driven cmdline parsing as the
+primary path so a future SPL evolution can override the default.
+
+Also fix drivers/char/serial_be300.c's UART init banner from "tty00" to
+"ttyS0" — the tty_driver.name is already "ttyS" (line 311), so the
+userspace device is /dev/ttyS0; the banner just had a stray legacy
+string. Matches kernels/2.4.log.
+
+--- a/arch/mips/vr41xx/vr4131/casio-be300/prom.c
++++ b/arch/mips/vr41xx/vr4131/casio-be300/prom.c
+@@ -19,8 +19,20 @@
+ #include <asm/addrspace.h>
+ #include <asm/vr41xx.h>
+ 
+-char arcs_cmdline[CL_SIZE];
++/*
++ * Default kernel cmdline for the BE-300 when SPL hands off with
++ * a0..a3 == 0 (the current board/casio-be300/spl_start.S behavior).
++ * console=tty0 routes /dev/console to the framebuffer VT so userspace
++ * lands on the LCD; consoleblank=0 disables the fbcon VT blanker so
++ * the screen does not fade to black during idle. If the SPL ever
++ * evolves to pass a real argv-style cmdline, prom_init() overrides
++ * this default with the SPL-supplied string (see below).
++ */
++#define BE300_DEFAULT_CMDLINE \
++	"console=tty0 consoleblank=0 root=/dev/ram rootfstype=ext2 init=/sbin/init"
+ 
++char arcs_cmdline[CL_SIZE] = BE300_DEFAULT_CMDLINE;
++
+ const char *get_system_type(void)
+ {
+ 	return "NEC_Vr41xx Casio Cassiopeia BE-300";
+@@ -29,8 +41,15 @@
+ void __init prom_init(int argc, char **argv, char **envp)
+ {
+ 	int i;
++	int saw_arg = 0;
+ 
+ 	for (i = 1; i < argc; i++) {
++		if (argv[i] == NULL)
++			continue;
++		if (!saw_arg) {
++			arcs_cmdline[0] = '\0';
++			saw_arg = 1;
++		}
+ 		strcat(arcs_cmdline, argv[i]);
+ 
+ 		if (i < (argc - 1))
+--- a/drivers/char/serial_be300.c
++++ b/drivers/char/serial_be300.c
+@@ -366,7 +366,7 @@
+ 		panic("Cannot allocate IRQ for UART.\n");
+ 	else
+ */	
+-	printk("tty00 at 0xAA008680 (irq = 19) is a NEC D89041F1001 UART\n"); 
++	printk("ttyS0 at 0xAA008680 (irq = 19) is a NEC D89041F1001 UART\n");
+ 	
+ /*	restore_flags(flags);
+ */	

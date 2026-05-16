@@ -1,0 +1,302 @@
+BE-300 2.4.18: emergency printk instrumentation of the mount path.
+
+THROW-AWAY DIAGNOSTIC PATCH.  Sprinkles printk(KERN_EMERG ...) markers
+at every potentially-blocking call from sys_mount down through
+proc_read_super so the last marker on the console identifies which
+call swallowed control flow when `mount -t proc proc /proc` hangs.
+Marker prefix is "BE300DBG:" so it greps cleanly out of the boot log.
+
+Drop (or rename to 0007-DISABLED-mount-debug-printk.patch) once the
+mount stall is fixed and the precise-fix patch lands.
+
+console_loglevel is forced to 15 in proc_root_init() so KERN_EMERG
+(level 0) reaches the BE-300 SIU UART poll-write console path
+regardless of cmdline `loglevel=` settings.  That UART poll path is
+the only proven-working visibility channel on this build (the BE-300
+serial driver's tty layer is broken for userspace write/close, and
+fbcon renders silently — see the build_be300_2_4_kernel.sh rcS notes).
+
+The instrumented call chain matches the proc-mount path:
+
+  sys_mount -> do_mount -> do_add_mount -> do_kern_mount
+                                              -> get_sb_single (FS_SINGLE)
+                                                   -> alloc_super
+                                                   -> grab_super
+                                                        -> down_write(s_umount)
+                                                   -> do_remount_sb
+                                                        -> shrink_dcache_sb
+                                                        -> fsync_super
+                                                        -> s_op->remount_fs
+                                                   -> read_super (first-time)
+                                                        = proc_read_super
+                                                          -> read_lock(tasklist_lock)
+                                                          -> d_alloc_root
+
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -627,13 +627,20 @@
+ static int do_add_mount(struct nameidata *nd, char *type, int flags,
+ 			int mnt_flags, char *name, void *data)
+ {
+-	struct vfsmount *mnt = do_kern_mount(type, flags, name, data);
+-	int err = PTR_ERR(mnt);
++	struct vfsmount *mnt;
++	int err;
+ 
++	printk(KERN_EMERG "BE300DBG: do_add_mount: enter type=%s flags=0x%x\n",
++	       type ? type : "(null)", flags);
++	mnt = do_kern_mount(type, flags, name, data);
++	err = PTR_ERR(mnt);
++	printk(KERN_EMERG "BE300DBG: do_add_mount: do_kern_mount -> %p\n", mnt);
+ 	if (IS_ERR(mnt))
+ 		goto out;
+ 
++	printk(KERN_EMERG "BE300DBG: do_add_mount: before down(&mount_sem)\n");
+ 	down(&mount_sem);
++	printk(KERN_EMERG "BE300DBG: do_add_mount: after  down(&mount_sem)\n");
+ 	/* Something was mounted here while we slept */
+ 	while(d_mountpoint(nd->dentry) && follow_down(&nd->mnt, &nd->dentry))
+ 		;
+@@ -647,11 +654,14 @@
+ 		goto unlock;
+ 
+ 	mnt->mnt_flags = mnt_flags;
++	printk(KERN_EMERG "BE300DBG: do_add_mount: before graft_tree\n");
+ 	err = graft_tree(mnt, nd);
++	printk(KERN_EMERG "BE300DBG: do_add_mount: graft_tree -> %d\n", err);
+ unlock:
+ 	up(&mount_sem);
+ 	mntput(mnt);
+ out:
++	printk(KERN_EMERG "BE300DBG: do_add_mount: exit err=%d\n", err);
+ 	return err;
+ }
+ 
+@@ -708,6 +718,9 @@
+ 	struct nameidata nd;
+ 	int retval = 0;
+ 	int mnt_flags = 0;
++	printk(KERN_EMERG "BE300DBG: do_mount: dev=%s dir=%s type=%s flags=0x%lx\n",
++	       dev_name ? dev_name : "(null)", dir_name ? dir_name : "(null)",
++	       type_page ? type_page : "(null)", flags);
+ 
+ 	/* Discard magic */
+ 	if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
+@@ -746,6 +759,7 @@
+ 		retval = do_add_mount(&nd, type_page, flags, mnt_flags,
+ 				      dev_name, data_page);
+ 	path_release(&nd);
++	printk(KERN_EMERG "BE300DBG: do_mount: exit retval=%d\n", retval);
+ 	return retval;
+ }
+ 
+@@ -754,6 +768,7 @@
+ {
+ 	int retval;
+ 	unsigned long data_page;
++	printk(KERN_EMERG "BE300DBG: sys_mount: enter\n");
+ 	unsigned long type_page;
+ 	unsigned long dev_page;
+ 	char *dir_page;
+@@ -779,6 +794,7 @@
+ 	retval = do_mount((char*)dev_page, dir_page, (char*)type_page,
+ 			  flags, (void*)data_page);
+ 	unlock_kernel();
++	printk(KERN_EMERG "BE300DBG: sys_mount: post do_mount retval=%d\n", retval);
+ 	free_page(data_page);
+ 
+ out3:
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -358,20 +358,24 @@
+ static int grab_super(struct super_block *s)
+ {
+ 	s->s_count++;
++	printk(KERN_EMERG "BE300DBG: grab_super: s=%p s_count=%d before down_write\n", s, s->s_count);
+ 	spin_unlock(&sb_lock);
+ 	down_write(&s->s_umount);
++	printk(KERN_EMERG "BE300DBG: grab_super: s=%p after down_write s_root=%p\n", s, s->s_root);
+ 	if (s->s_root) {
+ 		spin_lock(&sb_lock);
+ 		if (s->s_count > S_BIAS) {
+ 			atomic_inc(&s->s_active);
+ 			s->s_count--;
+ 			spin_unlock(&sb_lock);
++			printk(KERN_EMERG "BE300DBG: grab_super: ok s=%p\n", s);
+ 			return 1;
+ 		}
+ 		spin_unlock(&sb_lock);
+ 	}
+ 	up_write(&s->s_umount);
+ 	put_super(s);
++	printk(KERN_EMERG "BE300DBG: grab_super: FAIL s=%p\n", s);
+ 	return 0;
+ }
+  
+@@ -727,23 +731,32 @@
+ static struct super_block *get_sb_single(struct file_system_type *fs_type,
+ 	int flags, void *data)
+ {
+-	struct super_block * s = alloc_super();
++	struct super_block * s;
++	printk(KERN_EMERG "BE300DBG: get_sb_single: enter fs=%s flags=0x%x\n",
++	       fs_type ? fs_type->name : "(null)", flags);
++	s = alloc_super();
+ 	if (!s)
+ 		return ERR_PTR(-ENOMEM);
++	printk(KERN_EMERG "BE300DBG: get_sb_single: alloc_super -> %p\n", s);
+ 	/*
+ 	 * Get the superblock of kernel-wide instance, but
+ 	 * keep the reference to fs_type.
+ 	 */
+ retry:
+ 	spin_lock(&sb_lock);
++	printk(KERN_EMERG "BE300DBG: get_sb_single: fs_supers_empty=%d\n",
++	       list_empty(&fs_type->fs_supers));
+ 	if (!list_empty(&fs_type->fs_supers)) {
+ 		struct super_block *old;
+ 		old = list_entry(fs_type->fs_supers.next, struct super_block,
+ 				s_instances);
++		printk(KERN_EMERG "BE300DBG: get_sb_single: existing old=%p before grab_super\n", old);
+ 		if (!grab_super(old))
+ 			goto retry;
+ 		destroy_super(s);
++		printk(KERN_EMERG "BE300DBG: get_sb_single: before do_remount_sb old=%p\n", old);
+ 		do_remount_sb(old, flags, data);
++		printk(KERN_EMERG "BE300DBG: get_sb_single: after  do_remount_sb old=%p\n", old);
+ 		return old;
+ 	} else {
+ 		kdev_t dev = get_unnamed_dev();
+@@ -756,8 +769,10 @@
+ 		s->s_flags = flags;
+ 		insert_super(s, fs_type);
+ 		lock_super(s);
++		printk(KERN_EMERG "BE300DBG: get_sb_single: before read_super (first-time)\n");
+ 		if (!fs_type->read_super(s, data, flags & MS_VERBOSE ? 1 : 0))
+ 			goto out_fail;
++		printk(KERN_EMERG "BE300DBG: get_sb_single: after  read_super\n");
+ 		s->s_flags |= MS_ACTIVE;
+ 		unlock_super(s);
+ 		return s;
+@@ -817,25 +832,35 @@
+ int do_remount_sb(struct super_block *sb, int flags, void *data)
+ {
+ 	int retval;
++	printk(KERN_EMERG "BE300DBG: do_remount_sb: enter sb=%p flags=0x%x s_dev=0x%x\n",
++	       sb, flags, sb->s_dev);
+ 	
+ 	if (!(flags & MS_RDONLY) && sb->s_dev && is_read_only(sb->s_dev))
+ 		return -EACCES;
+ 		/*flags |= MS_RDONLY;*/
+ 	if (flags & MS_RDONLY)
+ 		acct_auto_close(sb->s_dev);
++	printk(KERN_EMERG "BE300DBG: do_remount_sb: before shrink_dcache_sb\n");
+ 	shrink_dcache_sb(sb);
++	printk(KERN_EMERG "BE300DBG: do_remount_sb: before fsync_super\n");
+ 	fsync_super(sb);
++	printk(KERN_EMERG "BE300DBG: do_remount_sb: after  fsync_super\n");
+ 	/* If we are remounting RDONLY, make sure there are no rw files open */
+ 	if ((flags & MS_RDONLY) && !(sb->s_flags & MS_RDONLY))
+ 		if (!fs_may_remount_ro(sb))
+ 			return -EBUSY;
+ 	if (sb->s_op && sb->s_op->remount_fs) {
++		printk(KERN_EMERG "BE300DBG: do_remount_sb: before s_op->remount_fs\n");
+ 		lock_super(sb);
+ 		retval = sb->s_op->remount_fs(sb, &flags, data);
+ 		unlock_super(sb);
++		printk(KERN_EMERG "BE300DBG: do_remount_sb: after  s_op->remount_fs rc=%d\n", retval);
+ 		if (retval)
+ 			return retval;
++	} else {
++		printk(KERN_EMERG "BE300DBG: do_remount_sb: no remount_fs op (sb->s_op=%p)\n", sb->s_op);
+ 	}
++	printk(KERN_EMERG "BE300DBG: do_remount_sb: exit ok\n");
+ 	sb->s_flags = (sb->s_flags & ~MS_RMT_MASK) | (flags & MS_RMT_MASK);
+ 
+ 	/*
+@@ -852,6 +877,8 @@
+ 	struct file_system_type * fstype;
+ 	struct vfsmount *mnt = NULL;
+ 	struct super_block *sb;
++	printk(KERN_EMERG "BE300DBG: do_kern_mount: enter type=%s name=%s\n",
++	       type ? type : "(null)", name ? name : "(null)");
+ 
+ 	if (!type || !memchr(type, 0, PAGE_SIZE))
+ 		return ERR_PTR(-EINVAL);
+@@ -873,12 +900,18 @@
+ 	}
+ 	set_devname(mnt, name);
+ 	/* get locked superblock */
+-	if (fstype->fs_flags & FS_REQUIRES_DEV)
++	if (fstype->fs_flags & FS_REQUIRES_DEV) {
++		printk(KERN_EMERG "BE300DBG: do_kern_mount: dispatch=get_sb_bdev\n");
+ 		sb = get_sb_bdev(fstype, name, flags, data);
+-	else if (fstype->fs_flags & FS_SINGLE)
++	} else if (fstype->fs_flags & FS_SINGLE) {
++		printk(KERN_EMERG "BE300DBG: do_kern_mount: dispatch=get_sb_single\n");
+ 		sb = get_sb_single(fstype, flags, data);
+-	else
++	} else {
++		printk(KERN_EMERG "BE300DBG: do_kern_mount: dispatch=get_sb_nodev\n");
+ 		sb = get_sb_nodev(fstype, flags, data);
++	}
++	printk(KERN_EMERG "BE300DBG: do_kern_mount: after dispatch sb=%p err=%ld\n",
++	       sb, IS_ERR(sb) ? PTR_ERR(sb) : 0L);
+ 
+ 	if (IS_ERR(sb)) {
+ 		free_vfsmnt(mnt);
+@@ -892,9 +925,12 @@
+ 	mnt->mnt_root = dget(sb->s_root);
+ 	mnt->mnt_mountpoint = mnt->mnt_root;
+ 	mnt->mnt_parent = mnt;
++	printk(KERN_EMERG "BE300DBG: do_kern_mount: before up_write(s_umount)\n");
+ 	up_write(&sb->s_umount);
++	printk(KERN_EMERG "BE300DBG: do_kern_mount: after  up_write(s_umount)\n");
+ fs_out:
+ 	put_filesystem(fstype);
++	printk(KERN_EMERG "BE300DBG: do_kern_mount: exit mnt=%p\n", mnt);
+ 	return mnt;
+ }
+ 
+--- a/fs/proc/inode.c
++++ b/fs/proc/inode.c
+@@ -181,6 +181,7 @@
+ {
+ 	struct inode * root_inode;
+ 	struct task_struct *p;
++	printk(KERN_EMERG "BE300DBG: proc_read_super: enter s=%p\n", s);
+ 
+ 	s->s_blocksize = 1024;
+ 	s->s_blocksize_bits = 10;
+@@ -193,13 +194,16 @@
+ 	/*
+ 	 * Fixup the root inode's nlink value
+ 	 */
++	printk(KERN_EMERG "BE300DBG: proc_read_super: before tasklist_lock\n");
+ 	read_lock(&tasklist_lock);
+ 	for_each_task(p) if (p->pid) root_inode->i_nlink++;
+ 	read_unlock(&tasklist_lock);
++	printk(KERN_EMERG "BE300DBG: proc_read_super: after  tasklist_lock\n");
+ 	s->s_root = d_alloc_root(root_inode);
+ 	if (!s->s_root)
+ 		goto out_no_root;
+ 	parse_options(data, &root_inode->i_uid, &root_inode->i_gid);
++	printk(KERN_EMERG "BE300DBG: proc_read_super: exit ok s_root=%p\n", s->s_root);
+ 	return s;
+ 
+ out_no_root:
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -27,7 +27,11 @@
+ 
+ void __init proc_root_init(void)
+ {
+-	int err = register_filesystem(&proc_fs_type);
++	int err;
++	extern int console_loglevel;
++	console_loglevel = 15;  /* BE300DBG: force KERN_* through to console */
++	printk(KERN_EMERG "BE300DBG: proc_root_init: console_loglevel=15\n");
++	err = register_filesystem(&proc_fs_type);
+ 	if (err)
+ 		return;
+ 	proc_mnt = kern_mount(&proc_fs_type);

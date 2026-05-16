@@ -1,0 +1,98 @@
+BE-300 2.4.18: split Hit_Writeback_Inv_D into writeback + invalidate.
+
+VR4131 silicon has a documented D-cache bug: combined Hit_Writeback_Inv_D
+(cache op 0x15) occasionally leaves a line in an inconsistent state
+because the internal refill buffer is mishandled across the
+writeback+invalidate sequence. The published workaround (see the linux4be
+era patches/vr4131_cachebug_fix.patch and the 4.2.9 port's
+patches/linux-4.2.9/be300/0003-linux-4.2.9-add-BE-300-runtime-fixes.patch)
+is to issue Hit_Writeback_D (0x19) followed by Hit_Invalidate_D (0x11)
+as two separate cache instructions.
+
+This patch applies the split to the three Hit_Writeback_Inv_D sites in
+include/asm-mips/r4kcache.h:
+
+  * flush_dcache_line() — line-level flush.
+  * blast_dcache16_page() — 16-byte-line page flush.
+  * blast_dcache32_page() — 32-byte-line page flush.
+
+All gated on CONFIG_VR4131_CACHE_FIX so non-BE-300 VR41xx targets are
+unaffected. CONFIG_VR4131_CACHE_FIX=y is already in config_be300 (it
+also picks pg-vr4131.o over pg-r4k.o in arch/mips/mm/Makefile).
+
+The emulator does not simulate the D-cache and therefore does not
+observe the bug; the test environment can't confirm the fix works on
+real silicon, only that the kernel still boots clean with the split
+in place. Required for any real-HW bring-up attempt — without it, the
+2.4.18 kernel hangs at "Calibrating delay loop..." just like the same
+bug observed on 4.2.9 (see CLAUDE.md "VR4131 cache bug").
+
+--- a/include/asm-mips/r4kcache.h
++++ b/include/asm-mips/r4kcache.h
+@@ -65,15 +65,38 @@
+ 
+ static inline void flush_dcache_line(unsigned long addr)
+ {
++#ifdef CONFIG_VR4131_CACHE_FIX
++	/*
++	 * VR4131 D-cache bug: combined Hit_Writeback_Inv_D (op 0x15)
++	 * occasionally leaves a line in an inconsistent state because the
++	 * internal refill buffer is mishandled. Issue separate
++	 * Hit_Writeback_D (op 0x19) + Hit_Invalidate_D (op 0x11). See
++	 * patches/vr4131_cachebug_fix.patch and the 4.2.9 port's
++	 * patches/linux-4.2.9/be300/0003 for the same split applied to
++	 * later kernels.
++	 */
+ 	__asm__ __volatile__(
+ 		".set noreorder\n\t"
+ 		".set mips3\n\t"
+ 		"cache %1, (%0)\n\t"
++		"cache %2, (%0)\n\t"
+ 		".set mips0\n\t"
+ 		".set reorder"
+ 		:
+ 		: "r" (addr),
++		  "i" (Hit_Writeback_D),
++		  "i" (Hit_Invalidate_D));
++#else
++	__asm__ __volatile__(
++		".set noreorder\n\t"
++		".set mips3\n\t"
++		"cache %1, (%0)\n\t"
++		".set mips0\n\t"
++		".set reorder"
++		:
++		: "r" (addr),
+ 		  "i" (Hit_Writeback_Inv_D));
++#endif
+ }
+ 
+ static inline void invalidate_dcache_line(unsigned long addr)
+@@ -228,7 +251,13 @@
+ 	unsigned long end = (start + PAGE_SIZE);
+ 
+ 	while(start < end) {
++#ifdef CONFIG_VR4131_CACHE_FIX
++		/* VR4131 D-cache bug: split into writeback then invalidate. */
++		cache16_unroll32(start,Hit_Writeback_D);
++		cache16_unroll32(start,Hit_Invalidate_D);
++#else
+ 		cache16_unroll32(start,Hit_Writeback_Inv_D);
++#endif
+ 		start += 0x200;
+ 	}
+ }
+@@ -413,7 +442,13 @@
+ 
+ 	__asm__ __volatile__("nop;nop;nop;nop");
+ 	while(start < end) {
++#ifdef CONFIG_VR4131_CACHE_FIX
++		/* VR4131 D-cache bug: split into writeback then invalidate. */
++		cache32_unroll32(start,Hit_Writeback_D);
++		cache32_unroll32(start,Hit_Invalidate_D);
++#else
+ 		cache32_unroll32(start,Hit_Writeback_Inv_D);
++#endif
+ 		start += 0x400;
+ 	}
+ }

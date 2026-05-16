@@ -1,0 +1,45 @@
+BE-300 2.4.18: disable CF/IDE in the default NAND profile.
+
+The mega-patch turned on CONFIG_CASIO_BE300_CF + CONFIG_IDE for the
+opt-in CF recovery boot. Without `--cf <image>` attached, the emulator's
+IDE decode at 0x170 returns garbage status (0x50 with a junk model
+name) and the 2.4 IDE driver enters an infinite `hda: lost interrupt`
+loop during partition probe. That hangs init *before* NAND, touchscreen,
+and Stowaway keyboard register — i.e. before VFS mounts root — so the
+default boot stalls.
+
+Disable CONFIG_IDE in the default config_be300. CF is re-enabled by
+the future configs/be300_2_4_cf.config overlay (Phase 7 of the plan)
+which a separate build_be300_2_4_cf_image.sh will merge before
+configuring.
+
+This is the minimum change to unblock the rest of the HW-parity work.
+The CF IDE driver itself (cf_be300.c) and the IRQ cascade
+(CASIO_BE300_IRQ_CASCADE=y) stay in the tree.
+
+--- a/config_be300
++++ b/config_be300
+@@ -136,12 +136,18 @@
+ CONFIG_CASIO_BE300_NAND=y
+ CONFIG_CASIO_BE300_TOUCH=y
+ CONFIG_CASIO_BE300_STOWAWAY=y
+-CONFIG_CASIO_BE300_CF=y
++# CF/IDE host is opt-in via configs/be300_2_4_cf.config — the 2.4 IDE
++# driver issues SET_GEOMETRY / INITIALIZE_DEVICE_PARAMETERS during probe,
++# which the emulator's CF model doesn't implement, so without --cf
++# attached `hda` finds garbage status and spins forever in `lost
++# interrupt`, blocking NAND/touch/keyboard init. Keep off in the default
++# NAND profile; reenable when building the CF recovery image.
++# CONFIG_CASIO_BE300_CF is not set
+ CONFIG_CASIO_BE300_IRQ_CASCADE=y
+-CONFIG_IDE=y
+-CONFIG_BLK_DEV_IDE=y
+-CONFIG_BLK_DEV_IDEDISK=y
+-CONFIG_IDEDISK_MULTI_MODE=y
++# CONFIG_IDE is not set
++# CONFIG_BLK_DEV_IDE is not set
++# CONFIG_BLK_DEV_IDEDISK is not set
++# CONFIG_IDEDISK_MULTI_MODE is not set
+ 
+ #
+ # Parallel port support

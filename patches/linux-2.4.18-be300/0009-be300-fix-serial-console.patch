@@ -1,0 +1,334 @@
+BE-300 2.4.18: make serial_be300 usable as an interactive ttyS0.
+
+The linux4be serial_be300 driver registered a tty, but it never fully
+programmed the UART as a Linux console/getty device.  The most visible
+bug was be300_set_baud() leaving UART_LCR_DLAB set after writing the
+divisor, so later writes to UART_TX could update the divisor latch
+instead of transmitting bytes.  The driver also ignored termios, never
+asserted RTS, and depended on an IRQ path that is not wired for the
+VRC4173 companion UART in this 2.4 port.
+
+Program ttyS0 as 115200 8N1, clear DLAB after divisor updates, assert
+DTR|RTS so the emulator's VRC4173 SIU bridge sees the guest as ready,
+and poll RX into the tty flip buffer.  This keeps the default Opie build
+on framebuffer console tty0 while allowing ttyS0::askfirst:/bin/sh to be
+used through --serial1-bridge pty:auto.
+
+--- a/drivers/char/serial_be300.c
++++ b/drivers/char/serial_be300.c
+@@ -10,12 +10,14 @@
+ #include <linux/init.h>
+ #include <linux/config.h>
+ #include <linux/tty.h>
++#include <linux/tty_flip.h>
+ #include <linux/major.h>
+ #include <linux/console.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
+ #include <linux/serial.h>
+ #include <linux/serial_reg.h>
++#include <linux/timer.h>
+ #include <asm/io.h>
+ #include <asm/uaccess.h>
+ #include <asm/delay.h>
+@@ -32,9 +34,13 @@ extern vr41xx_clock_supply(u16);
+ static struct tty_driver be300_driver, be300_callout;
+ static int be300_refcount, be300_initialized;
+ 
+-static struct tty_struct **be300_tty;
+-static struct termios **be300_termios;
+-static struct termios **be300_termios_locked;
++static struct tty_struct *be300_tty_table[1];
++static struct termios *be300_termios_table[1];
++static struct termios *be300_termios_locked_table[1];
++
++#define BE300_RX_POLL_HZ 100
++static struct tty_struct *be300_open_tty;
++static struct timer_list be300_rx_timer;
+ 
+ static 	int baud_table[] = {
+ 		110, 10473,
+@@ -79,12 +85,42 @@ static inline void serial_puts(const unsigned char *buf, int count)
+ 	}
+ }
+ 
++static unsigned long be300_rx_poll_delay(void)
++{
++	unsigned long delay = HZ / BE300_RX_POLL_HZ;
++
++	return delay ? delay : 1;
++}
++
++static void be300_rx_poll(unsigned long data)
++{
++	struct tty_struct *tty = be300_open_tty;
++	int budget = 256;
++	int pushed = 0;
++
++	while (tty && budget-- > 0 &&
++	       (serial_inb(UART_LSR) & UART_LSR_DR)) {
++		unsigned char ch = serial_inb(UART_RX);
++
++		if (tty->flip.count >= TTY_FLIPBUF_SIZE)
++			break;
++		tty_insert_flip_char(tty, ch, TTY_NORMAL);
++		pushed = 1;
++	}
++
++	if (pushed)
++		tty_flip_buffer_push(tty);
++
++	be300_rx_timer.expires = jiffies + be300_rx_poll_delay();
++	add_timer(&be300_rx_timer);
++}
++
+ #ifdef CONFIG_REMOTE_DEBUG
+ int putDebugChar(unsigned char byte)
+ {
+ 	serial_putc(byte);
+ }
+ 
+ unsigned char getDebugChar(void)
+ {
+ 	while(!(serial_inb(UART_LSR) & UART_LSR_DR));
+@@ -107,7 +141,7 @@ int be300_calc_divider(int baud)
+ 	return 0;
+ }
+ 
+-void be300_set_baud(int baud)
++static void be300_set_baud(int baud)
+ {
+ 	int divisor = be300_calc_divider(baud);
+ 	
+@@ -117,11 +151,21 @@ void be300_set_baud(int baud)
+ 	serial_outb(UART_LCR, UART_LCR_DLAB);	
+ 	serial_outb(UART_DLL, divisor & 0xFF);
+ 	serial_outb(UART_DLM, (divisor & 0xff00) >> 8);
+-	serial_outb(UART_LCR, UART_LCR_DLAB);
+-	
+-	/*serial_inb(UART_IER);*/
++	serial_outb(UART_LCR, UART_LCR_WLEN8);
+ }
+ 
++static void be300_configure_uart(int baud)
++{
++	if (!baud)
++		baud = 115200;
++
++	be300_set_baud(baud);
++	serial_outb(UART_LCR, UART_LCR_WLEN8);
++	serial_outb(UART_IER, 0);
++	serial_outb(UART_MCR, UART_MCR_DTR | UART_MCR_RTS);
++	serial_inb(UART_LSR);
++}
++
+ static void be300_show_serial_version(void)
+ {
+ 	printk("Casio Cassiopeia BE-300 Serial Driver version 0.01\n");
+@@ -137,8 +181,22 @@ static void be300_serial_put_char(struct tty_struct *tty, unsigned char ch)
+ static int be300_serial_write(struct tty_struct *tty, int from_user,
+ 	const unsigned char *buf, int count)
+ {
+-	serial_puts(buf, count);	
+-	return count;
++	int i;
++
++	for (i = 0; i < count; i++) {
++		unsigned char ch;
++
++		if (from_user) {
++			if (get_user(ch, buf + i))
++				return i ? i : -EFAULT;
++		} else {
++			ch = buf[i];
++		}
++		if (ch == '\n')
++			serial_putc('\r');
++		serial_putc(ch);
++	}
++	return i;
+ }
+ 
+ static int be300_serial_write_room(struct tty_struct *tty)
+@@ -146,5 +202,5 @@ static int be300_serial_write_room(struct tty_struct *tty)
+ //	printk("wr: be300_serial_write_room\n");
+-	return 1;
++	return 256;
+ }
+ 
+ static void be300_serial_flush_buffer(struct tty_struct *tty)
+@@ -192,26 +248,27 @@ static void be300_serial_unthrottle(struct tty_struct *tty)
+ 
+ static void be300_serial_close(struct tty_struct *tty, struct file *flip)
+ {
++	be300_open_tty = NULL;
+ 	MOD_DEC_USE_COUNT;
+ //printk("c: be300_serial_close\n");
+ }
+ 
+ static int be300_serial_open(struct tty_struct *tty, struct file *flip)
+ {
+-	/*int retval;
+-	unsigned long flags;*/
++	int line;
+ 	
+ //	printk("o: be300_serial_open\n");
+ 	
+-	MOD_INC_USE_COUNT;
+-	
+ 	if(!be300_initialized)
+ 		return -EIO;
+-		
+-	if(MINOR(tty->device) - tty->driver.minor_start)
++
++	line = MINOR(tty->device) - tty->driver.minor_start;
++	if (line != 0)
+ 		return -ENODEV;
+-		
+-	/*save_flags(flags);*/
++
++	MOD_INC_USE_COUNT;
++	be300_open_tty = tty;
++	be300_configure_uart(tty_get_baud_rate(tty));
+ 	
+ 	return 0;
+ }
+@@ -219,7 +277,7 @@ static int be300_serial_open(struct tty_struct *tty, struct file *flip)
+ static void be300_serial_set_termios(struct tty_struct *tty, 
+ 	struct termios *old_termios)
+ {
+-//printk("st: be300_serial_set_termios\n");
++	be300_configure_uart(tty_get_baud_rate(tty));
+ }
+ 
+ static int be300_serial_ioctl(struct tty_struct * tty, struct file * filp, 
+@@ -266,33 +324,14 @@ static inline void be300_uart_interrupt(int irq, void *dev_id,
+ 
+ void __init be300_serial_init(void)
+ {
+-	int flags;
+-	
+ 	be300_show_serial_version();
+ 	
+-	/* Allocate critical structures */
+-	if(!(be300_tty = kmalloc(sizeof(struct tty_struct), GFP_KERNEL)))
+-	{
+-		return;
+-	}
+-	if(!(be300_termios = kmalloc(sizeof(struct termios), GFP_KERNEL)))
+-	{
+-		kfree(be300_tty);
+-		return;
+-	}
+-	if(!(be300_termios_locked = kmalloc(sizeof(struct termios), GFP_KERNEL)))
+-	{
+-		kfree(be300_termios);
+-		kfree(be300_tty);
+-		return;
+-	}
+-	
+-	memset(be300_tty, 0, sizeof(struct tty_struct));
+-	memset(be300_termios, 0, sizeof(struct termios));
+-	memset(be300_termios_locked, 0, sizeof(struct termios));
++	memset(be300_tty_table, 0, sizeof(be300_tty_table));
++	memset(be300_termios_table, 0, sizeof(be300_termios_table));
++	memset(be300_termios_locked_table, 0, sizeof(be300_termios_locked_table));
+ 	memset(&be300_driver, 0, sizeof(struct tty_driver));
+ 	memset(&be300_callout, 0, sizeof(struct tty_driver));
+-	
++
+ 	be300_driver.magic = TTY_DRIVER_MAGIC;
+ #ifdef CONFIG_DEVFS_FS
+ 	be300_driver.name = "tts/%d";
+@@ -308,13 +344,13 @@ void __init be300_serial_init(void)
+ 	be300_driver.major = TTY_MAJOR;
+ 	be300_driver.minor_start = 64;
+ 	be300_driver.init_termios = tty_std_termios;
+-	be300_driver.init_termios.c_cflag = B9600 | CS8 | CREAD | HUPCL | CLOCAL;
++	be300_driver.init_termios.c_cflag = B115200 | CS8 | CREAD | CLOCAL;
+ 	be300_driver.refcount = &be300_refcount;
+ 	be300_driver.flags = TTY_DRIVER_REAL_RAW;
+ 	
+-	be300_driver.table = be300_tty;
+-	be300_driver.termios = be300_termios;
+-	be300_driver.termios_locked = be300_termios_locked;
++	be300_driver.table = be300_tty_table;
++	be300_driver.termios = be300_termios_table;
++	be300_driver.termios_locked = be300_termios_locked_table;
+ 	
+ 	be300_driver.open = be300_serial_open;
+ 	be300_driver.close = be300_serial_close; 
+@@ -355,19 +391,26 @@ void __init be300_serial_init(void)
+ 	if(tty_register_driver(&be300_callout))
+ 		panic("Unable to register callout driver\n");
+ 	
+-/*	vr41xx_clock_supply(SIU_CLOCK);
+-	vr41xx_clock_supply(DSIU_CLOCK);
+-	
+-	save_and_cli(flags);
+-*/	
++/*	vr41xx_clock_supply(SIU_CLOCK);
++	vr41xx_clock_supply(DSIU_CLOCK);
++*/
+ /*	if(request_irq(0x13, be300_uart_interrupt, SA_INTERRUPT,
+ 		"BE300Uart", NULL))
+ 		panic("Cannot allocate IRQ for UART.\n");
+ 	else
+ */	
+ 	printk("ttyS0 at 0xAA008680 (irq = 19) is a NEC D89041F1001 UART\n");
+ 	
+-/*	restore_flags(flags);
+-*/	
++	be300_configure_uart(115200);
++
++	init_timer(&be300_rx_timer);
++	be300_rx_timer.function = be300_rx_poll;
++	be300_rx_timer.data = 0;
++	be300_rx_timer.expires = jiffies + be300_rx_poll_delay();
++	add_timer(&be300_rx_timer);
++
++	printk("BE-300 serial: ttyS0 115200 8N1, DTR/RTS asserted, RX polled at %d Hz\n",
++		BE300_RX_POLL_HZ);
++
+ 	be300_initialized = 1;
+ }
+@@ -379,9 +423,13 @@ static void be300_serial_console_write(struct console *co, const char *s,
+ 
+ static kdev_t be300_serial_console_device(struct console *co)
+ {
+-	return MKDEV(TTY_MAJOR, 64 + co->index);
++	int index = co->index;
++
++	if (index < 0)
++		index = 0;
++	return MKDEV(TTY_MAJOR, 64 + index);
+ }
+ 
+ /* recieve a char from the serial port 
+  */
+ static int be300_serial_console_wait_key(struct console *co)
+@@ -395,23 +443,7 @@ static int be300_serial_console_wait_key(struct console *co)
+ 
+ static __init int be300_serial_console_setup(struct console *co, char *options)
+ {
+-/*	uint32 baud = 9600;
+-	uint8 bits = 0x3;
+-	uint8 parity = 0;
+-	uint8 stop = 0;
+-	uint32 divisor = 1;
+-
+-	serial_outb(UART_LCR, 0x0);
+-	serial_outb(UART_IIR, 0);
+-	
+-	serial_outb(UART_LCR, UART_LCR_DLAB);
+-	serial_outb(UART_DLL, divisor & 0xff);
+-	serial_outb(UART_DLM, (divisor & 0xff00)>>8);
+-
+-	serial_outb(UART_LCR, 0x0);
+-	
+-	serial_outb(UART_LCR, bits | parity | stop);
+-*/
++	be300_configure_uart(115200);
+ 	return 0;
+ }
+ 

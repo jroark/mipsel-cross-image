@@ -1,1 +1,11 @@
 0001-modern-toolchain-fixes.patch
+0002-be300-default-cmdline-and-tty-banner.patch
+0003-be300-disable-cf-ide-default.patch
+0004-be300-net-rtc-input-and-gcc-fixes.patch
+0005-be300-vr4131-dcache-bug-split.patch
+0006-be300-mtdblock-skip-invalidate-on-release.patch
+# 0007-be300-mount-debug-printk.patch — DISABLED (May 15 2026): served
+#   its purpose and proved mount(2) works. Keep the patch in-tree for
+#   future diagnostics; re-enable by uncommenting this line.
+0008-be300-2_4-add-exit_group-syscall.patch
+0009-be300-fix-serial-console.patch

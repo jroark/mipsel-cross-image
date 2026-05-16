@@ -1,0 +1,71 @@
+# BE-300 Linux 2.4.18 + Opie JFFS2 device table for mkfs.jffs2 --devtable.
+#
+# Linux 2.4.18 has no devtmpfs, so every device node Opie/BusyBox will open
+# at runtime must exist in the JFFS2 image.  mkfs.jffs2 reads this file and
+# bakes the nodes into the image even when running inside an unprivileged
+# Docker container (where mknod fails).
+#
+# Format:
+#   <name> <type> <mode> <uid> <gid> <major> <minor> <start> <inc> <count>
+#
+# - type: c = char dev, b = block dev, d = directory
+# - For singletons leave <start> <inc> <count> as `-`.
+# - For ranges, <count> nodes get the suffix `<start>`, `<start>+<inc>`, …,
+#   appended to <name> (with the major/minor incremented by <inc> each step).
+#
+# Cross-reference for the 2.4.18 device-major assignments comes from
+# drivers/char/serial_be300.c, arch/mips/vr41xx/vr4131/casio-be300/*.c and
+# include/linux/major.h after the be300 patch series is applied.
+
+# Top-level /dev directory (mkfs.jffs2 needs explicit `d` entries for
+# subdirectories so that the bind-mount /dev/pts has a mount point).
+/dev            d 755 0 0 -  -  -  -  -
+/dev/input      d 755 0 0 -  -  -  -  -
+/dev/pts        d 755 0 0 -  -  -  -  -
+
+# core console + nullables
+/dev/console    c 600 0 0 5  1  -  -  -
+/dev/null       c 666 0 0 1  3  -  -  -
+/dev/zero       c 666 0 0 1  5  -  -  -
+/dev/full       c 666 0 0 1  7  -  -  -
+/dev/random     c 644 0 0 1  8  -  -  -
+/dev/urandom    c 644 0 0 1  9  -  -  -
+/dev/mem        c 640 0 0 1  1  -  -  -
+/dev/kmem       c 640 0 0 1  2  -  -  -
+
+# virtual terminals (BusyBox init opens /dev/tty0; Opie's be300-vtmode
+# switches it to KD_GRAPHICS; matchbox uses tty1..tty3 if /etc/inittab
+# spawns getty there — we don't, but keep the nodes for future use).
+/dev/tty        c 666 0 0 5  0  -  -  -
+/dev/tty        c 600 0 0 4  0  0  1  4
+
+# Serial UART: 2.4.18 BE-300 driver registers as TTY_MAJOR (4) with
+# minor_start = 64.  ttyS0 = VRC4173 companion SIU (dock UART, the
+# "vr4173 port"); ttyS1 = VR4131 main SIU.  Both carry an askfirst
+# /bin/sh from /etc/inittab and are RX-polled by serial_be300.c.
+/dev/ttyS0      c 660 0 0 4  64 -  -  -
+/dev/ttyS1      c 660 0 0 4  65 -  -  -
+
+# pty pair (embeddedkonsole opens /dev/ptmx; pts/N is allocated dynamically
+# once devpts is mounted by /etc/init.d/rcS).
+/dev/ptmx       c 666 0 0 5  2  -  -  -
+
+# framebuffer
+/dev/fb0        c 660 0 0 29 0  -  -  -
+
+# evdev nodes.  event0 is the BE-300 Stowaway keyboard
+# (stowaway_be300.c:226 input_register_device).  event1..event3 are
+# pre-created stubs so Opie's TPanel handler open(/dev/input/event1)
+# doesn't return ENOENT; the 2.4.18 touch driver registers a misc
+# /dev/be300tpanel, not an evdev node, so touch input is deferred
+# (TODO: extend touch_be300.c with an input_dev registration).
+/dev/input/event c 660 0 0 13 64 0  1  4
+
+# BE-300 PIU touchscreen (misc device, minor 170 — see
+# touch_be300.c::BE300_TOUCH_MINOR).
+/dev/be300tpanel c 660 0 0 10 170 -  -  -
+
+# MTD raw + block (rootfs lives on mtdblock3; the first three partitions
+# expose the WinCE table, SPL, and vmlinux for the diagnostic tools).
+/dev/mtd        c 600 0 0 90 0  0  2  4
+/dev/mtdblock   b 600 0 0 31 0  0  1  4

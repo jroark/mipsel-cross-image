@@ -1,0 +1,40 @@
+BE-300 2.4.18: skip invalidate_device() in mtdblock_release.
+
+invalidate_device(inode->i_rdev, 1) hangs forever when called from
+mount_root's blkdev_put on the JFFS2 root mtdblock3.  It walks the
+page cache for the block device looking for dirty buffers to sync,
+finds none (mtdblock has no buffer-cache pages of its own — JFFS2
+talks to the MTD layer directly via mtdblock_readsect/writesect),
+but the sync path still tries to acquire the mtdblock cache_sem
+that this release function is itself about to acquire below at
+`down(&mtdblk->cache_sem)`.  The result is that mtdblock_release
+sleeps inside invalidate_device waiting for a buffer-IO completion
+that never fires, while holding nothing — but the rest of the
+mount-path machinery (BKL, lock_super, etc.) blocks on the original
+blkdev_put, leading to the boot-time hang documented in the earlier
+2.4 Opie work.
+
+The cache state at this release point is empty for a fresh RO mount,
+so skipping the invalidate is safe.  Comment block left in place to
+document the rationale for future readers.
+
+This was previously carried as an inline edit in the extracted
+linux-2.4.18/ tree; capturing it as a numbered patch so a fresh
+extract + apply_patch_series.sh reproduces the same state.
+
+--- a/drivers/mtd/mtdblock.c
++++ b/drivers/mtd/mtdblock.c
+@@ -371,7 +371,12 @@ static release_t mtdblock_release(struct inode *inode, struct file *file)
+ 	if (inode == NULL)
+ 		release_return(-ENODEV);
+
+-	invalidate_device(inode->i_rdev, 1);
++	/* invalidate_device(inode->i_rdev, 1) hangs forever when called from
++	 * mount_root's blkdev_put on the JFFS2 root mtdblock3 — it tries to
++	 * sync-flush a non-existent page cache through the MTD layer and
++	 * deadlocks against the cache_sem we're about to acquire below.
++	 * The mount-side cache is empty for a fresh RO mount, so just skip
++	 * the invalidate.  See BE300_2_4 Opie boot path notes. */
+
+ 	dev = MINOR(inode->i_rdev);
+ 	mtdblk = mtdblks[dev];
