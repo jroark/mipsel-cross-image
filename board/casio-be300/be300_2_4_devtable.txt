@@ -69,3 +69,15 @@
 # expose the WinCE table, SPL, and vmlinux for the diagnostic tools).
 /dev/mtd        c 600 0 0 90 0  0  2  4
 /dev/mtdblock   b 600 0 0 31 0  0  1  4
+
+# BSD-style ptys for the mw profile.  The 2003 microwindows nxterm
+# binary hardcodes `/dev/ptyp%d` (decimal printf format) when allocating
+# a pty pair — see strings(1) on /bin/nxterm.  CONFIG_UNIX98_PTYS=y in
+# our kernel doesn't disable the legacy BSD pty driver
+# (drivers/char/pty.c, nm vmlinux shows pty_driver symbol present); it
+# just needs the device nodes.  Master pool: major 2, minors 0..15.
+# Slave pool: major 3, minors 0..15.  The pgui and opie profiles use
+# UNIX98 ptys via /dev/ptmx + devpts so these are unused there but cost
+# only 32 inodes.
+/dev/ptyp       c 666 0 0 2  0  0  1 16
+/dev/ttyp       c 666 0 0 3  0  0  1 16

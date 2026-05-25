@@ -178,8 +178,19 @@ case "$BE300_2_4_UI" in
         ROOT_MODE="pgui"
         OUT="${BE300_2_4_NAND:-$REPO/linux-4.2.9/be300-2_4-pgui.nand}"
         ;;
+    mw)
+        # BE300_2_4_UI=mw mirrors pgui but with a Microwindows / Nano-X
+        # donor (default: $REPO/vmlinux-mw, override with
+        # BE300_2_4_RAMDISK_SRC).  The donor ships uClibc 0.9.19, BusyBox,
+        # nano-X server, nanowm window manager, and the launcher app menu
+        # (~30 Nano-X demo apps in /bin).  Same kernel build, same JFFS2
+        # mtd3 packing, same noinitrd cmdline; only the userspace overlay
+        # differs from pgui.
+        ROOT_MODE="mw"
+        OUT="${BE300_2_4_NAND:-$REPO/linux-4.2.9/be300-2_4-mw.nand}"
+        ;;
     *)
-        echo "ERROR: BE300_2_4_UI must be 'none', 'opie', or 'pgui' (got '$BE300_2_4_UI')" >&2
+        echo "ERROR: BE300_2_4_UI must be 'none', 'opie', 'pgui', or 'mw' (got '$BE300_2_4_UI')" >&2
         exit 2
         ;;
 esac
@@ -194,8 +205,8 @@ case "$BE300_2_4_CONSOLE" in
         ;;
 esac
 
-if [[ "$ROOT_MODE" != "initrd" && "$ROOT_MODE" != "nand" && "$ROOT_MODE" != "cf" && "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" ]]; then
-    echo "ERROR: BE300_2_4_ROOT must be 'initrd', 'nand', 'cf', 'opie', or 'pgui' (got '$ROOT_MODE')" >&2
+if [[ "$ROOT_MODE" != "initrd" && "$ROOT_MODE" != "nand" && "$ROOT_MODE" != "cf" && "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" && "$ROOT_MODE" != "mw" ]]; then
+    echo "ERROR: BE300_2_4_ROOT must be 'initrd', 'nand', 'cf', 'opie', 'pgui', or 'mw' (got '$ROOT_MODE')" >&2
     exit 2
 fi
 
@@ -261,35 +272,43 @@ RAMDISK_GZ="$SOURCE_DIR/arch/mips/ramdisk/ramdisk.gz"
 # real linux4be initrd, leave it alone — noinitrd makes the contents
 # inert at boot, and not overwriting preserves the file for a later
 # switch back to initrd/nand mode.
-if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
+if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     if [[ ! -f "$RAMDISK_GZ" ]]; then
         mkdir -p "$(dirname "$RAMDISK_GZ")"
         printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
             > "$RAMDISK_GZ"
     fi
 fi
-# pgui: extract the picogui ramdisk to a side file (NOT arch/mips/ramdisk/
+# pgui/mw: extract the donor ramdisk to a side file (NOT arch/mips/ramdisk/
 # ramdisk.gz, because the kernel is built without an embedded initrd —
-# the picogui rootfs goes to mtd3 JFFS2 in section 5a).
-PGUI_RAMDISK_SRC="${BE300_2_4_RAMDISK_SRC:-$REPO/vmlinux-pgui-test1}"
-PGUI_ROOTFS_GZ="$SOURCE_DIR/.pgui-rootfs.gz"
+# the donor rootfs goes to mtd3 JFFS2 in section 5a).  Each mode has its
+# own cache so switching between picogui and microwindows donors does not
+# fight over the same .gz.  Same default donor convention as picogui:
+# mw defaults to $REPO/vmlinux-mw.
+if [[ "$ROOT_MODE" == "mw" ]]; then
+    PGUI_RAMDISK_SRC="${BE300_2_4_RAMDISK_SRC:-$REPO/vmlinux-mw}"
+    PGUI_ROOTFS_GZ="$SOURCE_DIR/.mw-rootfs.gz"
+else
+    PGUI_RAMDISK_SRC="${BE300_2_4_RAMDISK_SRC:-$REPO/vmlinux-pgui-test1}"
+    PGUI_ROOTFS_GZ="$SOURCE_DIR/.pgui-rootfs.gz"
+fi
 # Sidecar stamp records the source vmlinux that produced the cached
-# .pgui-rootfs.gz.  If the user re-runs with a different
-# BE300_2_4_RAMDISK_SRC, the cached blob is stale and must be regenerated;
-# without this check, switching donors silently packed the previous
-# donor's ramdisk onto the new NAND.
+# rootfs blob.  If the user re-runs with a different BE300_2_4_RAMDISK_SRC,
+# the cached blob is stale and must be regenerated; without this check,
+# switching donors silently packed the previous donor's ramdisk onto the
+# new NAND.
 PGUI_ROOTFS_STAMP="$PGUI_ROOTFS_GZ.src"
-if [[ "$ROOT_MODE" == "pgui" ]]; then
+if [[ "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     PGUI_CACHED_SRC=""
     [[ -f "$PGUI_ROOTFS_STAMP" ]] && PGUI_CACHED_SRC=$(cat "$PGUI_ROOTFS_STAMP")
     if [[ ! -f "$PGUI_ROOTFS_GZ" || "$PGUI_CACHED_SRC" != "$PGUI_RAMDISK_SRC" ]]; then
         if [[ -f "$PGUI_ROOTFS_GZ" && "$PGUI_CACHED_SRC" != "$PGUI_RAMDISK_SRC" ]]; then
-            echo "--- Cached .pgui-rootfs.gz was from '$PGUI_CACHED_SRC', re-extracting from '$PGUI_RAMDISK_SRC' ---"
+            echo "--- Cached $(basename "$PGUI_ROOTFS_GZ") was from '$PGUI_CACHED_SRC', re-extracting from '$PGUI_RAMDISK_SRC' ---"
             rm -f "$PGUI_ROOTFS_GZ" "$PGUI_ROOTFS_STAMP"
             # Also drop the downstream JFFS2 so the new ramdisk lands on mtd3.
-            rm -f "$REPO/linux-4.2.9/rootfs-2_4-pgui.jffs2"
+            rm -f "$REPO/linux-4.2.9/rootfs-2_4-pgui.jffs2" "$REPO/linux-4.2.9/rootfs-2_4-mw.jffs2"
         fi
-        echo "--- Extracting picogui rootfs from $PGUI_RAMDISK_SRC into $PGUI_ROOTFS_GZ ---"
+        echo "--- Extracting $ROOT_MODE rootfs from $PGUI_RAMDISK_SRC into $PGUI_ROOTFS_GZ ---"
         [[ -f "$PGUI_RAMDISK_SRC" ]] || { echo "ERROR: $PGUI_RAMDISK_SRC missing" >&2; exit 1; }
         python3 - <<PYEOF
 import struct
@@ -344,7 +363,7 @@ PYEOF
         exit 1
     fi
 fi
-if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" && ! -f "$RAMDISK_GZ" ]]; then
+if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" && "$ROOT_MODE" != "mw" && ! -f "$RAMDISK_GZ" ]]; then
     echo "--- Extracting initrd from $PREBUILT_VMLINUX into $RAMDISK_GZ ---"
     [[ -f "$PREBUILT_VMLINUX" ]] || { echo "ERROR: $PREBUILT_VMLINUX missing" >&2; exit 1; }
     python3 - <<PYEOF
@@ -386,7 +405,7 @@ for i in range(e_phnum):
 PYEOF
 fi
 
-if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" ]]; then
+if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" && "$ROOT_MODE" != "mw" ]]; then
 
 # 3a. Build the userspace HW test program and inject it into the initrd.
 #
@@ -698,9 +717,9 @@ elif [[ "$ROOT_MODE" == "opie" ]]; then
     OPIE_CMDLINE="consoleblank=0 noinitrd root=/dev/mtdblock3 rootfstype=jffs2 init=/sbin/init console=${BE300_2_4_CONSOLE}"
     sed -i "s|console=tty0 consoleblank=0 root=/dev/ram rootfstype=ext2 init=/sbin/init|$OPIE_CMDLINE|" "$PROM_C"
     echo "--- patched prom.c for Opie direct JFFS2 root cmdline (${BE300_2_4_CONSOLE}) ---"
-elif [[ "$ROOT_MODE" == "pgui" ]]; then
-    # PicoGUI direct JFFS2 root, same shape as Opie above.  The picogui
-    # rootfs lives on /dev/mtdblock3; the kernel skips initrd via
+elif [[ "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
+    # PicoGUI / Microwindows direct JFFS2 root, same shape as Opie above.
+    # The donor rootfs lives on /dev/mtdblock3; the kernel skips initrd via
     # `noinitrd` and the 2.4 Makefile-mandated arch/mips/ramdisk/ramdisk.gz
     # is the 20-byte gzip-of-empty placeholder written in section 3.
     cp "$PROM_C" "$PROM_C.cmdline-bak"
@@ -711,7 +730,7 @@ elif [[ "$ROOT_MODE" == "pgui" ]]; then
     # a small built-in port list and may not hit 0x300 explicitly.
     PGUI_CMDLINE="consoleblank=0 noinitrd root=/dev/mtdblock3 rootfstype=jffs2 init=/sbin/init console=${BE300_2_4_CONSOLE} ne=0x300,72"
     sed -i "s|console=tty0 consoleblank=0 root=/dev/ram rootfstype=ext2 init=/sbin/init|$PGUI_CMDLINE|" "$PROM_C"
-    echo "--- patched prom.c for PicoGUI direct JFFS2 root cmdline (${BE300_2_4_CONSOLE}) ---"
+    echo "--- patched prom.c for $ROOT_MODE direct JFFS2 root cmdline (${BE300_2_4_CONSOLE}) ---"
 fi
 
 # 4. Configure
@@ -751,7 +770,7 @@ fi
 # structs remain.  The same overlay is sound for the PicoGUI profile:
 # TMPFS/RAMFS/DEVPTS are over-provisioned (picogui's rcS only mounts /proc)
 # but harmless, and useful for any post-build inittab tweaks.
-if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
+if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     if [[ -f "$REPO/configs/be300_2_4_opie.config" ]]; then
         echo "--- merging configs/be300_2_4_opie.config for $ROOT_MODE mode ---"
         sed -i \
@@ -766,9 +785,9 @@ if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
     fi
 fi
 
-# pgui: also merge networking overlay (NETDEVICES + NE2000 ISA driver)
+# pgui/mw: also merge networking overlay (NETDEVICES + NE2000 ISA driver)
 # so the emulator's --ne2000 PCMCIA NE2000 card registers as eth0.
-if [[ "$ROOT_MODE" == "pgui" ]]; then
+if [[ "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     if [[ -f "$REPO/configs/be300_2_4_net.config" ]]; then
         echo "--- merging configs/be300_2_4_net.config for pgui networking ---"
         sed -i \
@@ -801,11 +820,11 @@ fi
 # already accepted above: no early-boot kernel printk over serial
 # (fbcon/LCD only).  The dep_bool has no `default y`, so disabling it in
 # the seed .config survives `make oldconfig`.
-if [[ ( "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ) && "$BE300_2_4_CONSOLE" != "ttyS0" ]]; then
+if [[ ( "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ) && "$BE300_2_4_CONSOLE" != "ttyS0" ]]; then
     sed -i 's|^CONFIG_SERIAL_BE300_CONSOLE=y$|# CONFIG_SERIAL_BE300_CONSOLE is not set|' \
         "$SOURCE_DIR/.config"
     echo "--- disabled CONFIG_SERIAL_BE300_CONSOLE (clean getty UARTs) ---"
-elif [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
+elif [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     echo "--- keeping CONFIG_SERIAL_BE300_CONSOLE for ttyS0 console ---"
 fi
 # `yes ""` keeps writing after `make oldconfig` closes its stdin, which raises
@@ -1277,6 +1296,345 @@ PYEOF
     echo "  rootfs : $(ls -la "$JFFS2_ROOTFS" | awk '{print $5, $9}')"
 fi
 
+# Microwindows / Nano-X profile: BusyBox + uClibc 0.9.19 + nano-X server +
+# nanowm + launcher + ~30 Nano-X demo apps in /bin (ntetris, nxclock,
+# nxterm, nxkbd, nxmag, ...).  The donor ramdisk is a 2003 linux4be
+# microwindows-demo build extracted from vmlinux-mw.
+if [[ "$ROOT_MODE" == "mw" ]]; then
+    echo "--- Building JFFS2 rootfs from microwindows ramdisk contents ---"
+    JFFS2_ROOTFS="$REPO/linux-4.2.9/rootfs-2_4-mw.jffs2"
+    DEVTABLE_PGUI="$REPO/board/casio-be300/be300_2_4_devtable.txt"
+    [[ -f "$DEVTABLE_PGUI" ]] || { echo "ERROR: $DEVTABLE_PGUI missing" >&2; exit 1; }
+    [[ -f "$PGUI_ROOTFS_GZ" ]] || { echo "ERROR: $PGUI_ROOTFS_GZ missing (section 3 should have produced it)" >&2; exit 1; }
+    JFFS2_WORK=$(mktemp -d)
+    trap '[[ -f "'"$PROM_C"'.cmdline-bak" ]] && mv "'"$PROM_C"'.cmdline-bak" "'"$PROM_C"'" || true; rm -rf "'"$JFFS2_WORK"'"' EXIT
+
+    cp "$PGUI_ROOTFS_GZ" "$JFFS2_WORK/rd.gz"
+    gunzip -f "$JFFS2_WORK/rd.gz"
+    mkdir "$JFFS2_WORK/root"
+    debugfs -R "rdump / $JFFS2_WORK/root" "$JFFS2_WORK/rd" >/dev/null
+
+    # Same /dev cleanup as pgui (rdump fabricates regular files for char
+    # devs; the static devtable owns them at runtime).
+    find "$JFFS2_WORK/root/dev" -maxdepth 1 -type f -delete 2>/dev/null || true
+    # Drop any rdumped symlinks that collide with devtable char nodes.
+    rm -f "$JFFS2_WORK/root/dev/tty0" "$JFFS2_WORK/root/dev/fb"
+
+    # The mw donor ships an /etc/profile but no /etc/passwd or /etc/group.
+    # Add the same stubs the pgui path uses so `id`, `whoami`, and shell
+    # prompt rendering work.  Append to existing profile (preserves the
+    # donor's SDL_NOMOUSE=1 / USER=root) instead of clobbering.
+    cat > "$JFFS2_WORK/root/etc/passwd" <<'PWD_'
+root:x:0:0:root:/:/bin/sh
+PWD_
+    cat > "$JFFS2_WORK/root/etc/group" <<'GRP_'
+root:x:0:
+GRP_
+    cat >> "$JFFS2_WORK/root/etc/profile" <<'PROFILE_'
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export HOME=/
+export TERM=xterm
+export PS1='# '
+PROFILE_
+    echo "--- staged /etc/passwd + /etc/group + appended /etc/profile ---"
+
+    # Wrapper that nxterm execs as its child.  Forces interactive mode
+    # explicitly: busybox sh started by execv("/bin/sh", "/bin/sh", NULL)
+    # is non-interactive by default — no PS1, no command echo — even
+    # when stdin/stdout are a tty.  Setting up the env in this wrapper
+    # also avoids depending on nxterm to call /etc/profile (it doesn't).
+    cat > "$JFFS2_WORK/root/usr/bin/mw-shell" <<'SHWRAP'
+#!/bin/sh
+# /usr/bin precedes /bin in PATH so the ls/grep shims (below) shadow
+# the busybox applets and pipe through cat — that makes isatty(stdout)
+# false inside busybox, which is what its color-output code keys off.
+# Setting TERM=dumb/vt100 doesn't suppress 0.60.5's ls colors; the
+# isatty trick does.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export HOME=/
+export USER=root
+export TERM=vt100
+export PS1='# '
+# Print diagnostic banner so we can confirm the shim landed and what
+# /bin/ls actually is on this boot.  Goes to stderr (nxterm tty).
+echo "=== mw-shell debug ===" 1>&2
+echo "/bin/ls -la /bin/ls:" 1>&2
+/bin/busybox ls -la /bin/ls 1>&2
+echo "head /bin/ls:" 1>&2
+/bin/busybox head -3 /bin/ls 1>&2
+echo "PATH=$PATH" 1>&2
+echo "===" 1>&2
+exec /bin/sh -i
+SHWRAP
+    chmod 0755 "$JFFS2_WORK/root/usr/bin/mw-shell"
+
+    # Patch nxterm's hardcoded window geometry.  The 2003 nxterm binary
+    # was built without BE300_TOUCHSCREEN defined, so it uses the source
+    # defaults stdcol=80 stdrow=50 (microwindows/src/demos/nanox/nxterm.c
+    # lines 75-77), producing a 480x650 px window at 6x13 SystemFixed
+    # which is twice the 240x320 LCD in both axes.  The -g flag in the
+    # donor binary is advertised but not honored (verified at runtime).
+    # Patch the two `li t8, <imm>` instructions in main() that load the
+    # initial col/row values:
+    #   vaddr 0x406ecc:  ADDIU t8,$0,80  (0x24180050)  -> 38 (0x24180026)
+    #   vaddr 0x406fac:  ADDIU t8,$0,50  (0x24180032)  -> 20 (0x24180014)
+    # giving a 228x260 px window that fits the LCD with the title bar.
+    python3 - "$JFFS2_WORK/root/bin/nxterm" <<'PYEOF'
+import struct, sys
+p = sys.argv[1]
+with open(p, 'rb') as f: d = bytearray(f.read())
+e_phoff = struct.unpack_from('<I', d, 28)[0]
+e_phnum = struct.unpack_from('<H', d, 44)[0]
+def va2off(va):
+    for i in range(e_phnum):
+        base = e_phoff + i*32
+        p_type, p_offset, p_vaddr, _pa, p_filesz, _ms, _f, _a = \
+            struct.unpack_from('<IIIIIIII', d, base)
+        if p_type == 1 and p_vaddr <= va < p_vaddr + p_filesz:
+            return p_offset + (va - p_vaddr)
+    raise SystemExit("vaddr 0x%x not in any LOAD segment" % va)
+off1 = va2off(0x406ecc)  # stdcol: li t8, 80
+off2 = va2off(0x406fac)  # stdrow: li t8, 50
+if bytes(d[off1:off1+4]) != b'\x50\x00\x18\x24':
+    raise SystemExit("nxterm stdcol pattern at file off 0x%x mismatch: got %s" %
+                     (off1, bytes(d[off1:off1+4]).hex()))
+if bytes(d[off2:off2+4]) != b'\x32\x00\x18\x24':
+    raise SystemExit("nxterm stdrow pattern at file off 0x%x mismatch: got %s" %
+                     (off2, bytes(d[off2:off2+4]).hex()))
+d[off1] = 0x26  # 80 -> 38
+d[off2] = 0x14  # 50 -> 20
+open(p, 'wb').write(d)
+print("nxterm patched: stdcol 80->38, stdrow 50->20 (window fits 240x320)")
+PYEOF
+
+    # Touch bridge — 2003 nano-X has no /dev/input device strings, so
+    # it can't read the BE-300 touchscreen on its own.  be300_nxbridge
+    # reads /dev/input/event1 (touch — patch 0010 evdev) and forwards
+    # via GrInjectPointerEvent over /tmp/.nano-X.  Built freestanding
+    # with raw o32 syscalls (same recipe as be300_inputbridge for pgui)
+    # so it runs on the 2.4.18 + uClibc 0.9.19 donor rootfs without
+    # needing a matching libc toolchain.
+    NXBRIDGE_BIN="$JFFS2_WORK/root/usr/bin/be300_nxbridge"
+    mkdir -p "$(dirname "$NXBRIDGE_BIN")"
+    mipsel-linux-gnu-gcc -march=mips2 -static -nostdlib -nostdinc \
+        -fno-pic -mno-abicalls -fomit-frame-pointer -fno-builtin \
+        -Os -Wall -Wl,--entry=_start \
+        -o "$NXBRIDGE_BIN" "$REPO/board/casio-be300/be300_nxbridge.c"
+    mipsel-linux-gnu-strip "$NXBRIDGE_BIN"
+    chmod 0755 "$NXBRIDGE_BIN"
+    python3 -c "
+import struct, sys
+p = sys.argv[1]
+with open(p, 'rb') as f: d = bytearray(f.read())
+ef = struct.unpack_from('<I', d, 36)[0]
+new = (ef & ~0xF0000000) | 0x10000000
+if new != ef:
+    struct.pack_into('<I', d, 36, new)
+    open(p, 'wb').write(d)
+" "$NXBRIDGE_BIN"
+    echo "--- built be300_nxbridge $(stat -c%s "$NXBRIDGE_BIN" 2>/dev/null || stat -f%z "$NXBRIDGE_BIN") bytes ---"
+
+    # ls/grep shims that defeat busybox 0.60.5's color-output detection
+    # by piping through cat (forces isatty(stdout)=0 inside busybox, so
+    # it omits the SGR escapes nxterm renders literally).  Lighter than
+    # a sed-strip pass and works without --color=never (busybox 0.60.5
+    # doesn't grok --color args).
+    #
+    # Replace /bin/ls (a symlink to busybox) directly so the shim is
+    # invoked regardless of PATH lookup — an earlier attempt to drop the
+    # shim into /usr/bin/ls with /usr/bin first in PATH did not take
+    # effect (likely a busybox sh path-hash quirk).  /bin/grep
+    # mirrors the pattern.
+    rm -f "$JFFS2_WORK/root/bin/ls" "$JFFS2_WORK/root/bin/grep"
+    # Use a temp file rather than a pipe — BusyBox 0.60.5 sh's pipeline
+    # appears to hang on this kernel/uClibc combination (observed: the
+    # ls output truncates partway and the shell never returns to its
+    # prompt).  Redirecting to a file still defeats isatty(STDOUT) inside
+    # busybox ls, which is what its color code keys off, so colors stay
+    # suppressed without the pipe.
+    cat > "$JFFS2_WORK/root/bin/ls" <<'LS_'
+#!/bin/sh
+T=/tmp/.ls.$$
+/bin/busybox ls "$@" >$T 2>&1
+RC=$?
+/bin/busybox cat $T
+/bin/busybox rm -f $T
+exit $RC
+LS_
+    chmod 0755 "$JFFS2_WORK/root/bin/ls"
+    cat > "$JFFS2_WORK/root/bin/grep" <<'GR_'
+#!/bin/sh
+T=/tmp/.grep.$$
+/bin/busybox grep "$@" >$T 2>&1
+RC=$?
+/bin/busybox cat $T
+/bin/busybox rm -f $T
+exit $RC
+GR_
+    chmod 0755 "$JFFS2_WORK/root/bin/grep"
+
+    # Diagnostic wrapper for the nxterm-rendering question.  Prints a
+    # banner BEFORE handing off to /bin/sh -i so we can tell "nxterm is
+    # silent because the shell is silent" apart from "nxterm doesn't
+    # render output at all".  Each line is also tee'd to a log on tmpfs
+    # so the user can recover what was attempted in case the screen
+    # stays black.
+    cat > "$JFFS2_WORK/root/usr/bin/mw-diag" <<'DIAG'
+#!/bin/sh
+exec 1>/tmp/mw-diag.out 2>&1
+echo "==== mw-diag start ===="
+echo "pid=$$  argv0=$0  stdin tty? $(tty 2>/dev/null || echo no)"
+echo "uname: $(uname -a)"
+echo "ls /:"
+ls /
+echo "date: $(date)"
+echo "TERM=$TERM"
+# Now restore stdio to whatever nxterm gave us (re-open the controlling tty).
+exec </dev/tty >/dev/tty 2>/dev/tty
+cat /tmp/mw-diag.out
+echo "==== handing off to /bin/sh -i ===="
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/ USER=root TERM=xterm PS1='# '
+exec /bin/sh -i
+DIAG
+    chmod 0755 "$JFFS2_WORK/root/usr/bin/mw-diag"
+
+    # Resolver setup: /etc/resolv.conf -> /tmp/resolv.conf (tmpfs at
+    # runtime), and a static /etc/hosts since the emulator NATs TCP but
+    # ships no DNS forwarder.  Same content as the pgui path.
+    ln -sf /tmp/resolv.conf "$JFFS2_WORK/root/etc/resolv.conf"
+    cat > "$JFFS2_WORK/root/etc/hosts" <<'HOSTS'
+127.0.0.1   localhost
+93.184.215.14   example.com
+93.184.215.14   www.example.com
+1.1.1.1     cloudflare cf one.one.one.one
+8.8.8.8     dns google-public-dns
+208.67.222.222   opendns
+HOSTS
+
+    # Production mw rcS.  CWD must be "/" when launcher runs because
+    # /bin/launcher.cnf references icons + binaries with "bin/..."
+    # prefixes (CWD-relative).  Nano-X opens /dev/fb0 directly (already
+    # in static devtable as char 29:0) and /dev/tty0 for keyboard input
+    # via VT raw-kbd ioctls — both are present.  Touch may not work out
+    # of the box: the 2003 nano-X binary contains no /dev/input or
+    # /dev/be300tpanel device strings, so its compiled-in mouse driver
+    # is probably a stub or expects a legacy device path our 4.2.9-style
+    # patch series doesn't create.  Userspace bridge can come later.
+    cat > "$JFFS2_WORK/root/etc/init.d/rcS" <<'RCSMW'
+#!/bin/sh
+/bin/mount -t proc none /proc
+/bin/mount -t devpts devpts /dev/pts 2>/dev/null
+/bin/mount -t tmpfs -o size=1m tmpfs /tmp 2>/dev/null
+/bin/hostname linux4be
+/bin/echo "Welcome to Linux4BE (microwindows)"
+
+# Loopback (BusyBox ifconfig 2.4.x does not auto-install 127.0.0.0/8).
+/sbin/ifconfig lo 127.0.0.1 netmask 255.0.0.0 up
+/sbin/route add -net 127.0.0.0 netmask 255.0.0.0 lo 2>/dev/null
+
+# eth0 (NE2000 at 0x300 IRQ 72 via patches 0013 + ne=0x300,72 cmdline).
+# gxemul user-mode NAT: 10.0.0.0/8 with gateway/DNS at 10.0.0.254
+# (NOT QEMU 10.0.2.x).  Boot with --ne2000 --net-mac 02:de:ad:be:ef:02.
+/sbin/ifconfig eth0 10.0.0.1 netmask 255.0.0.0 up 2>/dev/null
+/sbin/route add default gw 10.0.0.254 2>/dev/null
+echo 'nameserver 10.0.0.254' > /tmp/resolv.conf
+echo 'nameserver 8.8.8.8'    >> /tmp/resolv.conf
+
+# Nano-X expects CWD=/ so launcher.cnf "bin/..." paths resolve.
+cd /
+# nano-X server: opens /dev/fb0 + /dev/tty0.  -x 240 -y 320 explicitly
+# matches the BE-300 LCD geometry; without these flags nano-X 2003 picks
+# a default of 320x240 (landscape, palmtop convention) and clients render
+# wider than the framebuffer, cutting text off the right edge.  Log to
+# /tmp so we can read back why clients fail to connect if the screen
+# stays blank.
+/bin/nano-X -x 240 -y 320 >/tmp/nano-X.log 2>&1 &
+NANOX=$!
+# Nano-X creates /tmp/.nano-X (its UNIX-domain socket) once it has
+# initialized the screen.  Wait for the socket before launching clients —
+# 1-second sleeps weren't long enough; clients failed to connect and
+# exited silently, leaving the screen at the nano-X splash.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -S /tmp/.nano-X ] && break
+    sleep 1
+done
+# Window manager.
+/bin/nanowm >/tmp/nanowm.log 2>&1 &
+sleep 1
+# Terminal — full-screen on the 240x320 LCD.  /usr/bin/mw-shell exports
+# PS1/TERM/PATH and execs /bin/sh -i.  Requires the BSD pty nodes
+# /dev/ptyp0..15 and /dev/ttyp0..15 (added to be300_2_4_devtable.txt) —
+# the 2003 nxterm binary hardcodes `/dev/ptyp%d` (no fallback) and was
+# silently failing to allocate a pty before those nodes existed.
+#
+# Empirically the 2003 nxterm IGNORES the `[program {args}]` argv tail
+# (verified May 24 2026: mw-shell ran no diagnostics; BusyBox banner
+# from /bin/sh -i appeared regardless).  nxterm reads the SHELL env
+# var to pick what to launch (strings show `SHELL=` + getenv()), so
+# point that at our wrapper.  nxterm also force-sets TERM=vt52 for
+# the child; mw-shell re-exports TERM=vt100 to undo that.
+export SHELL=/usr/bin/mw-shell
+# Touch bridge: /dev/input/event1 -> GrInjectPointerEvent.  Must run
+# AFTER nano-X has created /tmp/.nano-X (the bridge retries the connect
+# up to 30 x 200 ms internally, but we still gate on the socket file
+# above for sanity).
+/usr/bin/be300_nxbridge </dev/null >/tmp/nxbridge.log 2>&1 &
+# launcher (the donor's tappable taskbar from launcher.cnf) brings up
+# a panel with Tetris / NanoBreaker / Landmine / Slider / Terminal /
+# Clock / Magnifier / Scribble / SoftKeyboard / Roach / Tux / NXEyes
+# entries.  Each tap forks the named binary — Terminal launches nxterm.
+# CWD must be / because launcher.cnf uses bin/-relative paths.
+cd /
+/bin/launcher /bin/launcher.cnf >/tmp/launcher.log 2>&1 &
+wait $NANOX
+RCSMW
+    chmod 0755 "$JFFS2_WORK/root/etc/init.d/rcS"
+
+    # ELF e_flags rewrite (mips32r2 -> mips2) — idempotent for 2003
+    # binaries which are already pre-2009 format.  Same as pgui path.
+    echo "--- Rewriting ELF e_flags arch bits for 2.4.18 elf_check_arch ---"
+    python3 - "$JFFS2_WORK/root" <<'PYEOF'
+import os, struct, sys
+root = sys.argv[1]
+patched = 0
+for dirpath, _, files in os.walk(root):
+    for fn in files:
+        p = os.path.join(dirpath, fn)
+        try:
+            if os.path.islink(p):
+                continue
+            with open(p, 'rb') as f:
+                head = f.read(40)
+            if head[:4] != b'\x7fELF':
+                continue
+            if head[4] != 1 or head[5] != 1:
+                continue
+            machine = struct.unpack_from('<H', head, 18)[0]
+            if machine != 8:
+                continue
+            ef = struct.unpack_from('<I', head, 36)[0]
+            new = (ef & ~0xF0000000) | 0x10000000
+            if new == ef:
+                continue
+            with open(p, 'r+b') as f:
+                f.seek(36)
+                f.write(struct.pack('<I', new))
+            patched += 1
+        except (OSError, struct.error):
+            pass
+print(f'patched {patched} ELF files (0x70000000 -> 0x10000000)')
+PYEOF
+
+    echo "--- Building JFFS2 image $JFFS2_ROOTFS ---"
+    mkfs.jffs2 --root="$JFFS2_WORK/root" \
+        --devtable="$DEVTABLE_PGUI" \
+        --eraseblock=16384 --pagesize=512 --no-cleanmarkers \
+        --pad=0xB00000 --little-endian \
+        --output="$JFFS2_ROOTFS"
+    echo "  rootfs : $(ls -la "$JFFS2_ROOTFS" | awk '{print $5, $9}')"
+fi
+
 if [[ "$ROOT_MODE" == "opie" ]]; then
     echo "--- Building BusyBox + Opie 1.2.5 rootfs via build_be300_kernel.sh ---"
     OPIE_ROOTFS_DIR="/work/rootfs_be300_opie"
@@ -1542,7 +1900,7 @@ ls -l "$OUT"
 echo ""
 echo "Boot with:"
 echo "  ./bin/be300 --nand ${OUT#$REPO/} --speed 0 --detect-stall"
-if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
+if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     echo ""
     echo "Serial console:"
     echo "  ./bin/be300 --nand ${OUT#$REPO/} --speed 0 --serial1-bridge pty:auto"
