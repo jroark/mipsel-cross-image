@@ -9,3 +9,15 @@
 #   future diagnostics; re-enable by uncommenting this line.
 0008-be300-2_4-add-exit_group-syscall.patch
 0009-be300-fix-serial-console.patch
+0010-be300-2_4-touch-evdev.patch
+0012-be300-ip-fast-csum-portable-c.patch
+0013-be300-pcmcia-bridge-enable.patch
+# 0011-be300-2_4-touch-poll-debug.patch -- DISABLED (May 16 2026):
+#   throwaway diagnostic (poll-tick coord dump + input_dev handler
+#   chain dump + evdev open/event/poll/read probes gated to minor 1).
+#   It proved the kernel touch path (patch 0010) is correct: decodes
+#   correct coords, registers the input_dev, evdev forwards to qpe's
+#   open fd. The remaining failure (OPIE does not see touch/keys) is a
+#   separate qpe/Qt-on-2.4.18 event-loop defect, NOT a kernel bug.
+#   Keep the patch file for future input diagnostics; re-enable by
+#   uncommenting this line.

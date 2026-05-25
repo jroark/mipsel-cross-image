@@ -66,6 +66,11 @@
 /mipsel-uclibc-g++
 /uclibc-gcc.specs
 /ramdisk-pgui-full.gz
+# Donor vmlinux blobs for the 2.4.18 picogui-demo/test1 ramdisk
+# extraction (BE300_2_4_RAMDISK_SRC).  See CLAUDE.md / build_be300_2_4_pgui_demo_nand.sh.
+/vmlinux-pgui-demo
+/vmlinux-pgui-test1
+/vmlinux-pgui-test*
 # Large hardware reference PDFs (kept local only; see docs/hw_notes.txt)
 /docs/Vr4131-um_200203.pdf
 /docs/Vrc4173.pdf

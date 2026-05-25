@@ -1,0 +1,112 @@
+BE-300 2.4.18: replace inline-asm ip_fast_csum with portable C.
+
+The original include/asm-mips/checksum.h's ip_fast_csum() is hand-written
+inline asm with output operands `"=&r" (sum), "=&r" (iph), "=&r" (ihl),
+"=&r" (dummy)` and matching inputs `"1" (iph), "2" (ihl)`.  Under modern
+GCC (verified with gcc 10.3.0 from the Debian mipsel-linux-gnu toolchain
+plus -fgnu89-inline + -O2) the asm produces a sum byte pattern that does
+not match what the receiver's inlined ip_fast_csum re-computes for the
+same header.  The kernel boots fine and listen() succeeds, but every
+loopback connect() times out because ip_rcv silently drops the SYN
+packets with InHdrErrors (csum != 0).
+
+  Concrete observation on a `socket+bind+listen / fork / connect`
+  self-test: child's connect() returns ETIMEDOUT (-145), and after the
+  test /proc/net/snmp shows
+      Ip: ... InReceives=3 InHdrErrors=3 ... InDelivers=0
+  The same userspace runs fine on the original linux4be vmlinux (built
+  with gcc 3.0.1 in 2002) and on real BE-300 silicon, so the kernel
+  source itself is good — only the gcc-10 codegen for this particular
+  asm constraint pattern is bad.
+
+Replacing the asm with a small portable C version produces the
+arithmetically-equivalent checksum and is fast enough on the VR4131 to
+have no measurable boot-time impact.  TCP loopback then works
+end-to-end: a bare TCP self-test reports `connect OK`, /proc/net/snmp
+shows InDelivers > 0, and the picogui-demo userspace (booted from JFFS2
+on /dev/mtdblock3) now reaches its full launcher with pgboard / omnibar /
+canvastst all connected.
+
+Bisection that led here:
+  * 0003, 0005, 0008, 0009, 0010 individually-skipped: no change (still
+    white screen / connect ETIMEDOUT).
+  * 0006 skipped: JFFS2 mount fails (required for any boot).
+  * Rebuild with -O1 / -O0 / -Os: no change or build failure.
+  * Reverting the patch-0001 `extern __inline__ → static __inline__`
+    conversion in asm-mips/{bitops,atomic,system,pgalloc}.h: no change.
+  * Adding ip_rcv InHdrError-path printk diagnostics: revealed that
+    every loopback packet failed ip_fast_csum() validation.
+  * Computed expected vs stored checksum: the diff was the value of one
+    of the IP-header bytes (e.g. 0x40 = DF-flag byte), suggesting the
+    asm path was either missing or double-counting that byte under
+    modern gcc register allocation.
+--- a/include/asm-mips/checksum.h
++++ b/include/asm-mips/checksum.h
+@@ -95,48 +95,27 @@
+ static inline unsigned short ip_fast_csum(unsigned char *iph,
+ 					  unsigned int ihl)
+ {
+-	unsigned int sum;
+-	unsigned long dummy;
+-
+-	/*
+-	 * This is for 32-bit MIPS processors.
+-	 */
+-	__asm__ __volatile__(
+-	".set\tnoreorder\t\t\t# ip_fast_csum\n\t"
+-	".set\tnoat\n\t"
+-	"lw\t%0, (%1)\n\t"
+-	"subu\t%2, 4\n\t"
+-	"#blez\t%2, 2f\n\t"
+-	" sll\t%2, 2\n\t"
+-	"lw\t%3, 4(%1)\n\t"
+-	"addu\t%2, %1\n\t"
+-	"addu\t%0, %3\n\t"
+-	"sltu\t$1, %0, %3\n\t"
+-	"lw\t%3, 8(%1)\n\t"
+-	"addu\t%0, $1\n\t"
+-	"addu\t%0, %3\n\t"
+-	"sltu\t$1, %0, %3\n\t"
+-	"lw\t%3, 12(%1)\n\t"
+-	"addu\t%0, $1\n\t"
+-	"addu\t%0, %3\n\t"
+-	"sltu\t$1, %0, %3\n\t"
+-	"addu\t%0, $1\n"
+-
+-	"1:\tlw\t%3, 16(%1)\n\t"
+-	"addiu\t%1, 4\n\t"
+-	"addu\t%0, %3\n\t"
+-	"sltu\t$1, %0, %3\n\t"
+-	"bne\t%2, %1, 1b\n\t"
+-	" addu\t%0, $1\n"
+-
+-	"2:\t.set\tat\n\t"
+-	".set\treorder"
+-	: "=&r" (sum), "=&r" (iph), "=&r" (ihl), "=&r" (dummy)
+-	: "1" (iph), "2" (ihl));
+-
+-	return csum_fold(sum);
++	/* Portable C version: bypasses a modern-gcc (10.x) miscompile
++	 * of the original inline asm where the receiver's inlined
++	 * ip_fast_csum() computed a different bit pattern than the
++	 * sender's, causing every loopback packet to be dropped with
++	 * ip_rcv InHdrErrors.  See patches/linux-2.4.18-be300/
++	 * 0012-be300-ip-fast-csum-portable-c.patch for the diagnosis. */
++	unsigned int sum = 0;
++	unsigned int i;
++	for (i = 0; i < ihl; i++) {
++		unsigned int w = *(unsigned int *)(iph + i * 4);
++		sum += w;
++		if (sum < w)
++			sum++;	/* end-around carry */
++	}
++	/* Fold 32 -> 16. */
++	sum = (sum & 0xffff) + (sum >> 16);
++	sum = (sum & 0xffff) + (sum >> 16);
++	return (unsigned short)(~sum);
+ }
+ 
++
+ /*
+  * computes the checksum of the TCP/UDP pseudo-header
+  * returns a 16-bit checksum, already complemented

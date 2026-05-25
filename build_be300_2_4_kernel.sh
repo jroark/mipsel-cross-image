@@ -110,7 +110,10 @@ set -euo pipefail
 
 REPO=/work
 MODE="${BE300_2_4_MODE:-rebuild}"
-PREBUILT_VMLINUX="$REPO/kernels/vmlinux-2.4"
+# Default prebuilt kernel donor (override with BE300_2_4_PREBUILT_VMLINUX).
+# Used by prebuilt mode AND as the initrd source for the rebuild path's
+# ramdisk extract step.
+PREBUILT_VMLINUX="${BE300_2_4_PREBUILT_VMLINUX:-$REPO/kernels/vmlinux-2.4}"
 SOURCE_DIR="$REPO/linux-2.4.18"
 BUILT_VMLINUX="$SOURCE_DIR/vmlinux"
 PATCH_SERIES="$REPO/patches/linux-2.4.18-be300/series"
@@ -165,8 +168,18 @@ case "$BE300_2_4_UI" in
         ROOT_MODE="opie"
         OUT="${BE300_2_4_NAND:-$REPO/linux-4.2.9/be300-2_4-opie.nand}"
         ;;
+    pgui)
+        # BE300_2_4_UI=pgui sources the rootfs from a prebuilt 2.4 vmlinux
+        # that carries a BusyBox + uClibc 0.9.15 + picogui ramdisk at
+        # __rd_start..__rd_end (default: $REPO/vmlinux-pgui-test1, override
+        # with BE300_2_4_RAMDISK_SRC).  Source-builds a fresh 2.4.18
+        # vmlinux with the existing patch series, packs the picogui rootfs
+        # onto NAND mtd3 as JFFS2, boots noinitrd root=/dev/mtdblock3.
+        ROOT_MODE="pgui"
+        OUT="${BE300_2_4_NAND:-$REPO/linux-4.2.9/be300-2_4-pgui.nand}"
+        ;;
     *)
-        echo "ERROR: BE300_2_4_UI must be 'none' or 'opie' (got '$BE300_2_4_UI')" >&2
+        echo "ERROR: BE300_2_4_UI must be 'none', 'opie', or 'pgui' (got '$BE300_2_4_UI')" >&2
         exit 2
         ;;
 esac
@@ -181,8 +194,8 @@ case "$BE300_2_4_CONSOLE" in
         ;;
 esac
 
-if [[ "$ROOT_MODE" != "initrd" && "$ROOT_MODE" != "nand" && "$ROOT_MODE" != "cf" && "$ROOT_MODE" != "opie" ]]; then
-    echo "ERROR: BE300_2_4_ROOT must be 'initrd', 'nand', 'cf', or 'opie' (got '$ROOT_MODE')" >&2
+if [[ "$ROOT_MODE" != "initrd" && "$ROOT_MODE" != "nand" && "$ROOT_MODE" != "cf" && "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" ]]; then
+    echo "ERROR: BE300_2_4_ROOT must be 'initrd', 'nand', 'cf', 'opie', or 'pgui' (got '$ROOT_MODE')" >&2
     exit 2
 fi
 
@@ -241,14 +254,97 @@ fi
 # in a 20-byte gzip-of-empty placeholder so the link succeeds while
 # CONFIG_BLK_DEV_INITRD=n keeps the kernel from probing it.
 RAMDISK_GZ="$SOURCE_DIR/arch/mips/ramdisk/ramdisk.gz"
-if [[ "$ROOT_MODE" == "opie" ]]; then
+# 20-byte gzip-of-empty placeholder used by opie/pgui where the kernel
+# does not embed a real initrd (noinitrd cmdline + JFFS2 root) but the
+# 2.4 Makefile still link-includes arch/mips/ramdisk/ramdisk.o.  If a
+# previous initrd/nand build already populated ramdisk.gz with the
+# real linux4be initrd, leave it alone — noinitrd makes the contents
+# inert at boot, and not overwriting preserves the file for a later
+# switch back to initrd/nand mode.
+if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
     if [[ ! -f "$RAMDISK_GZ" ]]; then
         mkdir -p "$(dirname "$RAMDISK_GZ")"
         printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
             > "$RAMDISK_GZ"
     fi
 fi
-if [[ "$ROOT_MODE" != "opie" && ! -f "$RAMDISK_GZ" ]]; then
+# pgui: extract the picogui ramdisk to a side file (NOT arch/mips/ramdisk/
+# ramdisk.gz, because the kernel is built without an embedded initrd —
+# the picogui rootfs goes to mtd3 JFFS2 in section 5a).
+PGUI_RAMDISK_SRC="${BE300_2_4_RAMDISK_SRC:-$REPO/vmlinux-pgui-test1}"
+PGUI_ROOTFS_GZ="$SOURCE_DIR/.pgui-rootfs.gz"
+# Sidecar stamp records the source vmlinux that produced the cached
+# .pgui-rootfs.gz.  If the user re-runs with a different
+# BE300_2_4_RAMDISK_SRC, the cached blob is stale and must be regenerated;
+# without this check, switching donors silently packed the previous
+# donor's ramdisk onto the new NAND.
+PGUI_ROOTFS_STAMP="$PGUI_ROOTFS_GZ.src"
+if [[ "$ROOT_MODE" == "pgui" ]]; then
+    PGUI_CACHED_SRC=""
+    [[ -f "$PGUI_ROOTFS_STAMP" ]] && PGUI_CACHED_SRC=$(cat "$PGUI_ROOTFS_STAMP")
+    if [[ ! -f "$PGUI_ROOTFS_GZ" || "$PGUI_CACHED_SRC" != "$PGUI_RAMDISK_SRC" ]]; then
+        if [[ -f "$PGUI_ROOTFS_GZ" && "$PGUI_CACHED_SRC" != "$PGUI_RAMDISK_SRC" ]]; then
+            echo "--- Cached .pgui-rootfs.gz was from '$PGUI_CACHED_SRC', re-extracting from '$PGUI_RAMDISK_SRC' ---"
+            rm -f "$PGUI_ROOTFS_GZ" "$PGUI_ROOTFS_STAMP"
+            # Also drop the downstream JFFS2 so the new ramdisk lands on mtd3.
+            rm -f "$REPO/linux-4.2.9/rootfs-2_4-pgui.jffs2"
+        fi
+        echo "--- Extracting picogui rootfs from $PGUI_RAMDISK_SRC into $PGUI_ROOTFS_GZ ---"
+        [[ -f "$PGUI_RAMDISK_SRC" ]] || { echo "ERROR: $PGUI_RAMDISK_SRC missing" >&2; exit 1; }
+        python3 - <<PYEOF
+import struct
+data = open("$PGUI_RAMDISK_SRC","rb").read()
+e_shoff = struct.unpack_from('<I', data, 32)[0]
+e_shentsize = struct.unpack_from('<H', data, 46)[0]
+e_shnum = struct.unpack_from('<H', data, 48)[0]
+e_shstrndx = struct.unpack_from('<H', data, 50)[0]
+sec_shstr = struct.unpack_from('<IIIIIIIIII', data, e_shoff + e_shstrndx*e_shentsize)
+shstr_off = sec_shstr[4]
+def get_str(off): return data[shstr_off+off:].split(b'\x00',1)[0].decode()
+sections=[]
+for i in range(e_shnum):
+    o = e_shoff + i*e_shentsize
+    s = struct.unpack_from('<IIIIIIIIII', data, o)
+    sections.append((get_str(s[0]), s))
+symtab = next(s for n,s in sections if n=='.symtab')
+strtab = sections[symtab[6]][1]
+def get_strtab(off): return data[strtab[4]+off:].split(b'\x00',1)[0].decode()
+nsyms = symtab[5] // symtab[9]
+rd_start = rd_end = None
+for i in range(nsyms):
+    o = symtab[4] + i*symtab[9]
+    st_name, st_value, *_ = struct.unpack_from('<IIIBBH', data, o)
+    name = get_strtab(st_name)
+    if name == '__rd_start': rd_start = st_value
+    if name == '__rd_end':   rd_end   = st_value
+if rd_start is None or rd_end is None:
+    raise SystemExit("ERROR: $PGUI_RAMDISK_SRC missing __rd_start/__rd_end symbols")
+e_phoff = struct.unpack_from('<I', data, 28)[0]
+e_phnum = struct.unpack_from('<H', data, 44)[0]
+for i in range(e_phnum):
+    o = e_phoff + i*32
+    p_type, p_offset, p_vaddr, p_paddr, p_filesz, *_ = struct.unpack_from('<IIIIIIII', data, o)
+    if p_type == 1 and p_vaddr <= rd_start < p_vaddr + p_filesz:
+        rel = rd_start - p_vaddr
+        open("$PGUI_ROOTFS_GZ","wb").write(data[p_offset+rel : p_offset+rel + (rd_end-rd_start)])
+        print(f'wrote $PGUI_ROOTFS_GZ ({rd_end-rd_start} bytes)')
+        break
+PYEOF
+        # Record which source vmlinux this cache entry came from so a
+        # later run with a different BE300_2_4_RAMDISK_SRC re-extracts
+        # instead of silently reusing the wrong donor's ramdisk.
+        printf '%s' "$PGUI_RAMDISK_SRC" > "$PGUI_ROOTFS_STAMP"
+    fi
+    # Defensive size check: picogui ramdisk should be ~520 KiB (4 MiB ext2
+    # gzipped). Anything outside [1 KiB, 5 MiB] indicates wrong source or
+    # corrupted extraction.
+    PGUI_SZ=$(stat -c%s "$PGUI_ROOTFS_GZ" 2>/dev/null || stat -f%z "$PGUI_ROOTFS_GZ")
+    if (( PGUI_SZ < 1024 || PGUI_SZ > 5*1024*1024 )); then
+        echo "ERROR: $PGUI_ROOTFS_GZ size $PGUI_SZ outside [1024, 5242880] — wrong source vmlinux?" >&2
+        exit 1
+    fi
+fi
+if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" && ! -f "$RAMDISK_GZ" ]]; then
     echo "--- Extracting initrd from $PREBUILT_VMLINUX into $RAMDISK_GZ ---"
     [[ -f "$PREBUILT_VMLINUX" ]] || { echo "ERROR: $PREBUILT_VMLINUX missing" >&2; exit 1; }
     python3 - <<PYEOF
@@ -290,7 +386,7 @@ for i in range(e_phnum):
 PYEOF
 fi
 
-if [[ "$ROOT_MODE" != "opie" ]]; then
+if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" ]]; then
 
 # 3a. Build the userspace HW test program and inject it into the initrd.
 #
@@ -602,6 +698,20 @@ elif [[ "$ROOT_MODE" == "opie" ]]; then
     OPIE_CMDLINE="consoleblank=0 noinitrd root=/dev/mtdblock3 rootfstype=jffs2 init=/sbin/init console=${BE300_2_4_CONSOLE}"
     sed -i "s|console=tty0 consoleblank=0 root=/dev/ram rootfstype=ext2 init=/sbin/init|$OPIE_CMDLINE|" "$PROM_C"
     echo "--- patched prom.c for Opie direct JFFS2 root cmdline (${BE300_2_4_CONSOLE}) ---"
+elif [[ "$ROOT_MODE" == "pgui" ]]; then
+    # PicoGUI direct JFFS2 root, same shape as Opie above.  The picogui
+    # rootfs lives on /dev/mtdblock3; the kernel skips initrd via
+    # `noinitrd` and the 2.4 Makefile-mandated arch/mips/ramdisk/ramdisk.gz
+    # is the 20-byte gzip-of-empty placeholder written in section 3.
+    cp "$PROM_C" "$PROM_C.cmdline-bak"
+    trap '[[ -f "'"$PROM_C"'.cmdline-bak" ]] && mv "'"$PROM_C"'.cmdline-bak" "'"$PROM_C"'" || true' EXIT
+    # ne=0x300,72: force the NE2000 ISA driver to probe port 0x300 with
+    # IRQ 72 (= VRC4173_IRQ_BASE + 0, the BE-300 PCMCIA card IRQ; see
+    # board/casio-be300/irq.c).  Without this the ne.c probe scans only
+    # a small built-in port list and may not hit 0x300 explicitly.
+    PGUI_CMDLINE="consoleblank=0 noinitrd root=/dev/mtdblock3 rootfstype=jffs2 init=/sbin/init console=${BE300_2_4_CONSOLE} ne=0x300,72"
+    sed -i "s|console=tty0 consoleblank=0 root=/dev/ram rootfstype=ext2 init=/sbin/init|$PGUI_CMDLINE|" "$PROM_C"
+    echo "--- patched prom.c for PicoGUI direct JFFS2 root cmdline (${BE300_2_4_CONSOLE}) ---"
 fi
 
 # 4. Configure
@@ -630,17 +740,20 @@ if [[ "$ROOT_MODE" == "cf" ]]; then
     fi
 fi
 
-# Opie overlay: adds CONFIG_TMPFS/RAMFS/DEVPTS_FS so /etc/init.d/rcS can
-# mount tmpfs on /tmp + /root and devpts on /dev/pts before /bin/start-opie
-# spawns qpe.  CONFIG_BLK_DEV_INITRD stays on (the kernel tree assumes
-# it everywhere — rd_init, real_root_dev, setup.c::initrd_start are all
-# unconditionally referenced).  `noinitrd` on the cmdline tells the
-# kernel to skip mounting the bogus 20-byte placeholder ramdisk at
-# boot, so the 1.25 MiB allocation that was happening with the legacy
-# initrd is gone — only the preallocation structs remain.
-if [[ "$ROOT_MODE" == "opie" ]]; then
+# Opie/PicoGUI overlay: adds CONFIG_TMPFS/RAMFS/DEVPTS_FS so /etc/init.d/rcS
+# can mount tmpfs on /tmp + /root and devpts on /dev/pts before
+# /bin/start-opie spawns qpe.  CONFIG_BLK_DEV_INITRD stays on (the kernel
+# tree assumes it everywhere — rd_init, real_root_dev,
+# setup.c::initrd_start are all unconditionally referenced).  `noinitrd`
+# on the cmdline tells the kernel to skip mounting the bogus 20-byte
+# placeholder ramdisk at boot, so the 1.25 MiB allocation that was
+# happening with the legacy initrd is gone — only the preallocation
+# structs remain.  The same overlay is sound for the PicoGUI profile:
+# TMPFS/RAMFS/DEVPTS are over-provisioned (picogui's rcS only mounts /proc)
+# but harmless, and useful for any post-build inittab tweaks.
+if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
     if [[ -f "$REPO/configs/be300_2_4_opie.config" ]]; then
-        echo "--- merging configs/be300_2_4_opie.config for Opie mode ---"
+        echo "--- merging configs/be300_2_4_opie.config for $ROOT_MODE mode ---"
         sed -i \
             -e '/# CONFIG_TMPFS is not set/d' \
             -e '/# CONFIG_RAMFS is not set/d' \
@@ -650,6 +763,23 @@ if [[ "$ROOT_MODE" == "opie" ]]; then
             >> "$SOURCE_DIR/.config"
     else
         echo "WARNING: $REPO/configs/be300_2_4_opie.config missing" >&2
+    fi
+fi
+
+# pgui: also merge networking overlay (NETDEVICES + NE2000 ISA driver)
+# so the emulator's --ne2000 PCMCIA NE2000 card registers as eth0.
+if [[ "$ROOT_MODE" == "pgui" ]]; then
+    if [[ -f "$REPO/configs/be300_2_4_net.config" ]]; then
+        echo "--- merging configs/be300_2_4_net.config for pgui networking ---"
+        sed -i \
+            -e '/# CONFIG_ISA is not set/d' \
+            -e '/# CONFIG_NETDEVICES is not set/d' \
+            -e '/# CONFIG_NET_ETHERNET is not set/d' \
+            -e '/# CONFIG_NET_ISA is not set/d' \
+            -e '/# CONFIG_NE2000 is not set/d' \
+            "$SOURCE_DIR/.config"
+        grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$REPO/configs/be300_2_4_net.config" \
+            >> "$SOURCE_DIR/.config"
     fi
 fi
 
@@ -671,11 +801,11 @@ fi
 # already accepted above: no early-boot kernel printk over serial
 # (fbcon/LCD only).  The dep_bool has no `default y`, so disabling it in
 # the seed .config survives `make oldconfig`.
-if [[ "$ROOT_MODE" == "opie" && "$BE300_2_4_CONSOLE" != "ttyS0" ]]; then
+if [[ ( "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ) && "$BE300_2_4_CONSOLE" != "ttyS0" ]]; then
     sed -i 's|^CONFIG_SERIAL_BE300_CONSOLE=y$|# CONFIG_SERIAL_BE300_CONSOLE is not set|' \
         "$SOURCE_DIR/.config"
     echo "--- disabled CONFIG_SERIAL_BE300_CONSOLE (clean getty UARTs) ---"
-elif [[ "$ROOT_MODE" == "opie" ]]; then
+elif [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
     echo "--- keeping CONFIG_SERIAL_BE300_CONSOLE for ttyS0 console ---"
 fi
 # `yes ""` keeps writing after `make oldconfig` closes its stdin, which raises
@@ -686,6 +816,13 @@ fi
 ( cd "$SOURCE_DIR" && make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- dep >/dev/null 2>&1 )
 
 # 5. Build vmlinux
+# Optional: override the kernel -O level (BE300_2_4_KERNEL_O={0|1|s}).
+# Useful for chasing gcc-10 vs gcc-3 codegen regressions where the
+# default -O2 may miscompile legacy 2.4 source.
+if [[ -n "${BE300_2_4_KERNEL_O:-}" ]]; then
+    echo "--- overriding kernel -O2 -> -O${BE300_2_4_KERNEL_O} ---"
+    sed -i "s|-O2 |-O${BE300_2_4_KERNEL_O} |g" "$SOURCE_DIR/Makefile"
+fi
 echo "--- make vmlinux ---"
 ( cd "$SOURCE_DIR" && make ARCH=mips CROSS_COMPILE=mipsel-linux-gnu- vmlinux )
 [[ -f "$BUILT_VMLINUX" ]] || { echo "ERROR: build did not produce $BUILT_VMLINUX" >&2; exit 1; }
@@ -753,6 +890,387 @@ PYEOF
 
     mkfs.jffs2 --root="$JFFS2_WORK/root" \
         --devtable="$JFFS2_WORK/devtable" \
+        --eraseblock=16384 --pagesize=512 --no-cleanmarkers \
+        --pad=0xB00000 --little-endian \
+        --output="$JFFS2_ROOTFS"
+    echo "  rootfs : $(ls -la "$JFFS2_ROOTFS" | awk '{print $5, $9}')"
+fi
+
+# 5a-pgui. Build JFFS2 rootfs from the picogui ramdisk extracted in
+# section 3.  Distinct from `nand` mode in two ways: source is the
+# .pgui-rootfs.gz side file (NOT $RAMDISK_GZ — the kernel ships the
+# 20-byte placeholder), and devtable is the static
+# board/casio-be300/be300_2_4_devtable.txt (the picogui ramdisk's /dev
+# is mostly symlinks, so a dynamic walk would only emit /dev/tty0 — the
+# static table is a superset of what pgserver needs: /dev/fb0, /dev/console,
+# /dev/input/event[0-3], /dev/be300tpanel, /dev/mtdblock0..3, etc.).  The
+# rdumped /dev/fb -> fb0 symlink resolves against the static /dev/fb0
+# char node at runtime, which is exactly what pgserver.conf opens.
+if [[ "$ROOT_MODE" == "pgui" ]]; then
+    echo "--- Building JFFS2 rootfs from picogui ramdisk contents ---"
+    JFFS2_ROOTFS="$REPO/linux-4.2.9/rootfs-2_4-pgui.jffs2"
+    DEVTABLE_PGUI="$REPO/board/casio-be300/be300_2_4_devtable.txt"
+    [[ -f "$DEVTABLE_PGUI" ]] || { echo "ERROR: $DEVTABLE_PGUI missing" >&2; exit 1; }
+    [[ -f "$PGUI_ROOTFS_GZ" ]] || { echo "ERROR: $PGUI_ROOTFS_GZ missing (section 3 should have produced it)" >&2; exit 1; }
+    JFFS2_WORK=$(mktemp -d)
+    # Chain the prom.c restore (set in section 3b) with rootfs work cleanup.
+    trap '[[ -f "'"$PROM_C"'.cmdline-bak" ]] && mv "'"$PROM_C"'.cmdline-bak" "'"$PROM_C"'" || true; rm -rf "'"$JFFS2_WORK"'"' EXIT
+
+    # Decompress the picogui ramdisk and rdump it to a host directory.
+    cp "$PGUI_ROOTFS_GZ" "$JFFS2_WORK/rd.gz"
+    gunzip -f "$JFFS2_WORK/rd.gz"
+    mkdir "$JFFS2_WORK/root"
+    debugfs -R "rdump / $JFFS2_WORK/root" "$JFFS2_WORK/rd" >/dev/null
+
+    # Drop the host-fs /dev entries rdump created — they're either zero-byte
+    # placeholders for char devs (root can't mknod here under Docker) or
+    # regular files masquerading as symlinks.  Non-conflicting symlinks
+    # (/dev/fb -> fb0, /dev/ram -> ram1, /dev/std* -> /proc/self/fd/*,
+    # /dev/kcore -> /proc/kcore) are kept — they resolve against the
+    # devtable-created char nodes at runtime, and pgserver.conf opens
+    # /dev/fb specifically.  /dev/tty0 in the picogui ramdisk is a symlink
+    # to /dev/tty, but the static devtable creates /dev/tty0 as char 4:0
+    # — mkfs.jffs2 errors with "file type does not match specified type"
+    # unless we drop the symlink first.  Letting the devtable own /dev/tty0
+    # as char 4:0 is semantically equivalent (the symlink target /dev/tty
+    # is also char 4:0).
+    find "$JFFS2_WORK/root/dev" -maxdepth 1 -type f -delete 2>/dev/null || true
+    rm -f "$JFFS2_WORK/root/dev/tty0"
+
+    # Populate omnibar's Applications menu.  omnibar reads *.app files
+    # from /usr/share/picogui/appmenu/ and execlp()s the selected one
+    # (see picogui-jserv-be300-uclibc/pg1/apps/test/omnibar/omnibar.c).
+    # Generate a thin /bin/sh launcher for every picogui app in /usr/bin
+    # except the infrastructure binaries (pgserver, pgboard, omnibar)
+    # and dev tools (pgmon, resbuild) — and the -ja Japanese variants
+    # since the demo rootfs doesn't ship the matching CJK fonts.
+    APPMENU="$JFFS2_WORK/root/usr/share/picogui/appmenu"
+    mkdir -p "$APPMENU"
+    # The 2002 omnibar binary opendir's "demos" (relative to CWD) for
+    # the menu listing but builds the exec path as
+    # /usr/share/picogui/appmenu/<name>.app.  CWD is "/" (pgserver's
+    # CWD inherited via fork), so symlink /demos -> /usr/share/picogui/appmenu
+    # to satisfy both halves of the path mismatch with one set of files.
+    ln -sf usr/share/picogui/appmenu "$JFFS2_WORK/root/demos"
+    SKIP_APPS="pgserver pgboard pgboard_cmds omnibar pgmon resbuild hello-ja textedit-ja"
+
+    # Swap the default session-start app from canvastst (eye-candy demo)
+    # to pterm (a useful shell).  /usr/bin/pgstartup is the picogui
+    # session script that pgserver execs once at startup; its content
+    # is normally /usr/bin/pgboard + /usr/bin/omnibar + /usr/bin/canvastst.
+    if [[ -f "$JFFS2_WORK/root/usr/bin/pgstartup" ]]; then
+        # Default startup app: atomicnav (the picogui browser).  Networking
+        # is configured statically in rcS (10.0.0.1 via gxemul NAT) so
+        # the browser can fetch real pages.  pterm and the rest of the
+        # demo apps are still available from the Applications menu via
+        # the kill-other-normal-apps wrapper (subject to the known
+        # 2002-pgserver multi-normal-app limitation).
+        sed -i 's|/usr/bin/canvastst.*|/usr/bin/atomicnav \&|' \
+            "$JFFS2_WORK/root/usr/bin/pgstartup"
+        echo "--- patched pgstartup: canvastst -> atomicnav ---"
+    fi
+
+    # The 2002 rootfs ships without /etc/passwd, /etc/group, /etc/profile.
+    # Without these, busybox sh's prompt-rendering and pterm's shell
+    # subprocess get into degenerate states (id fails, $USER empty,
+    # PS1 unset).  Add minimal stubs so a usable shell prompt appears.
+    cat > "$JFFS2_WORK/root/etc/passwd" <<'PWD_'
+root:x:0:0:root:/:/bin/sh
+PWD_
+    cat > "$JFFS2_WORK/root/etc/group" <<'GRP_'
+root:x:0:
+GRP_
+    cat > "$JFFS2_WORK/root/etc/profile" <<'PROFILE_'
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export HOME=/
+export USER=root
+export TERM=xterm
+export PS1='# '
+PROFILE_
+    echo "--- staged /etc/passwd + /etc/group + /etc/profile ---"
+
+    # Patch pgserver.conf to match the BE-300's actual 240x320 portrait
+    # framebuffer.  The 2002 demo shipped with width=320 height=256
+    # (landscape) which causes some apps to draw widgets beyond the
+    # visible area.
+    if [[ -f "$JFFS2_WORK/root/etc/pgserver.conf" ]]; then
+        sed -i \
+            -e 's|^width *=.*|width = 240|' \
+            -e 's|^height *=.*|height = 320|' \
+            -e 's|^mode *=.*|mode = 240x320x16|' \
+            "$JFFS2_WORK/root/etc/pgserver.conf"
+        echo "--- patched pgserver.conf to 240x320 portrait ---"
+    fi
+    for bin in "$JFFS2_WORK/root/usr/bin/"*; do
+        [[ -f "$bin" && -x "$bin" && ! -L "$bin" ]] || continue
+        # ELF-only
+        head -c 4 "$bin" 2>/dev/null | grep -q $'\x7fELF' || continue
+        name=$(basename "$bin")
+        skip=0
+        for s in $SKIP_APPS; do [[ "$name" == "$s" ]] && skip=1 && break; done
+        (( skip )) && continue
+        cat > "$APPMENU/$name.app" <<APP
+#!/bin/sh
+# pgserver's managed_rootless appmgr allows only one PG_APP_NORMAL at a
+# time.  Kill any currently-running normal app (graceful SIGTERM, wait,
+# then SIGKILL if still around), give pgserver a moment to reap the
+# client disconnect and clean up the widgets, then launch the new app.
+# (Infrastructure: pgboard / omnibar / pgserver / be300_inputbridge are
+# omitted — they need to stay alive.)
+APPS="atomicnav pterm wclock textedit pgtuxphone scribble \
+      dialogdemo canvastst canvastiles bouncyball blackout \
+      galaxy gridgame connectfour battleship picomail vrcalc \
+      imgview themebar fieldtest hello pqw tpcal pgl-clock \
+      pgl-keyboard pgl-launcher pgl-rotate pgl-toolbar"
+for p in \$APPS; do killall -TERM "\$p" 2>/dev/null; done
+sleep 2
+for p in \$APPS; do killall -KILL "\$p" 2>/dev/null; done
+sleep 1
+exec /usr/bin/$name "\$@" >/tmp/$name.log 2>&1
+APP
+        chmod 0755 "$APPMENU/$name.app"
+    done
+    echo "--- omnibar appmenu: $(ls -1 "$APPMENU" | wc -l) entries ---"
+
+    # Optional userspace serial-debug overlay: redirect pgserver stdio to
+    # ttyS0 (the VRC4173 SIU dock UART) so the emulator's
+    # --serial1-bridge pty:auto path captures pgserver / pgstartup /
+    # pgl-launcher messages.  CONFIG_SERIAL_BE300_CONSOLE is already
+    # disabled in this profile, so kernel printk does not pollute the
+    # UART — pgserver output arrives clean.
+    # Build be300_inputbridge: a static client that connects to
+    # pgserver, registers as a client-side input filter via
+    # PGREQ_MKINFILTER, and forwards kernel evdev events (BE-300 touch +
+    # Stowaway keyboard) into pgserver via PGREQ_INFILTERSEND.  The
+    # 2002 pgserver binary has no server-side input drivers compiled in
+    # (`pgserver -l` shows "Input drivers:" empty), so this bridge is
+    # the only way to deliver input without rebuilding it.
+    INPUTBRIDGE_BIN="$JFFS2_WORK/root/usr/bin/be300_inputbridge"
+    mkdir -p "$(dirname "$INPUTBRIDGE_BIN")"
+    # Freestanding build (-nostdlib + raw o32 syscalls): static-glibc
+    # binaries don't boot on 2.4.18 (clock_gettime / set_tid_address
+    # absent in startup); raw-syscall binaries do.  See
+    # tcp_loopback_test.c which uses the same pattern.
+    mipsel-linux-gnu-gcc -march=mips2 -static -nostdlib -nostdinc \
+        -fno-pic -mno-abicalls -fomit-frame-pointer -fno-builtin \
+        -Os -Wall -Wl,--entry=_start \
+        -o "$INPUTBRIDGE_BIN" "$REPO/board/casio-be300/be300_inputbridge.c"
+    mipsel-linux-gnu-strip "$INPUTBRIDGE_BIN"
+    chmod 0755 "$INPUTBRIDGE_BIN"
+    # ELF e_flags rewrite (mips32r2 -> mips2) for 2.4.18 elf_check_arch.
+    python3 -c "
+import struct, sys
+p = sys.argv[1]
+with open(p, 'rb') as f: d = bytearray(f.read())
+ef = struct.unpack_from('<I', d, 36)[0]
+new = (ef & ~0xF0000000) | 0x10000000
+if new != ef:
+    struct.pack_into('<I', d, 36, new)
+    open(p, 'wb').write(d)
+" "$INPUTBRIDGE_BIN"
+    echo "--- built be300_inputbridge $(stat -c%s "$INPUTBRIDGE_BIN" 2>/dev/null || stat -f%z "$INPUTBRIDGE_BIN") bytes ---"
+
+    # Always overlay rcS in pgui mode: original picogui rcS doesn't
+    # launch the bridge.  Replacement still launches pgserver but also
+    # starts be300_inputbridge after a moment.  Network + loopback
+    # route also need to be brought up because BusyBox ifconfig on
+    # 2.4.18 doesn't auto-install 127.0.0.0/8 → without the route,
+    # libpgui's connect() to 127.0.0.1 ETIMEDOUTs.
+    if [[ "${BE300_2_4_PGUI_DEBUG_SERIAL:-0}" == "1" ]]; then
+        echo "--- Patching rcS for serial debug (pgserver -> /dev/ttyS0) ---"
+        # Add /etc/hosts (clients may gethostbyname()) and an explicit
+        # 127.0.0.0/8 route — BusyBox ifconfig on 2.4.18 does NOT auto-
+        # install it.
+        cat > "$JFFS2_WORK/root/etc/hosts" <<'HOSTS'
+127.0.0.1   localhost
+HOSTS
+        # Build a minimal static TCP-loopback self-test binary
+        # (no libc, raw o32 syscalls).  Runs from rcS before pgserver.
+        # Result tells us if the kernel TCP stack works on loopback at
+        # all — isolating "kernel TCP broken" from "pgserver-specific".
+        TCP_TEST_BIN="$JFFS2_WORK/root/usr/bin/tcp_loopback_test"
+        mkdir -p "$(dirname "$TCP_TEST_BIN")"
+        mipsel-linux-gnu-gcc -march=mips2 -static -nostdlib -nostdinc \
+            -fno-pic -mno-abicalls -fomit-frame-pointer -Os -Wall \
+            -Wl,--entry=_start \
+            -o "$TCP_TEST_BIN" "$REPO/board/casio-be300/tcp_loopback_test.c"
+        mipsel-linux-gnu-strip "$TCP_TEST_BIN"
+        # Fix ELF e_flags so 2.4.18 elf_check_arch accepts it (modern
+        # binutils stamps mips2 PIC output as mips32r2 = 0x70000000).
+        python3 -c "
+import struct, sys
+p = sys.argv[1]
+with open(p, 'rb') as f: d = bytearray(f.read())
+ef = struct.unpack_from('<I', d, 36)[0]
+new = (ef & ~0xF0000000) | 0x10000000
+if new != ef:
+    struct.pack_into('<I', d, 36, new)
+    open(p, 'wb').write(d)
+" "$TCP_TEST_BIN"
+        chmod 0755 "$TCP_TEST_BIN"
+        cat > "$JFFS2_WORK/root/etc/init.d/rcS" <<'RCSDBG'
+#!/bin/sh
+TTY=/dev/ttyS0
+/bin/mount -t proc none /proc
+/sbin/ifconfig lo 127.0.0.1 netmask 255.0.0.0 up
+/sbin/route add -net 127.0.0.0 netmask 255.0.0.0 lo 2>/dev/null
+echo "===== shorten TCP SYN retries to 2 (fast fail) =====" >$TTY
+echo 2 > /proc/sys/net/ipv4/tcp_syn_retries 2>$TTY
+echo "===== bare TCP self-test (no picogui) =====" >$TTY
+/usr/bin/tcp_loopback_test >$TTY 2>&1
+echo "(tcp-test exit=$?)" >$TTY
+echo "===== /proc/net/snmp =====" >$TTY
+cat /proc/net/snmp >$TTY 2>&1
+echo "===== /proc/net/dev =====" >$TTY
+cat /proc/net/dev >$TTY 2>&1
+echo "===== pgserver -l (compiled-in drivers) =====" >$TTY
+/usr/bin/pgserver -l >$TTY 2>&1
+echo "(pgserver -l exit=$?)" >$TTY
+
+echo "===== pty / devpts state =====" >$TTY
+/bin/mount -t devpts devpts /dev/pts 2>$TTY
+echo "mount result:" >$TTY; mount >$TTY 2>&1
+ls -la /dev/ptmx /dev/pts/ >$TTY 2>&1
+echo "===== /bin/sh sanity =====" >$TTY
+/bin/sh -c 'echo SHELL_RUNS; id; pwd; echo PATH=$PATH' >$TTY 2>&1
+echo "===== bridge sanity: run /usr/bin/be300_inputbridge with pgserver NOT yet started =====" >$TTY
+# Bridge should try to connect, retry, and eventually give up.  This
+# tells us if (a) it execs at all on 2.4.18, (b) glibc-static startup
+# works, (c) it produces any output.
+( /usr/bin/be300_inputbridge >$TTY 2>&1 ) &
+SOLOPID=$!
+sleep 3
+echo "===== T+3s bridge still alive? kill -0 $SOLOPID -> =====" >$TTY
+if kill -0 $SOLOPID 2>$TTY; then echo "yes" >$TTY; else echo "no, exited" >$TTY; fi
+kill $SOLOPID 2>/dev/null
+wait $SOLOPID 2>/dev/null
+echo "===== launch pgserver + be300_inputbridge for real =====" >$TTY
+/usr/bin/pgserver </dev/null >$TTY 2>&1 &
+PGSRV=$!
+sleep 2
+/usr/bin/be300_inputbridge >$TTY 2>&1 &
+BRIDGE=$!
+sleep 5
+echo "===== T+7s state: pgserver alive? bridge alive? =====" >$TTY
+kill -0 $PGSRV 2>/dev/null && echo "pgserver alive" >$TTY || echo "pgserver gone" >$TTY
+kill -0 $BRIDGE 2>/dev/null && echo "bridge alive" >$TTY || echo "bridge gone" >$TTY
+echo "===== /proc/net/tcp =====" >$TTY
+cat /proc/net/tcp >$TTY 2>&1
+wait $PGSRV
+echo "===== pgserver exited =====" >$TTY
+RCSDBG
+        chmod 0755 "$JFFS2_WORK/root/etc/init.d/rcS"
+    else
+        # Production pgui rcS: minimal — bring up loopback, start
+        # pgserver in background, start input bridge.
+        cat > "$JFFS2_WORK/root/etc/hosts" <<'HOSTS'
+127.0.0.1   localhost
+HOSTS
+        # JFFS2 root is mounted read-only, so udhcpc can't write
+        # /etc/resolv.conf directly.  Build-time symlink /etc/resolv.conf
+        # -> /tmp/resolv.conf (tmpfs at runtime); the udhcpc default
+        # script writes to /tmp/resolv.conf instead.
+        ln -sf /tmp/resolv.conf "$JFFS2_WORK/root/etc/resolv.conf"
+
+        # Static /etc/hosts so atomicnav can resolve a handful of names
+        # without a DNS server (the BE-300 emulator does NAT for TCP
+        # but doesn't ship a DNS forwarder).  uClibc 0.9.15 reads
+        # /etc/hosts before /etc/resolv.conf.
+        cat > "$JFFS2_WORK/root/etc/hosts" <<'HOSTS'
+127.0.0.1   localhost
+93.184.215.14   example.com
+93.184.215.14   www.example.com
+1.1.1.1     cloudflare cf one.one.one.one
+8.8.8.8     dns google-public-dns
+208.67.222.222   opendns
+HOSTS
+        mkdir -p "$JFFS2_WORK/root/usr/share/udhcpc"
+        cat > "$JFFS2_WORK/root/usr/share/udhcpc/default.script" <<'DHCPSCR'
+#!/bin/sh
+case "$1" in
+deconfig)
+    /sbin/ifconfig $interface 0.0.0.0
+    ;;
+bound|renew)
+    /sbin/ifconfig $interface $ip netmask $subnet
+    [ -n "$router" ] && /sbin/route add default gw "${router%% *}"
+    : > /tmp/resolv.conf
+    for d in $dns; do echo "nameserver $d" >> /tmp/resolv.conf; done
+    ;;
+esac
+DHCPSCR
+        chmod 0755 "$JFFS2_WORK/root/usr/share/udhcpc/default.script"
+        cat > "$JFFS2_WORK/root/etc/init.d/rcS" <<'RCSPROD'
+#!/bin/sh
+/bin/mount -t proc none /proc
+# devpts for pterm and any pseudoterminal-using picogui app.  The kernel
+# has CONFIG_DEVPTS_FS=y (merged via configs/be300_2_4_opie.config).
+/bin/mount -t devpts devpts /dev/pts 2>/dev/null
+# tmpfs for /tmp so apps that scratch (textedit, picomail, pterm history)
+# don't write to the read-only JFFS2 root.
+/bin/mount -t tmpfs -o size=1m tmpfs /tmp 2>/dev/null
+# udhcpc writes /tmp/resolv.conf (which /etc/resolv.conf symlinks to).
+/sbin/ifconfig lo 127.0.0.1 netmask 255.0.0.0 up
+/sbin/route add -net 127.0.0.0 netmask 255.0.0.0 lo 2>/dev/null
+# eth0 (NE2000 at 0x300 IRQ 72 via patches 0013 + ne=0x300,72 cmdline).
+# This busybox doesn't have udhcpc, so configure statically.  The BE-300
+# emulator's user-mode NAT (inherited from gxemul) uses 10.0.0.0/8 with
+# gateway/DNS at 10.0.0.254 — NOT QEMU's 10.0.2.x SLIRP defaults.
+# Anything else gets dropped with "IP packet not for gateway".  Boot
+# with --ne2000 --net-mac 02:de:ad:be:ef:01.
+/sbin/ifconfig eth0 10.0.0.1 netmask 255.0.0.0 up 2>/dev/null
+/sbin/route add default gw 10.0.0.254 2>/dev/null
+echo 'nameserver 10.0.0.254' > /tmp/resolv.conf
+echo 'nameserver 8.8.8.8'    >> /tmp/resolv.conf
+/usr/bin/pgserver &
+PGSRV=$!
+/usr/bin/be300_inputbridge </dev/null >/dev/null 2>&1 &
+wait $PGSRV
+RCSPROD
+        chmod 0755 "$JFFS2_WORK/root/etc/init.d/rcS"
+    fi
+
+    # Rewrite ELF e_flags arch bits from mips32r2 (0x70000000) to mips2
+    # (0x10000000) on every MIPS ELF.  Idempotent: 2002-vintage
+    # uClibc-0.9.15 binaries are already in the pre-2009 (0x00000000 or
+    # 0x10000000) format so this is a no-op for them; modern toolchain
+    # output gets corrected.  Same as the opie path.
+    echo "--- Rewriting ELF e_flags arch bits for 2.4.18 elf_check_arch ---"
+    python3 - "$JFFS2_WORK/root" <<'PYEOF'
+import os, struct, sys
+root = sys.argv[1]
+patched = 0
+for dirpath, _, files in os.walk(root):
+    for fn in files:
+        p = os.path.join(dirpath, fn)
+        try:
+            if os.path.islink(p):
+                continue
+            with open(p, 'rb') as f:
+                head = f.read(40)
+            if head[:4] != b'\x7fELF':
+                continue
+            if head[4] != 1 or head[5] != 1:
+                continue
+            machine = struct.unpack_from('<H', head, 18)[0]
+            if machine != 8:
+                continue
+            ef = struct.unpack_from('<I', head, 36)[0]
+            new = (ef & ~0xF0000000) | 0x10000000
+            if new == ef:
+                continue
+            with open(p, 'r+b') as f:
+                f.seek(36)
+                f.write(struct.pack('<I', new))
+            patched += 1
+        except (OSError, struct.error):
+            pass
+print(f'patched {patched} ELF files (0x70000000 -> 0x10000000)')
+PYEOF
+
+    echo "--- Building JFFS2 image $JFFS2_ROOTFS ---"
+    mkfs.jffs2 --root="$JFFS2_WORK/root" \
+        --devtable="$DEVTABLE_PGUI" \
         --eraseblock=16384 --pagesize=512 --no-cleanmarkers \
         --pad=0xB00000 --little-endian \
         --output="$JFFS2_ROOTFS"
@@ -870,7 +1388,12 @@ export PATH=/opt/QtPalmtop/bin:/bin:/sbin:/usr/bin:/usr/sbin
 export LD_LIBRARY_PATH=/opt/QtPalmtop/lib:/lib
 export QWS_DISPLAY="LinuxFb:/dev/fb0:mmWidth80:mmHeight106"
 export QWS_SIZE="240x320"
-export QWS_MOUSE_PROTO="${QWS_MOUSE_PROTO:-TPanel:/dev/be300tpanel}"
+# Touch is exposed as evdev /dev/input/event1 by patch series 0010
+# (touch_be300.c input_dev registration; Makefile keeps stowaway on
+# event0). The "/dev/input/" prefix activates the patched Qt
+# QVrTPanelHandlerPrivate evdev branch, identical to the 4.2.9 path.
+# /dev/be300tpanel still exists as a misc diagnostic node.
+export QWS_MOUSE_PROTO="${QWS_MOUSE_PROTO:-TPanel:/dev/input/event1}"
 export QWS_KEYBOARD="${QWS_KEYBOARD:-USB:/dev/input/event0}"
 export OPIE_NO_SOUND=1
 export LD_BIND_NOW=1
@@ -1019,7 +1542,7 @@ ls -l "$OUT"
 echo ""
 echo "Boot with:"
 echo "  ./bin/be300 --nand ${OUT#$REPO/} --speed 0 --detect-stall"
-if [[ "$ROOT_MODE" == "opie" ]]; then
+if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" ]]; then
     echo ""
     echo "Serial console:"
     echo "  ./bin/be300 --nand ${OUT#$REPO/} --speed 0 --serial1-bridge pty:auto"

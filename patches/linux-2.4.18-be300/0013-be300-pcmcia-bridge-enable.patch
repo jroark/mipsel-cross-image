@@ -1,0 +1,52 @@
+BE-300 2.4.18: enable the VRC4173 PCMCIA bridge so the C000/D000 card
+windows are alive for --ne2000 (and --cf when applicable).
+
+Mirror of the same bring-up the 4.2.9 board file does in
+board/casio-be300/setup.c (see "BE300_PCMCIA_BRIDGE_PA" there): write
+bit 0x04 into the bridge register at PA 0x0A00A01C to let the PCMCIA
+attribute window own ports 0xC000-0xD7FF, then drain the GIRQ0 cascade
+source so cf_attach() / ne2000 don't immediately drive GIU pin 0 high
+the moment local_irq_enable runs.
+
+Without this, the kernel's ioremap-less set_io_port_base() reads/writes
+to 0xAA00C300 (NE2000 default I/O port) just see floating bus and the
+ne.c probe fails with "no such device".
+
+Touches arch/mips/vr41xx/vr4131/casio-be300/setup.c only.
+
+--- a/arch/mips/vr41xx/vr4131/casio-be300/setup.c
++++ b/arch/mips/vr41xx/vr4131/casio-be300/setup.c
+@@ -41,6 +41,33 @@
+ 	 * IDE generic code reach the CF via standard inb/outb. */
+ 	set_io_port_base(KSEG1ADDR(0x0A00C000));
+
++	/* Enable the VRC4173 PCMCIA bridge windows.  NAND uses the XFER
++	 * engine at PA 0x0A00A4xx / 0x0A00B000, so the bridge may own the
++	 * C000/D000 card windows needed by NE2000 and CF without stealing
++	 * NAND I/O.  Without this write, inb/outb against 0xAA00Cxxx see
++	 * floating bus and ne.c / IDE probe both fail.  Mirror of 4.2.9
++	 * board/casio-be300/setup.c::BE300_PCMCIA_BRIDGE_PA / _EN.
++	 *
++	 * 2.4 has no ioremap of physical addresses, but KSEG1 already maps
++	 * the BCU region uncached — use the KSEG1 alias directly.
++	 */
++	{
++		volatile unsigned long *bridge =
++			(volatile unsigned long *) KSEG1ADDR(0x0a00a01c);
++		*bridge = *bridge | 0x04;
++	}
++
++	/* Drain the VRC4173 GIRQ0 cascade source before IRQs come up.
++	 * cf_attach / --ne2000 set state_change_pending and irq_pending in
++	 * the emulator, which would drive GIU pin 0 high the moment
++	 * local_irq_enable runs.  Read 0x0A00A03C to clear
++	 * state_change_pending; write 0x0A000014 to W1C the latch.
++	 */
++	{
++		(void) *(volatile unsigned long *) KSEG1ADDR(0x0a00a03c);
++		*(volatile unsigned long *) KSEG1ADDR(0x0a000014) = 0xffffffffu;
++	}
++
+ 	_machine_restart = vr41xx_restart;
+ 	_machine_halt = vr41xx_halt;
+ 	_machine_power_off = vr41xx_power_off;

@@ -74,6 +74,20 @@ docker-compose run --rm mips-dev bash -c "./build_be300_2_6_kernel.sh"
 # replaced the BE-300 serial+kbd drivers).
 docker-compose run --rm mips-dev bash -c "./build_be300_2_4_kernel.sh"
 
+# Build a 2.4.18 NAND image whose JFFS2 mtd3 carries the 2002 jserv
+# picogui ramdisk extracted from a prebuilt linux4.be kernel. The
+# `demo` donor (vmlinux-pgui-demo) has the full picogui app set
+# (pgserver, atomicnav, pgboard, omnibar, ~60 apps); the `test1` donor
+# (vmlinux-pgui-test1) is the videotest-only minimal cut. Both
+# wrappers set BE300_2_4_UI=pgui and source-rebuild the 2.4.18 kernel
+# with the modern toolchain + patch series, including patch 0012
+# (ip_fast_csum portable C — fixes a gcc 10 inline-asm miscompile
+# that broke TCP loopback) and 0013 (VRC4173 PCMCIA bridge enable +
+# GIRQ0 cascade drain, lets ne.c probe NE2000 at port 0x300 IRQ 72).
+docker-compose run --rm mips-dev bash -c "./build_be300_2_4_pgui_demo_nand.sh"
+docker-compose run --rm mips-dev bash -c "./build_be300_2_4_pgui_nand.sh"
+./bin/be300 --nand linux-4.2.9/be300-2_4-pgui-demo.nand --speed 0 --ne2000 --net-mac 02:de:ad:be:ef:01
+
 # Build just the Malta/QEMU kernel (simpler, for reference)
 docker-compose run --rm mips-dev bash -c "./build_tcl_kernel.sh"
 
@@ -185,6 +199,8 @@ Test / diagnostic programs (not linked into the kernel):
 Known-good stock OPIE evidence (May 2, 2026): `docker compose run --rm mips-dev bash -c "./build_be300_opie_nand.sh"` produced `linux-4.2.9/be300-opie.nand` (16 MiB), `rootfs-opie.jffs2` (11 MiB), and `vmlinux` (4.7 MiB). Booting with `./bin/be300 --nand linux-4.2.9/be300-opie.nand --speed 0 --detect-stall` registered `CONFIG_CASIO_BE300_SDRAM_MB=16` / `memory: 01000000 @ 00000000`, detected the Samsung 16 MiB NAND, mounted JFFS2 from `/dev/mtdblock3`, and reached the OPIE launcher.
 
 Known-good Microwindows/Dillo evidence (May 3, 2026): `docker compose run --rm mips-dev bash -c "./build_be300_kernel.sh"` produced `linux-4.2.9/be300.nand` (16 MiB), `rootfs.jffs2` (11 MiB padded), an unpacked `rootfs_be300/` of 3.9 MiB, a stripped static `rootfs_be300/usr/bin/dillo` (1.6 MiB), and a kernel flat payload of `0x2E95AC` bytes (`mipsel-linux-gnu-size linux-4.2.9/vmlinux`: text 2,900,784, data 148,608, bss 80,448). Booting with `./bin/be300 --nand linux-4.2.9/be300.nand --ne2000 --net-mac 02:de:ad:be:ef:01 --speed 0 --detect-stall` registered `memory: 01000000 @ 00000000` with `12980K/16384K available`, detected the Samsung 16 MiB NAND, mounted JFFS2 from `/dev/mtdblock3`, configured DHCP on `eth0`, launched Dillo to `http://example.com/`, and exited with `[BE300_STALL_SUMMARY] fired=0`.
+
+2.4.18 picogui-demo profile (May 24, 2026, realistic ceiling): `docker compose run --rm mips-dev bash -c "./build_be300_2_4_pgui_demo_nand.sh"` produces `linux-4.2.9/be300-2_4-pgui-demo.nand` — the source-rebuilt 2.4.18 kernel + the 2002 jserv picogui demo ramdisk on JFFS2 mtd3. Boots with `./bin/be300 --nand linux-4.2.9/be300-2_4-pgui-demo.nand --speed 0 --ne2000 --net-mac 02:de:ad:be:ef:01`. Working end-to-end: kernel boot, JFFS2 root, pgserver on the 240x320 LCD, app launchers, pgboard virtual keyboard, pterm, omnibar Applications menu (via `/demos` → `/usr/share/picogui/appmenu` symlink workaround for omnibar's CWD-relative opendir), Stowaway IR keyboard (no modifier passthrough from emulator), touch input via `board/casio-be300/be300_inputbridge.c` (raw o32 syscalls so it runs without libc on 2002 uClibc), NE2000 Ethernet (the emulator's gxemul-derived NAT uses `10.0.0.0/8` with gateway/DNS at `10.0.0.254` — *not* QEMU's 10.0.2.x; rcS configures eth0 statically as 10.0.0.1), and atomicnav fetching real HTTP/HTTPS over the wider internet. **Ceiling**: the 2002 pgserver binary registers `"html"` as a textformat name but ships no `html_load`/`html_save` symbols at all — so atomicnav fetches pages successfully but pgserver falls back to plaintext display of the raw response body. HTML rendering wasn't implemented in this 2002 cut; the patched `html_load_be300` lives in `picogui-jserv-be300-uclibc/pg1/server/widget/textbox_document.c` and is the renderer used by the modern 4.2.9 picogui profile. Multi-app launch from omnibar is also limited: the 2002 `managed_rootless` appmgr only supports one normal app at a time, so the per-launcher kill-others wrapper does not reliably hand off between e.g. atomicnav and pterm. For a usable web browser, use the 4.2.9 picogui profile below instead.
 
 PicoGUI profile (May 9, 2026, in development): `docker compose run --rm mips-dev bash -c "./build_be300_picogui_nand.sh"` produces `linux-4.2.9/be300-picogui.nand` from the BusyBox + jserv/picogui stack. The wrapper sets `BE300_UI=picogui` which selects `ROOTFS=/work/rootfs_be300_picogui`, `rootfs-picogui.jffs2`, and `be300-picogui.nand`, defaults `BE300_LIBC=uclibc` (dynamic; override with `BE300_LIBC=musl` for static), and dispatches to `board/picogui/build_picogui_rootfs.sh`. The picogui source pin lives in `board/picogui/git_sha` (placeholder `0000…` in repo — pin a real jserv commit before first build); the rootfs builder downloads the GitHub archive into `archives/picogui-jserv-<sha12>.tar.gz`, applies `board/picogui/patch_picogui_sources.py` (autoconf modernization + `evdev.c` driver registration), overlays `board/picogui/evdev.c` (new `/dev/input/event*` shim that mirrors `board/microwindows/{mou,kbd}_evdev.c` device-name discovery), `autoreconf -fi`, configures with `--with-config=board/picogui/picogui.config --enable-driver-evdev`, builds the v1 app set (`pgserver`, `pgboard`, `pterm`, `picosm`, `tpcal`), installs into `$ROOTFS`, copies `pgserverrc` + identity calibration into `/etc/picogui/`, and feeds binaries through the same line-1639 `check_rootfs_mips2` opcode scan. Inittab launches `/bin/start-picogui` (heredoc'd in `build_be300_kernel.sh`) on tty0 with `respawn`; the serial shell stays on ttyVR0 in `askfirst`.
 

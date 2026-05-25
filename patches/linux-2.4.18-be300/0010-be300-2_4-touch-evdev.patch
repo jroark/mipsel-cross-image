@@ -1,0 +1,247 @@
+BE-300 2.4.18: expose the PIU touchscreen as a Linux input device.
+
+The 2.4 touch_be300.c only registered the misc /dev/be300tpanel char
+device (8-byte {x,y,down,_pad} records).  Qt/Embedded's patched
+QVrTPanelHandlerPrivate only switches to its evdev parser when the
+device path begins with "/dev/input/"; pointed at /dev/be300tpanel it
+mis-parses the records as the legacy 12-byte raw tpanel format, so OPIE
+touch is dead.  The working 4.2.9 path is "evdev everywhere":
+board/casio-be300/touch_be300.c registers an input_dev and start-opie
+uses QWS_MOUSE_PROTO=TPanel:/dev/input/event1.
+
+Mirror that on 2.4 with the lowest-risk change:
+
+* touch_be300.c additionally registers a Linux input_dev (EV_ABS
+  ABS_X/ABS_Y/ABS_PRESSURE, EV_KEY BTN_TOUCH) using the exact 2.4 input
+  API the in-tree stowaway_be300.c already proves (static struct, void
+  input_register_device, manual absmin/absmax, no input_sync()/
+  input_set_abs_params()).  The misc device is kept unchanged for
+  diagnostics / back-compat.  The PIU autoscan + poll timer is started
+  from init (holding a permanent tp.active=1 reference) because Qt opens
+  the evdev node read-only and never the misc node, so the existing
+  misc-open-gated start would never fire for the OPIE use-case.
+
+* 2.4.18 has no EV_SYN/input_sync(); the patched Qt evdev branch needs a
+  terminating type-0/code-0 record to flush a coordinate batch.  Add
+  EV_SYN/SYN_REPORT (both 0x00, the modern aliases of the existing
+  EV_RST==0) to include/linux/input.h, set bit 0 in the device's evbit
+  so the synthetic SYN passes input_event()'s evbit gate, and add an
+  explicit "case EV_SYN: break;" to input_event()'s switch (behaviour
+  identical to the prior no-default fall-through, just self-documenting;
+  drivers/input/evdev.c is already type-agnostic and forwards it).
+
+* casio-be300/Makefile: link stowaway_be300.o before touch_be300.o.
+  evdev minors are assigned in input_register_device() call order =
+  builtin initcall = link order.  With touch now registering an
+  input_dev too, stowaway must register first so the keyboard keeps
+  /dev/input/event0 and the touchscreen gets /dev/input/event1
+  (matching the QWS_MOUSE_PROTO=TPanel:/dev/input/event1 wiring).
+
+No shared 4.2.9 file is touched (board/opie/*, the 4.2.9
+board/casio-be300/touch_be300.c, patch_qt_sources.py), and the Qt patch
+is unchanged: this reuses its existing path-gated evdev handler verbatim.
+
+diff --git a/arch/mips/vr41xx/vr4131/casio-be300/Makefile b/arch/mips/vr41xx/vr4131/casio-be300/Makefile
+index bf202b7..87887a7 100644
+--- a/arch/mips/vr41xx/vr4131/casio-be300/Makefile
++++ b/arch/mips/vr41xx/vr4131/casio-be300/Makefile
+@@ -17,8 +17,12 @@ obj-y	 := prom.o setup.o
+ 
+ obj-$(CONFIG_PCI) += pci_fixup.o
+ obj-$(CONFIG_CASIO_BE300_NAND) += nand_be300.o
+-obj-$(CONFIG_CASIO_BE300_TOUCH) += touch_be300.o
++# stowaway_be300 must link (and therefore initcall + input_register_device)
++# before touch_be300 so the keyboard keeps evdev minor 0 (/dev/input/event0)
++# and the touchscreen gets minor 1 (/dev/input/event1), matching the 4.2.9
++# QWS_MOUSE_PROTO=TPanel:/dev/input/event1 wiring.
+ obj-$(CONFIG_CASIO_BE300_STOWAWAY) += stowaway_be300.o
++obj-$(CONFIG_CASIO_BE300_TOUCH) += touch_be300.o
+ obj-$(CONFIG_CASIO_BE300_CF) += cf_be300.o
+ obj-$(CONFIG_CASIO_BE300_IRQ_CASCADE) += irq_be300.o
+ 
+diff --git a/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c b/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c
+index ddce43f..5dff889 100644
+--- a/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c
++++ b/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c
+@@ -47,6 +47,7 @@
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/errno.h>
++#include <linux/input.h>
+ #include <asm/io.h>
+ #include <asm/uaccess.h>
+ #include <asm/addrspace.h>
+@@ -198,6 +199,45 @@ static void push_event(int x, int y, int down)
+ 		kill_fasync(&tp.fasync, SIGIO, POLL_IN);
+ }
+ 
++/*
++ * Linux input-layer mirror of the misc /dev/be300tpanel path. Registered
++ * so Qt/Embedded's evdev mouse handler (QWS_MOUSE_PROTO=
++ * TPanel:/dev/input/event1) consumes the panel exactly like the 4.2.9
++ * board/casio-be300/touch_be300.c input_dev path. The misc device above
++ * is kept unchanged for diagnostics / back-compat. 2.4 input API is used
++ * exactly as the in-tree stowaway_be300.c proves (static struct, void
++ * input_register_device, no input_sync()/input_set_abs_params()).
++ */
++static struct input_dev be300_ts_input;
++static int be300_ts_registered;
++
++/*
++ * 2.4 has no input_sync(); emit a raw SYN_REPORT input_event so the
++ * patched Qt QVrTPanelHandlerPrivate evdev branch flushes the coordinate
++ * batch. EV_SYN/SYN_REPORT are both 0; __set_bit(EV_SYN, evbit) in init
++ * lets this type-0 event past input_event()'s evbit gate.
++ */
++static void be300_ts_sync(void)
++{
++	input_event(&be300_ts_input, EV_SYN, SYN_REPORT, 0);
++}
++
++static void be300_ts_report(int x, int y, int down)
++{
++	if (!be300_ts_registered)
++		return;
++	if (down) {
++		input_report_abs(&be300_ts_input, ABS_X, x);
++		input_report_abs(&be300_ts_input, ABS_Y, y);
++		input_report_abs(&be300_ts_input, ABS_PRESSURE, 1);
++		input_report_key(&be300_ts_input, BTN_TOUCH, 1);
++	} else {
++		input_report_key(&be300_ts_input, BTN_TOUCH, 0);
++		input_report_abs(&be300_ts_input, ABS_PRESSURE, 0);
++	}
++	be300_ts_sync();
++}
++
+ static void be300_touch_poll_tick(unsigned long _data)
+ {
+ 	u16 status, pending, mask, eff;
+@@ -213,16 +253,19 @@ static void be300_touch_poll_tick(unsigned long _data)
+ 	if (eff & PIUINT_PADPAGE0INTR) {
+ 		decode_page(PIU_PB00, &x, &y);
+ 		push_event(x, y, 1);
++		be300_ts_report(x, y, 1);
+ 	}
+ 	if (eff & PIUINT_PADPAGE1INTR) {
+ 		decode_page(PIU_PB10, &x, &y);
+ 		push_event(x, y, 1);
++		be300_ts_report(x, y, 1);
+ 	}
+ 	if (eff & PIUINT_PENCHGINTR) {
+ 		cnt = *PIU_CNTREG;
+ 		pen = !!(cnt & PIUCNT_PEN_DETECTED);
+ 		tp.pen_down = pen;
+ 		push_event(x, y, pen);
++		be300_ts_report(x, y, pen);
+ 	}
+ 
+ 	/* W1C the pending bits we observed (preserve mask in high byte). */
+@@ -354,8 +397,52 @@ static int __init be300_touch_init(void)
+ 		return err;
+ 	}
+ 
++	memset(&be300_ts_input, 0, sizeof(be300_ts_input));
++	be300_ts_input.name = "BE-300 PIU touchscreen";
++	be300_ts_input.idbus = BUS_RS232;	/* 2.4 has no BUS_HOST yet */
++	be300_ts_input.idvendor = 0x1033;	/* NEC */
++	be300_ts_input.idproduct = 0x4173;	/* VRC4173 */
++	be300_ts_input.idversion = 0x0001;
++
++	__set_bit(EV_SYN, be300_ts_input.evbit);	/* ==0; pass SYN gate */
++	__set_bit(EV_KEY, be300_ts_input.evbit);
++	__set_bit(EV_ABS, be300_ts_input.evbit);
++	__set_bit(BTN_TOUCH, be300_ts_input.keybit);
++	__set_bit(ABS_X, be300_ts_input.absbit);
++	__set_bit(ABS_Y, be300_ts_input.absbit);
++	__set_bit(ABS_PRESSURE, be300_ts_input.absbit);
++	be300_ts_input.absmin[ABS_X] = 0;
++	be300_ts_input.absmax[ABS_X] = BE300_TOUCH_WIDTH - 1;
++	be300_ts_input.absmin[ABS_Y] = 0;
++	be300_ts_input.absmax[ABS_Y] = BE300_TOUCH_HEIGHT - 1;
++	be300_ts_input.absmin[ABS_PRESSURE] = 0;
++	be300_ts_input.absmax[ABS_PRESSURE] = 1;
++
++	input_register_device(&be300_ts_input);
++	be300_ts_registered = 1;
++
++	/*
++	 * Qt opens the evdev node read-only and never the misc node, so
++	 * the misc-open-gated PIU/timer start in be300_touch_open() would
++	 * never fire for the OPIE use-case. Start the autoscan + poll
++	 * timer here and hold a permanent tp.active reference (= 1) so a
++	 * later misc open/close cannot del_timer() the input feed
++	 * (be300_touch_open: "if (tp.active++) return 0;" sees 1 and
++	 * skips re-init; be300_touch_release: "--tp.active <= 0" never
++	 * reaches 0). Same PIU programming as be300_touch_open().
++	 */
++	*PIU_SIVL = 0x05DC;
++	*PIU_STBL = 0x00C8;
++	*PIU_INTREG = (PIUINT_PENDING_ALL << 8) | 0;
++	*PIU_CNTREG = PIUCNT_PIUPWR | PIUCNT_PIUSEQEN | PIUCNT_PADATSTART;
++	tp.initialized = 1;
++	tp.head = tp.tail = 0;
++	tp.active = 1;
++	tp.poll.expires = jiffies + HZ / BE300_TOUCH_POLL_HZ;
++	add_timer(&tp.poll);
++
+ 	printk(KERN_INFO "BE-300 touchscreen: VRC4173 PIU @ PA 0x0A000300, "
+-	       "polled at %d Hz, /dev/be300tpanel (minor %d)\n",
++	       "polled at %d Hz, /dev/be300tpanel (minor %d) + input layer\n",
+ 	       BE300_TOUCH_POLL_HZ, BE300_TOUCH_MINOR);
+ 	return 0;
+ }
+@@ -363,6 +450,8 @@ static int __init be300_touch_init(void)
+ static void __exit be300_touch_exit(void)
+ {
+ 	del_timer_sync(&tp.poll);
++	if (be300_ts_registered)
++		input_unregister_device(&be300_ts_input);
+ 	misc_deregister(&be300_touch_misc);
+ }
+ 
+diff --git a/drivers/input/input.c b/drivers/input/input.c
+index b6e8f57..dcc8b6d 100644
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -73,6 +73,14 @@ void input_event(struct input_dev *dev, unsigned int type, unsigned int code, in
+ 
+ 	switch (type) {
+ 
++		case EV_SYN:
++			/* BE-300: forward the SYN_REPORT batch terminator to
++			 * the handler list (evdev) unchanged. Behaviourally
++			 * identical to the prior no-default fall-through, but
++			 * explicit so the touch driver's evdev sync is
++			 * self-documenting. */
++			break;
++
+ 		case EV_KEY:
+ 
+ 			if (code > KEY_MAX || !test_bit(code, dev->keybit) || !!test_bit(code, dev->key) == value)
+diff --git a/include/linux/input.h b/include/linux/input.h
+index 3f961ae..d721c5b 100644
+--- a/include/linux/input.h
++++ b/include/linux/input.h
+@@ -81,6 +81,9 @@ struct input_event {
+  * Event types
+  */
+ 
++#define EV_SYN			0x00	/* BE-300: modern alias of EV_RST,
++					 * used as the evdev batch terminator
++					 * (2.4 has no real EV_SYN/input_sync) */
+ #define EV_RST			0x00
+ #define EV_KEY			0x01
+ #define EV_REL			0x02
+@@ -92,6 +95,11 @@ struct input_event {
+ #define EV_FF			0x15
+ #define EV_MAX			0x1f
+ 
++/* BE-300: SYN_REPORT marks the end of an evdev event batch. 2.4 has no
++ * SYN_* namespace; value 0 == EV_SYN code, which the patched Qt
++ * QVrTPanelHandlerPrivate evdev branch uses to flush a coordinate. */
++#define SYN_REPORT		0x00
++
+ /*
+  * Keys and buttons
+  */

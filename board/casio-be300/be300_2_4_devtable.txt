@@ -53,12 +53,12 @@
 # framebuffer
 /dev/fb0        c 660 0 0 29 0  -  -  -
 
-# evdev nodes.  event0 is the BE-300 Stowaway keyboard
-# (stowaway_be300.c:226 input_register_device).  event1..event3 are
-# pre-created stubs so Opie's TPanel handler open(/dev/input/event1)
-# doesn't return ENOENT; the 2.4.18 touch driver registers a misc
-# /dev/be300tpanel, not an evdev node, so touch input is deferred
-# (TODO: extend touch_be300.c with an input_dev registration).
+# evdev nodes.  Patch series 0010 makes touch_be300.c register an
+# input_dev and links stowaway_be300.o before touch_be300.o, so evdev
+# minors are deterministic: event0 = BE-300 Stowaway keyboard,
+# event1 = BE-300 PIU touchscreen (Opie reads QWS_MOUSE_PROTO=
+# TPanel:/dev/input/event1, QWS_KEYBOARD=USB:/dev/input/event0).
+# event2/event3 stay as harmless pre-created stubs.
 /dev/input/event c 660 0 0 13 64 0  1  4
 
 # BE-300 PIU touchscreen (misc device, minor 170 — see

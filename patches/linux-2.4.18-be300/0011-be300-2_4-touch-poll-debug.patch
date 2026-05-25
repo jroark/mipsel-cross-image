@@ -1,0 +1,155 @@
+BE-300 2.4.18: THROWAWAY touch + evdev delivery debug.
+
+Diagnostic only (cf. the 0007 pattern). Probes, all first-N limited
+(no flood), captured via --serial1-bridge:
+
+  touch_be300.c:
+    * be300_touch_poll_tick(): pending/eff + decoded x/y per page +
+      pen state on PENCHG.
+    * be300_ts_report(): on each pen-down edge, walk the input_dev
+      handler chain (handle/open/handler->minor).
+
+  drivers/input/evdev.c (gated to minor 1 == /dev/input/event1, the
+  touchscreen):
+    * evdev_open:  prints when qpe opens event1 (open count, list).
+    * evdev_event: prints first 16 forwarded touch events + whether
+      an open-fd list exists to buffer into.
+    * evdev_read:  prints first 16 reads (head/tail/nonblock) — proves
+      whether qpe's Qt actually read()s the node.
+    * evdev_poll:  prints first 16 polls + return — proves whether
+      qpe's Qt event loop select()s the node.
+
+Together these localise the touch failure to exactly one of: kernel
+decode (proven OK), input_event->evdev forwarding, qpe never
+opening/polling/reading event1, or Qt consumption after read.
+Remove from series once touch works.
+
+diff --git a/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c b/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c
+index 5dff889..8e5ecec 100644
+--- a/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c
++++ b/arch/mips/vr41xx/vr4131/casio-be300/touch_be300.c
+@@ -224,8 +224,28 @@ static void be300_ts_sync(void)
+ 
+ static void be300_ts_report(int x, int y, int down)
+ {
++	static int be300_ts_was_down;
++
+ 	if (!be300_ts_registered)
+ 		return;
++
++	/* On each pen-down edge dump the input_dev handler chain so the
++	 * serial console shows whether evdev (handler->minor ==
++	 * EVDEV_MINOR_BASE 64) is connected to this device and whether
++	 * anything (qpe) has opened it (handle->open > 0). */
++	if (down && !be300_ts_was_down) {
++		struct input_handle *h;
++		int k = 0;
++
++		printk(KERN_INFO "be300tpdbg: chain dev=%p head=%p\n",
++		       &be300_ts_input, be300_ts_input.handle);
++		for (h = be300_ts_input.handle; h && k < 6; h = h->dnext, k++)
++			printk(KERN_INFO "be300tpdbg:  h=%p open=%d hdlr=%p "
++			       "min=%d\n", h, h->open, h->handler,
++			       h->handler ? h->handler->minor : -1);
++	}
++	be300_ts_was_down = down;
++
+ 	if (down) {
+ 		input_report_abs(&be300_ts_input, ABS_X, x);
+ 		input_report_abs(&be300_ts_input, ABS_Y, y);
+@@ -250,19 +270,30 @@ static void be300_touch_poll_tick(unsigned long _data)
+ 	mask = status >> 8;
+ 	eff = pending & mask;
+ 
++	/* BE300_TOUCH_DEBUG (0011, throwaway): only fires on real PIU
++	 * activity (pending != 0), so no idle log spam. */
++	if (pending)
++		printk(KERN_INFO "be300tpdbg: st=%04x pnd=%02x msk=%02x "
++		       "eff=%02x cnt=%04x\n", status, pending, mask, eff,
++		       *PIU_CNTREG);
++
+ 	if (eff & PIUINT_PADPAGE0INTR) {
+ 		decode_page(PIU_PB00, &x, &y);
++		printk(KERN_INFO "be300tpdbg: pg0 x=%d y=%d\n", x, y);
+ 		push_event(x, y, 1);
+ 		be300_ts_report(x, y, 1);
+ 	}
+ 	if (eff & PIUINT_PADPAGE1INTR) {
+ 		decode_page(PIU_PB10, &x, &y);
++		printk(KERN_INFO "be300tpdbg: pg1 x=%d y=%d\n", x, y);
+ 		push_event(x, y, 1);
+ 		be300_ts_report(x, y, 1);
+ 	}
+ 	if (eff & PIUINT_PENCHGINTR) {
+ 		cnt = *PIU_CNTREG;
+ 		pen = !!(cnt & PIUCNT_PEN_DETECTED);
++		printk(KERN_INFO "be300tpdbg: penchg pen=%d (x=%d y=%d)\n",
++		       pen, x, y);
+ 		tp.pen_down = pen;
+ 		push_event(x, y, pen);
+ 		be300_ts_report(x, y, pen);
+diff --git a/drivers/input/evdev.c b/drivers/input/evdev.c
+index 6f10058..b4ded69 100644
+--- a/drivers/input/evdev.c
++++ b/drivers/input/evdev.c
+@@ -65,6 +65,15 @@ static void evdev_event(struct input_handle *handle, unsigned int type, unsigned
+ 	struct evdev *evdev = handle->private;
+ 	struct evdev_list *list = evdev->list;
+ 
++	if (evdev->minor == 1) {
++		static int n_ev;
++		if (n_ev < 16) {
++			n_ev++;
++			printk(KERN_INFO "evdbg: event min=1 type=%u code=%u "
++			       "val=%d list=%p\n", type, code, value, list);
++		}
++	}
++
+ 	while (list) {
+ 
+ 		do_gettimeofday(&list->buffer[list->head].time);
+@@ -140,6 +149,11 @@ static int evdev_open(struct inode * inode, struct file * file)
+ 		if (list->evdev->exist)
+ 			input_open_device(&list->evdev->handle);
+ 
++	if (i == 1)
++		printk(KERN_INFO "evdbg: OPEN min=1 (event1) open=%d "
++		       "list=%p exist=%d\n", list->evdev->open, list,
++		       list->evdev->exist);
++
+ 	return 0;
+ }
+ 
+@@ -166,6 +180,16 @@ static ssize_t evdev_read(struct file * file, char * buffer, size_t count, loff_
+ 	struct evdev_list *list = file->private_data;
+ 	int retval = 0;
+ 
++	if (list->evdev->minor == 1) {
++		static int n_rd;
++		if (n_rd < 16) {
++			n_rd++;
++			printk(KERN_INFO "evdbg: read min=1 enter head=%d "
++			       "tail=%d nb=%d flags=%x\n", list->head,
++			       list->tail, (int)count, file->f_flags);
++		}
++	}
++
+ 	if (list->head == list->tail) {
+ 
+ 		add_wait_queue(&list->evdev->wait, &wait);
+@@ -211,6 +235,15 @@ static unsigned int evdev_poll(struct file *file, poll_table *wait)
+ {
+ 	struct evdev_list *list = file->private_data;
+ 	poll_wait(file, &list->evdev->wait, wait);
++	if (list->evdev->minor == 1) {
++		static int n_pl;
++		if (n_pl < 16) {
++			n_pl++;
++			printk(KERN_INFO "evdbg: poll min=1 head=%d tail=%d "
++			       "ret=%d\n", list->head, list->tail,
++			       list->head != list->tail ? 1 : 0);
++		}
++	}
+ 	if (list->head != list->tail)
+ 		return POLLIN | POLLRDNORM;
+ 	return 0;
