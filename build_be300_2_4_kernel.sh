@@ -1408,6 +1408,69 @@ open(p, 'wb').write(d)
 print("nxterm patched: stdcol 80->38, stdrow 50->20 (window fits 240x320)")
 PYEOF
 
+    # Overlay /bin/launcher.cnf with a fuller app set than the donor
+    # ships.  Donor stock has Tetris / NanoBreaker / Landmine / Slider /
+    # Terminal / Clock / Magnifier / Scribble / SoftKeyboard / Roach /
+    # Tux / NXEyes (12 apps).  Add TuxChess, Map (was commented), Image
+    # view, Clients, EventTest, TouchCal, Term2 so the user has a
+    # tappable entry for every Nano-X app the donor includes.  Apps
+    # without a dedicated icon use `-` (per launcher.cnf docs).
+    # Shell-wrapper launcher uses to exec apps.  Launching directly
+    # via launcher's fork+execvp produces a pc=0 / vaddr=0 TLBL crash
+    # for nxterm (same family of bug the picogui session hit — child
+    # inherits broken signal disposition or fd state from launcher,
+    # and the freshly-exec'd binary jumps to NULL through the bad
+    # callback during init).  Inserting an intermediate /bin/sh
+    # process gives the child a clean signal mask and reaped fd table
+    # before nxterm starts.
+    cat > "$JFFS2_WORK/root/usr/bin/mw-launch" <<'LAUN_'
+#!/bin/sh
+# Wrap with busybox setsid + detach so the target gets a fresh
+# session/process-group BEFORE its own setsid call would have
+# failed (the cause of the pc=0 TLBL crash on nxterm when launched
+# from launcher).  /bin/setsid isn't symlinked in the donor; call
+# busybox directly.  Log to /tmp so silent failures are recoverable.
+echo "[$(date)] mw-launch $*" >> /tmp/mw-launch.log
+( exec /bin/busybox setsid "$@" </dev/null >>/tmp/mw-launch.log 2>&1 ) &
+LAUN_
+    chmod 0755 "$JFFS2_WORK/root/usr/bin/mw-launch"
+
+    # Populated launcher.cnf.  Skipping:
+    #   - $window_background_image: clears LCD with the bg graphic and
+    #     hides the panel.
+    #   - the Terminal entry: launching nxterm via launcher fork+exec
+    #     (even through /bin/sh or a double-forked /usr/bin/mw-launch)
+    #     hits a pc=0 / vaddr=0 TLBL crash before nxterm can render its
+    #     window.  nxterm launched directly from rcS works fine, so
+    #     rcS launches a persistent nxterm instead and the launcher
+    #     panel covers everything else.
+    # Apps without dedicated icons use `-`.  mw-launch (small daemon-
+    # style shell wrapper that double-forks + redirects stdio to
+    # /dev/null) is on the wrapper path in case it helps any other
+    # apps avoid the same crash.
+    # launcher's panel is hardcoded for a screen larger than the BE-300's
+    # 240x320 LCD — empirically only 4-6 tiles fit before the panel
+    # either renders off-screen or aborts entirely (verified: 3 entries
+    # = panel visible, 12 entries = no panel + pc=0 crash).  Cap at 5
+    # apps so the panel lays out cleanly.  Terminal omitted since
+    # launcher fork+exec of nxterm crashes (rcS launches it directly).
+    # 5 verified-working entries.  Terminal is omitted because
+    # launcher-fork-of-nxterm crashes at pc=0 TLBL regardless of
+    # wrapper / setsid / detach — the 2003 donor wired Terminal into
+    # the cnf aspirationally but nxterm was probably only ever launched
+    # from /bin/startx on the original distribution.  rcS auto-launches
+    # a persistent nxterm so users still have a shell.
+    cat > "$JFFS2_WORK/root/bin/launcher.cnf" <<'LAUNCHCNF'
+$screensaver_timeout 120
+
+Clock bin/nxclock.pgm bin/nxclock
+Tetris bin/ntetris.ppm bin/ntetris
+Roach bin/nxroach.pgm bin/nxroach
+SoftKbd bin/nxkbd.pgm bin/nxkbd
+Tux bin/tux.ppm bin/tux
+LAUNCHCNF
+    echo "--- overlaid /bin/launcher.cnf with $(grep -cE '^[A-Z]' "$JFFS2_WORK/root/bin/launcher.cnf") app entries ---"
+
     # Touch bridge — 2003 nano-X has no /dev/input device strings, so
     # it can't read the BE-300 touchscreen on its own.  be300_nxbridge
     # reads /dev/input/event1 (touch — patch 0010 evdev) and forwards
@@ -1580,12 +1643,13 @@ export SHELL=/usr/bin/mw-shell
 # up to 30 x 200 ms internally, but we still gate on the socket file
 # above for sanity).
 /usr/bin/be300_nxbridge </dev/null >/tmp/nxbridge.log 2>&1 &
-# launcher (the donor's tappable taskbar from launcher.cnf) brings up
-# a panel with Tetris / NanoBreaker / Landmine / Slider / Terminal /
-# Clock / Magnifier / Scribble / SoftKeyboard / Roach / Tux / NXEyes
-# entries.  Each tap forks the named binary — Terminal launches nxterm.
-# CWD must be / because launcher.cnf uses bin/-relative paths.
+# Persistent nxterm from rcS so the user has a guaranteed shell to
+# inspect /tmp/mw-launch.log while we debug the launcher-fork-of-
+# nxterm crash.
 cd /
+/bin/nxterm >/tmp/nxterm.log 2>&1 &
+sleep 2
+# launcher renders the tappable app panel.
 /bin/launcher /bin/launcher.cnf >/tmp/launcher.log 2>&1 &
 wait $NANOX
 RCSMW
