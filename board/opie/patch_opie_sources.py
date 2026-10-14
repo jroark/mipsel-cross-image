@@ -3889,6 +3889,22 @@ def patch_launcher_main():
         )
     text = text.replace(
         "    odebug << \"--> mainloop in\" << oendl;\n    int rv = a.exec();\n",
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    /* BE-300: QWSServer's constructor calls openMouse()/openKeyboard()\n"
+        "       while QApplication is still being constructed, so on this\n"
+        "       Qt/MIPS build the input handlers' QSocketNotifiers never enter\n"
+        "       the event loop's select set -> touch and keyboard are dead\n"
+        "       (kernel delivers events to /dev/input/eventN but qpe never\n"
+        "       poll()s them). qApp is now fully constructed; re-open both so\n"
+        "       the freshly-created QSocketNotifiers register correctly.\n"
+        "       openMouse()/openKeyboard() are the same re-callable entry\n"
+        "       points the setMouseProto/setKeyboard QCop handlers use. */\n"
+        "    BE300_QPE_STAGE(\"be300.reopen_input\");\n"
+        "    if ( qwsServer ) {\n"
+        "        qwsServer->openMouse();\n"
+        "        qwsServer->openKeyboard();\n"
+        "    }\n"
+        "#endif\n"
         "    BE300_QPE_STAGE(\"mainloop\");\n"
         "    odebug << \"--> mainloop in\" << oendl;\n"
         "    int rv = a.exec();\n",
@@ -4208,6 +4224,175 @@ def patch_backup():
         write_text(path, text)
 
 
+def patch_be300_input_pump():
+    """BE-300 connect-free evdev input pump.
+
+    On this Qt/Embedded 2.3.10 + MIPS + uClibc QWS-server build,
+    QObject::connect() to the mouse/keyboard handler slots silently
+    fails, so neither QSocketNotifier::activated nor QTimer::timeout
+    ever reaches QVrTPanelHandlerPrivate::readMouseData() (verified:
+    the kernel delivers evdev events and qpe opens /dev/input/eventN,
+    but evdev poll/read counts stay 0). Server::timerEvent() is a plain
+    QObject virtual that the event loop *does* dispatch (Server already
+    uses it for tid_xfer), so pump /dev/input/event1 (touch) and
+    /dev/input/event0 (Stowaway keyboard) from there and inject via
+    QWSServer's static sendMouseEvent()/sendKeyEvent(). No connect /
+    slot / moc dependency. Layered after patch_regular_server_shell()
+    so it runs on the already-patched server.cpp (no restore_original).
+    """
+    path = ROOT / "core/launcher/server.cpp"
+    if not path.exists():
+        return
+    text = read_text(path)
+    if "be300_pump_input" in text:
+        return
+    text = text.replace(
+        "#include <unistd.h>\n"
+        "#include <stdlib.h>\n",
+        "#include <unistd.h>\n"
+        "#include <fcntl.h>\n"
+        "#include <signal.h>\n"
+        "#include <stdlib.h>\n",
+        1,
+    )
+    text = text.replace(
+        "Server::Server() :\n"
+        "    QWidget( 0, 0, WStyle_Tool | WStyle_Customize ),\n",
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "/* --- BE-300 connect-free evdev input pump ------------------- */\n"
+        "/* QObject connect()/slots AND QObject timers are unreliable in\n"
+        "   the qpe QWS-server loop on this Qt/MIPS+uClibc build (verified:\n"
+        "   QSocketNotifier, QTimer and ctor/re-armed startTimer all fail\n"
+        "   to tick repeatedly). qt_install_preselect_handler() registers\n"
+        "   a plain void(*)() that the event loop invokes every\n"
+        "   processNextEvent iteration before select() -- no QObject /\n"
+        "   connect / slot / timer dependency. */\n"
+        "extern void qt_install_preselect_handler( void (*)() );\n"
+        "/* The QWS-server select() blocks forever when qpe is idle (no\n"
+        "   Qt timers fire on this build; the touch fd is not in its fd\n"
+        "   set; app_readfds is snapshotted before preselect handlers run\n"
+        "   so adding it from the handler is one iteration too late). The\n"
+        "   robust wake is kernel SIGIO: evdev_event already calls\n"
+        "   kill_fasync(SIGIO). Arm O_ASYNC + F_SETOWN on the fds with a\n"
+        "   no-op SIGIO handler (NO SA_RESTART) so a tap interrupts the\n"
+        "   blocked select() (EINTR) -> the loop iterates -> the preselect\n"
+        "   pump drains the events. */\n"
+        "static volatile int be300_sigio_n = 0;\n"
+        "static void be300_sigio( int )\n"
+        "{\n"
+        "    be300_sigio_n++;\n"
+        "    if ( be300_sigio_n <= 8 )\n"
+        "        ::write( 2, \"[tpsig]\\n\", 7 );   /* async-signal-safe */\n"
+        "}\n"
+        "static int  be300_ts_fd  = -1;\n"
+        "static int  be300_kbd_fd = -1;\n"
+        "static int  be300_tx = 0, be300_ty = 0;\n"
+        "static bool be300_tdown = FALSE;\n"
+        "struct Be300Iev { unsigned int sec, usec;\n"
+        "                  unsigned short type, code; int value; };\n"
+        "static void be300_open_fd( int *fd, const char *path )\n"
+        "{\n"
+        "    if ( *fd < 0 )\n"
+        "        *fd = ::open( path, O_RDONLY | O_NONBLOCK );\n"
+        "}\n"
+        "/* Linux input keycode -> (Qt keycode, unicode). Best-effort\n"
+        "   common subset, unshifted; non-text keys get unicode 0. */\n"
+        "static void be300_lk2qt( int lk, int *qk, int *uc )\n"
+        "{\n"
+        "    static const char row[] =\n"
+        "        \"\\0\\0\"            /* 0,1   */\n"
+        "        \"1234567890-=\"   /* 2..13 KEY_1..KEY_EQUAL */\n"
+        "        \"\\0\\0\"            /* 14,15 BKSP,TAB */\n"
+        "        \"qwertyuiop[]\"   /* 16..27 KEY_Q..KEY_RIGHTBRACE */\n"
+        "        \"\\0\\0\"            /* 28,29 ENTER,LCTRL */\n"
+        "        \"asdfghjkl;'`\"   /* 30..41 KEY_A..KEY_GRAVE */\n"
+        "        \"\\0\"              /* 42    LSHIFT */\n"
+        "        \"\\\\zxcvbnm,./\";  /* 43..53 KEY_BACKSLASH..KEY_SLASH */\n"
+        "    *qk = 0; *uc = 0;\n"
+        "    if ( lk >= 2 && lk <= 53 && row[lk] ) {\n"
+        "        *uc = (unsigned char)row[lk];\n"
+        "        *qk = ( row[lk] >= 'a' && row[lk] <= 'z' )\n"
+        "                ? 0x41 + ( row[lk] - 'a' ) : row[lk];\n"
+        "        return;\n"
+        "    }\n"
+        "    switch ( lk ) {\n"
+        "      case 57: *qk = 0x20;   *uc = ' '; break;   /* SPACE */\n"
+        "      case 28: *qk = 0x1004; *uc = 13;  break;   /* ENTER */\n"
+        "      case 14: *qk = 0x1003; *uc = 8;   break;   /* BKSP  */\n"
+        "      case 15: *qk = 0x1001; *uc = 9;   break;   /* TAB   */\n"
+        "      case 1:  *qk = 0x1000; break;              /* ESC   */\n"
+        "      case 103:*qk = 0x1013; break;              /* UP    */\n"
+        "      case 108:*qk = 0x1015; break;              /* DOWN  */\n"
+        "      case 105:*qk = 0x1012; break;              /* LEFT  */\n"
+        "      case 106:*qk = 0x1014; break;              /* RIGHT */\n"
+        "      default: break;\n"
+        "    }\n"
+        "}\n"
+        "static void be300_pump_input()\n"
+        "{\n"
+        "    Be300Iev ev;\n"
+        "    static int be300_sig_armed = 0;\n"
+        "    be300_open_fd( &be300_ts_fd,  \"/dev/input/event1\" );\n"
+        "    be300_open_fd( &be300_kbd_fd, \"/dev/input/event0\" );\n"
+        "    if ( !be300_sig_armed && be300_ts_fd >= 0 ) {\n"
+        "        struct sigaction sa;\n"
+        "        sa.sa_handler = be300_sigio;\n"
+        "        sigemptyset( &sa.sa_mask );\n"
+        "        sa.sa_flags = 0;        /* no SA_RESTART: select() -> EINTR */\n"
+        "        ::sigaction( SIGIO, &sa, 0 );\n"
+        "        int afd[2]; afd[0] = be300_ts_fd; afd[1] = be300_kbd_fd;\n"
+        "        for ( int i = 0; i < 2; i++ ) {\n"
+        "            int f = afd[i];\n"
+        "            if ( f < 0 ) continue;\n"
+        "            ::fcntl( f, F_SETOWN, ::getpid() );\n"
+        "            ::fcntl( f, F_SETFL,\n"
+        "                     ::fcntl( f, F_GETFL, 0 ) | O_ASYNC | O_NONBLOCK );\n"
+        "        }\n"
+        "        be300_sig_armed = 1;\n"
+        "    }\n"
+        "    if ( be300_ts_fd >= 0 ) {\n"
+        "        while ( ::read( be300_ts_fd, &ev, sizeof(ev) ) == (int)sizeof(ev) ) {\n"
+        "            if ( ev.type == 3 ) {\n"
+        "                if ( ev.code == 0 ) be300_tx = ev.value;\n"
+        "                else if ( ev.code == 1 ) be300_ty = ev.value;\n"
+        "            } else if ( ev.type == 1 && ev.code == 0x14a ) {\n"
+        "                be300_tdown = ev.value != 0;\n"
+        "            } else if ( ev.type == 0 && ev.code == 0 ) {\n"
+        "                QWSServer::sendMouseEvent( QPoint( be300_tx, be300_ty ),\n"
+        "                                           be300_tdown ? Qt::LeftButton : 0 );\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    if ( be300_kbd_fd >= 0 ) {\n"
+        "        while ( ::read( be300_kbd_fd, &ev, sizeof(ev) ) == (int)sizeof(ev) ) {\n"
+        "            if ( ev.type == 1 ) {\n"
+        "                int qk, uc;\n"
+        "                be300_lk2qt( ev.code, &qk, &uc );\n"
+        "                if ( qk || uc )\n"
+        "                    QWSServer::sendKeyEvent( uc, qk, 0,\n"
+        "                                             ev.value != 0,\n"
+        "                                             ev.value == 2 );\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "#endif\n"
+        "\n"
+        "Server::Server() :\n"
+        "    QWidget( 0, 0, WStyle_Tool | WStyle_Customize ),\n",
+        1,
+    )
+    text = text.replace(
+        "    tid_xfer = 0;\n",
+        "    tid_xfer = 0;\n"
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    qt_install_preselect_handler( be300_pump_input );\n"
+        "#endif\n",
+        1,
+    )
+    write_text(path, text)
+
+
 def main():
     patch_qpeapplication()
     patch_regular_launcher_shell()
@@ -4217,6 +4402,7 @@ def main():
     patch_regular_documentlist_shell()
     patch_taskbar()
     patch_regular_server_shell()
+    patch_be300_input_pump()
     patch_opie_application()
     patch_launcher_main()
     patch_config_write()

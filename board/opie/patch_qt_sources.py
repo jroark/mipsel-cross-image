@@ -1294,10 +1294,48 @@ def patch_be300_wait_timer_null_guard():
     write_text(path, text)
 
 
+def patch_be300_select_timeout():
+    """Clamp the QWS-server processNextEvent select() timeout to <=20ms.
+
+    Every Qt event-delivery mechanism (QObject connect/QSocketNotifier/
+    QTimer/startTimer/qt_set_socket_handler/SIGIO) was empirically proven
+    unreliable in the qpe QWS-server loop on this Qt/MIPS+uClibc build,
+    so the connect-free preselect input pump (board/opie patch_opie_
+    sources be300_pump_input) only runs when this select() returns. With
+    no working Qt timers and the touch fd not in qpe's select set,
+    select() blocks forever after the first iteration (kernel evdev READ
+    probe stuck at 1). Forcing a <=20ms timeout makes the loop always
+    iterate so the preselect pump polls /dev/input/eventN. CASSIOPEIA-
+    gated; ~50 Hz poll is fine for the BE-300 pen.
+    """
+    path = ROOT / "src/kernel/qapplication_qws.cpp"
+    if not path.exists():
+        return
+    text = read_text(path)
+    if "be300_seltm" in text:
+        return
+    old = "    nsel = select( highest + 1,\n"
+    new = (
+        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "    static timeval be300_seltm;\n"
+        "    if ( !tm || tm->tv_sec > 0 || tm->tv_usec > 20000 ) {\n"
+        "        be300_seltm.tv_sec = 0;\n"
+        "        be300_seltm.tv_usec = 20000;\n"
+        "        tm = &be300_seltm;\n"
+        "    }\n"
+        "#endif\n"
+        "    nsel = select( highest + 1,\n"
+    )
+    if old in text:
+        text = text.replace(old, new, 1)
+        write_text(path, text)
+
+
 def main():
     patch_file("src/kernel/qapplication_qws.cpp")
     patch_file("src/kernel/qwindowsystem_qws.cpp")
     patch_time64_redirects()
+    patch_be300_select_timeout()
     patch_be300_locale_paths()
     patch_be300_message_output()
     patch_be300_qfile_destructor()

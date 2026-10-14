@@ -292,11 +292,45 @@ UDI __lshrdi3(UDI a, int b) { return a >> b; }
 DI  __ashrdi3(DI a, int b)  { return a >> b; }
 DI  __negdi2(DI a)          { return -a; }
 
-/* float<->int conversions pull in mul on mips32r2; provide C versions */
-DI __fixdfdi(double d)              { return (DI)d; }
-UDI __fixunsdfdi(double d)          { return (UDI)d; }
-double __floatdidf(DI i)            { return (double)i; }
-double __floatundidf(UDI i)         { return (double)i; }
+/* float<->int conversions pull in mul on mips32r2; provide C versions.
+ * Do NOT write these as plain casts: on mips2 GCC lowers a double<->64-bit
+ * integer cast to a call to this very helper, so `return (DI)d;` compiles
+ * to unbounded self-recursion (BusyBox `sleep` segfaulted on a stack
+ * fault ~9 MiB below the stack).  Split into two 32-bit halves instead;
+ * double<->32-bit conversions are inline (hard-float) or use the SI
+ * soft-float helpers. */
+#define TWO32 4294967296.0
+
+UDI __fixunsdfdi(double d)
+{
+	USI hi, lo;
+
+	if (!(d >= 1.0))	/* also catches NaN */
+		return 0;
+	hi = (USI)(d / TWO32);		/* exact power-of-two scale */
+	lo = (USI)(d - (double)hi * TWO32);
+	return ((UDI)hi << 32) | lo;
+}
+
+DI __fixdfdi(double d)
+{
+	if (d < 0.0)
+		return -(DI)__fixunsdfdi(-d);
+	return (DI)__fixunsdfdi(d);
+}
+
+double __floatundidf(UDI i)
+{
+	/* hi * 2^32 is exact; the single add rounds correctly. */
+	return (double)(USI)(i >> 32) * TWO32 + (double)(USI)i;
+}
+
+double __floatdidf(DI i)
+{
+	if (i < 0)
+		return -__floatundidf(-(UDI)i);
+	return __floatundidf((UDI)i);
+}
 
 SI __clzsi2(USI x)
 {

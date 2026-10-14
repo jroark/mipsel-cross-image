@@ -1964,6 +1964,14 @@ chmod 0644 "$ROOTFS/etc/tinyx.conf"
 cd /work
 else
 echo "=== Building Qt/Embedded + OPIE for BE-300 ==="
+# OPIE links shared libraries (libqte/libqpe/libopie*) through its own
+# qmake LFLAGS, which only see BE300_LIBC_LDFLAGS -- not the compile-time
+# -specs.  On musl the specs must also be on the link line, or gcc falls
+# back to the Debian glibc search path (no libcrypt, wrong crt/libc).
+OPIE_LIBC_LDFLAGS="$TARGET_LIBC_LDFLAGS"
+if [ "$BE300_LIBC" = "musl" ]; then
+    OPIE_LIBC_LDFLAGS="-specs $MUSL_SPECS $TARGET_LIBC_LDFLAGS"
+fi
 OPIE_CONFIG="$OPIE_CONFIG" \
 OPIE_BUILD_STAMP="$OPIE_BUILD_STAMP" \
 OPIE_PROFILE="$OPIE_PROFILE" \
@@ -1977,7 +1985,7 @@ BE300_TARGET_STRIP="$TARGET_STRIP" \
 BE300_TARGET_CROSS_COMPILE="$TARGET_CROSS_COMPILE" \
 BE300_ARCH_CFLAGS="$TARGET_ARCH_CFLAGS" \
 BE300_LIBC_CFLAGS="$TARGET_LIBC_CFLAGS" \
-BE300_LIBC_LDFLAGS="$TARGET_LIBC_LDFLAGS" \
+BE300_LIBC_LDFLAGS="$OPIE_LIBC_LDFLAGS" \
     /work/board/opie/build_opie_rootfs.sh "$ROOTFS" "$MUSL_SPECS" "$KHDRS"
 cd /work
 fi

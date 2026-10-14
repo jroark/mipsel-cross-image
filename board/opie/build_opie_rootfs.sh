@@ -48,6 +48,35 @@ OPIE_NO_RELAX_LDFLAGS="${BE300_OPIE_NO_RELAX_LDFLAGS:-}"
 if [ "$BE300_LIBC" = "uclibc" ] && [ -z "$OPIE_NO_RELAX_LDFLAGS" ]; then
 	OPIE_NO_RELAX_LDFLAGS="-Wl,--no-relax"
 fi
+# Qt/OPIE source patch set.  "stock" is the May 2026 set that the Linux
+# 4.2.9 OPIE image was verified with (themed launcher, apps launch via
+# quicklauncher).  "legacy24" is the later Linux 2.4.18/uClibc workaround
+# set (simplified launcher/server shells, connect-free input pump, select
+# clamp, no-vfprintf Qt messages); applying it to 4.2.9 breaks app launch
+# and the launcher theme.  The patch set follows the libc tree because the
+# 2.4.18 build always uses the uClibc trees.
+OPIE_PATCHSET="${BE300_OPIE_PATCHSET:-}"
+if [ -z "$OPIE_PATCHSET" ]; then
+	if [ "$BE300_LIBC" = "musl" ]; then
+		OPIE_PATCHSET="stock"
+	else
+		OPIE_PATCHSET="legacy24"
+	fi
+fi
+case "$OPIE_PATCHSET" in
+	stock)
+		PATCH_QT_SOURCES="/work/board/opie/patch_qt_sources_stock.py"
+		PATCH_OPIE_SOURCES="/work/board/opie/patch_opie_sources_stock.py"
+		;;
+	legacy24)
+		PATCH_QT_SOURCES="/work/board/opie/patch_qt_sources.py"
+		PATCH_OPIE_SOURCES="/work/board/opie/patch_opie_sources.py"
+		;;
+	*)
+		echo "ERROR: BE300_OPIE_PATCHSET must be 'stock' or 'legacy24' (got '$OPIE_PATCHSET')" >&2
+		exit 1
+		;;
+esac
 if [ "$BE300_LIBC" = "musl" ]; then
 	QT_SRC="/work/qt-${QT_VERSION}-be300"
 	OPIE_SRC="/work/opie-${OPIE_VERSION}-be300"
@@ -55,7 +84,16 @@ else
 	QT_SRC="/work/qt-${QT_VERSION}-be300-${BE300_LIBC}"
 	OPIE_SRC="/work/opie-${OPIE_VERSION}-be300-${BE300_LIBC}"
 fi
-COMMON_CFLAGS="${ARCH_CFLAGS} -DQT_QWS_CASSIOPEIA ${OPIE_EXTRA_DEFS} ${OPIE_NO_RELAX_CFLAGS} -Os -fomit-frame-pointer ${LIBC_CFLAGS} -I${BE300_LIBS}/include"
+# BE300_OPIE_LINUX24 gates the Linux 2.4.18 bring-up hacks (no-op app
+# launch, skipped AppLauncher, stubbed UidGen/wordDate/helpPath, vfork
+# invoke, no crash-signal handlers).  The 25 ms evdev poll timer is also
+# 2.4-only; on 4.2.9 it keeps qpe busy.  The stock 4.2.9 build gets
+# neither, matching the May 2026 launcher that launched apps on tap.
+OPIE_PATCHSET_DEFS=""
+if [ "$OPIE_PATCHSET" = "legacy24" ]; then
+	OPIE_PATCHSET_DEFS="-DBE300_QWS_EVPOLL_TIMER -DBE300_OPIE_LINUX24"
+fi
+COMMON_CFLAGS="${ARCH_CFLAGS} -DQT_QWS_CASSIOPEIA ${OPIE_PATCHSET_DEFS} ${OPIE_EXTRA_DEFS} ${OPIE_NO_RELAX_CFLAGS} -Os -fomit-frame-pointer ${LIBC_CFLAGS} -I${BE300_LIBS}/include"
 COMMON_CXXFLAGS="${COMMON_CFLAGS} -nostdinc++ -std=gnu++98 -fno-exceptions -fno-rtti -fpermissive -Wno-write-strings"
 COMMON_LFLAGS="${LIBC_LDFLAGS} ${OPIE_BIND_NOW_LDFLAGS} ${OPIE_NO_RELAX_LDFLAGS} -L${BE300_LIBS}/lib"
 COMMON_LIBS="-lbe300cxx -lbe300gcc"
@@ -556,6 +594,23 @@ new = (
     "\tmouseNotifier = new QSocketNotifier( mouseFD, QSocketNotifier::Read,\n"
     "\t\t\t\t\t this );\n"
     "\tconnect(mouseNotifier, SIGNAL(activated(int)),this, SLOT(readMouseData()));\n"
+    "#ifdef BE300_QWS_EVPOLL_TIMER\n"
+    "\t/* BE-300: on this Qt/MIPS+uClibc QWS-server build the\n"
+    "\t   QSocketNotifier never enters the event loop's select set\n"
+    "\t   (kernel delivers evdev events to /dev/input/eventN and qpe\n"
+    "\t   opens it, but qpe never poll()s/read()s the fd). Qt timers\n"
+    "\t   ARE dispatched normally here (Opie QTimer::singleShot and\n"
+    "\t   periodic timers work), so drive readMouseData() from a\n"
+    "\t   periodic QTimer as well; its while-read loop drains every\n"
+    "\t   pending evdev record per tick. The notifier is kept in case\n"
+    "\t   it ever works; the timer is the reliable path. */\n"
+    "\t{\n"
+    "\t    QTimer *evPollTimer = new QTimer( this );\n"
+    "\t    connect( evPollTimer, SIGNAL(timeout()),\n"
+    "\t\t     this, SLOT(readMouseData()) );\n"
+    "\t    evPollTimer->start( 25 );\n"
+    "\t}\n"
+    "#endif\n"
     "\tprintf(\"\\033[?25l\"); fflush(stdout);\n"
     "\treturn;\n"
     "    }\n"
@@ -661,7 +716,7 @@ if old in text:
     text = text.replace(old, new, 1)
 path.write_text(text)
 PY
-	python3 /work/board/opie/patch_qt_sources.py "$QT_SRC"
+	python3 "$PATCH_QT_SOURCES" "$QT_SRC"
 }
 
 build_qt() {
@@ -1144,7 +1199,7 @@ if path.exists():
         "        sig, info ? info->si_code : -1,\n"
         "        info ? info->si_addr : (void*)0, be300_qpe_stage);\n"
         "    write(2, buf, n);\n",
-        "#ifdef QT_QWS_CASSIOPEIA\n"
+        "#ifdef BE300_OPIE_LINUX24\n"
         "    const char msg[] = \"D'oh! qpe got signal\\n\";\n"
         "    write(2, msg, sizeof(msg) - 1);\n"
         "#else\n"
@@ -1162,7 +1217,7 @@ if path.exists():
         "        sigaction(SIGILL, &sa, 0);\n"
         "        sigaction(SIGTERM, &sa, 0);\n"
         "        sigaction(SIGINT, &sa, 0);\n",
-        "#ifndef QT_QWS_CASSIOPEIA\n"
+        "#ifndef BE300_OPIE_LINUX24\n"
         "        sigaction(SIGSEGV, &sa, 0);\n"
         "        sigaction(SIGBUS, &sa, 0);\n"
         "        sigaction(SIGILL, &sa, 0);\n"
@@ -1505,7 +1560,7 @@ if path.exists():
             "    connect(appLauncher, SIGNAL(terminated(int,const QString&)), this, SLOT(applicationTerminated(int,const QString&)) );\n"
             "    connect(appLauncher, SIGNAL(connected(const QString&)), this, SLOT(applicationConnected(const QString&)) );\n",
             "    docList = new DocumentList( serverGui );\n"
-            "#ifndef QT_QWS_CASSIOPEIA\n"
+            "#ifndef BE300_OPIE_LINUX24\n"
             "    appLauncher = new AppLauncher(this);\n"
             "    connect(appLauncher, SIGNAL(launched(int,const QString&)), this, SLOT(applicationLaunched(int,const QString&)) );\n"
             "    connect(appLauncher, SIGNAL(terminated(int,const QString&)), this, SLOT(applicationTerminated(int,const QString&)) );\n"
@@ -1614,7 +1669,7 @@ if path.exists():
             "    bool isUnique(int id) const { return (!ids.contains(id)); }\n",
             "    int generate() const\n"
             "\t{\n"
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "\t    /* BE300 lightweight UidGen: avoid the global QMap<int,bool>\n"
             "\t       during early qpe startup on the 16 MiB Linux 2.4 image. */\n"
             "\t    int id = sign * (int) ::time(NULL);\n"
@@ -1633,7 +1688,7 @@ if path.exists():
             "#endif\n"
             "\t}\n"
             "\n"
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "    void store(int) { }\n"
             "    bool isUnique(int) const { return true; }\n"
             "#else\n"
@@ -1651,7 +1706,7 @@ if path.exists():
             )
             replacement = """    int generate() const
 {
-#ifdef QT_QWS_CASSIOPEIA
+#ifdef BE300_OPIE_LINUX24
     /* BE300 lightweight UidGen: avoid the global QMap<int,bool>
        during early qpe startup on the 16 MiB Linux 2.4 image. */
     int id = sign * (int) ::time(NULL);
@@ -1670,7 +1725,7 @@ if path.exists():
 #endif
 }
 
-#ifdef QT_QWS_CASSIOPEIA
+#ifdef BE300_OPIE_LINUX24
     void store(int) { }
     bool isUnique(int) const { return true; }
 #else
@@ -1692,7 +1747,7 @@ if path.exists():
             "{\n",
             "QString DateFormat::wordDate(const QDate &d, int v) const\n"
             "{\n"
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "    /* BE300 simple DateFormat::wordDate: avoid the translated\n"
             "       QString-heavy path during 16 MiB qpe startup. */\n"
             "    (void)v;\n"
@@ -1725,7 +1780,7 @@ if path.exists():
             "{\n",
             "void Global::invoke(const QString &c)\n"
             "{\n"
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "    /* BE300 no-op Global::invoke: the 16 MiB Linux 2.4 profile\n"
             "       boots the desktop first and avoids fork/vfork child launch\n"
             "       from qpe, which corrupts the parent stack on this target. */\n"
@@ -1746,11 +1801,20 @@ if path.exists():
             "    return;\n"
             "#endif\n"
             "    // ask the server to do the work\n",
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "    /* BE300 no-op Global::execute: application launching is\n"
             "       disabled while bringing up the 16 MiB OPIE desktop. */\n"
             "    (void)c;\n"
             "    (void)document;\n"
+            "    return;\n"
+            "#elif defined(QT_QWS_CASSIOPEIA)\n"
+            "    /* BE300 direct Global::execute (Linux 4.2.9): the\n"
+            "       lightweight launcher has no AppLauncher QCop path;\n"
+            "       fork/exec the app directly via invoke(). */\n"
+            "    if ( document.isNull() || document.isEmpty() )\n"
+            "        invoke( c );\n"
+            "    else\n"
+            "        invoke( c + \" \" + document );\n"
             "    return;\n"
             "#endif\n"
             "    // ask the server to do the work\n",
@@ -1763,11 +1827,20 @@ if path.exists():
             "    // ask the server to do the work\n",
             "void Global::execute( const QString &c, const QString& document )\n"
             "{\n"
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "    /* BE300 no-op Global::execute: application launching is\n"
             "       disabled while bringing up the 16 MiB OPIE desktop. */\n"
             "    (void)c;\n"
             "    (void)document;\n"
+            "    return;\n"
+            "#elif defined(QT_QWS_CASSIOPEIA)\n"
+            "    /* BE300 direct Global::execute (Linux 4.2.9): the\n"
+            "       lightweight launcher has no AppLauncher QCop path;\n"
+            "       fork/exec the app directly via invoke(). */\n"
+            "    if ( document.isNull() || document.isEmpty() )\n"
+            "        invoke( c );\n"
+            "    else\n"
+            "        invoke( c + \" \" + document );\n"
             "    return;\n"
             "#endif\n"
             "    // ask the server to do the work\n",
@@ -1783,7 +1856,7 @@ if path.exists():
             "{\n",
             "QStringList Global::helpPath()\n"
             "{\n"
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "    /* BE300 simple Global::helpPath: avoid QString path\n"
             "       concatenation during 16 MiB qpe startup. */\n"
             "    return QStringList();\n"
@@ -1792,13 +1865,13 @@ if path.exists():
         )
     else:
         text = text.replace(
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "    /* BE300 simple Global::helpPath: avoid QString path\n"
             "       concatenation during 16 MiB qpe startup. */\n"
             "    QStringList path;\n"
             "    return path;\n"
             "#endif\n",
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "    /* BE300 simple Global::helpPath: avoid QString path\n"
             "       concatenation during 16 MiB qpe startup. */\n"
             "    return QStringList();\n"
@@ -1810,7 +1883,7 @@ if path.exists():
     if "BE300 vfork Global::invoke" not in text:
         text = text.replace(
             "        pid_t pid = ::fork ( );\n",
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "        /* BE300 vfork Global::invoke: 16 MiB Linux 2.4 has\n"
             "           shown unstable full-fork returns from qpe.  Build\n"
             "           child data before vfork and only make syscalls in\n"
@@ -1826,7 +1899,7 @@ if path.exists():
         text = text.replace(
             "            ::execv ( qpeDir ( ) + \"/bin/\" + args [0], (char * const *) args );\n"
             "            ::execvp ( args [0], (char * const *) args );\n",
-            "#ifdef QT_QWS_CASSIOPEIA\n"
+            "#ifdef BE300_OPIE_LINUX24\n"
             "            ::execv ( be300ExecPath8.data(), (char * const *) args );\n"
             "#else\n"
             "            ::execv ( qpeDir ( ) + \"/bin/\" + args [0], (char * const *) args );\n"
@@ -3832,7 +3905,7 @@ if path.exists():
     )
     path.write_bytes(data)
 PY
-	python3 /work/board/opie/patch_opie_sources.py "$OPIE_SRC"
+	python3 "$PATCH_OPIE_SOURCES" "$OPIE_SRC"
 	if [ ! -f "$OPIE_SRC/.be300-opie-patched" ]; then
 		echo "=== Applying BE-300 OPIE build patches ==="
 		OPIE_SRC="$OPIE_SRC" \
@@ -4313,7 +4386,11 @@ FONTDIR
 
 	mkdir -p "$ROOTFS/root/Applications" "$ROOTFS/root/Documents" \
 		"$ROOTFS/root/Settings"
-	${TARGET_CC} $COMMON_CFLAGS $COMMON_LFLAGS /work/board/opie/be300_vtmode.c \
+	# COMMON_CFLAGS and COMMON_LFLAGS both carry `-specs musl-gcc.specs` on
+	# the musl profile; gcc rejects the specs file loaded twice
+	# (cpp_options rename collision), so drop it from the link half here.
+	${TARGET_CC} $COMMON_CFLAGS ${COMMON_LFLAGS//-specs ${MUSL_SPECS}/} \
+		/work/board/opie/be300_vtmode.c \
 		-o "$ROOTFS/bin/be300-vtmode"
 	cp /work/board/opie/start-opie "$ROOTFS/bin/start-opie"
 	chmod +x "$ROOTFS/bin/start-opie"
