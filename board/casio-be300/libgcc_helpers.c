@@ -332,6 +332,13 @@ double __floatdidf(DI i)
 	return __floatundidf((UDI)i);
 }
 
+/* float <-> 64-bit integer, via the double helpers above.  Same rule:
+ * call the helpers by name, never cast float to/from a 64-bit type. */
+DI  __fixsfdi(float f)    { return __fixdfdi((double)f); }
+UDI __fixunssfdi(float f) { return __fixunsdfdi((double)f); }
+float __floatdisf(DI i)   { return (float)__floatdidf(i); }
+float __floatundisf(UDI i){ return (float)__floatundidf(i); }
+
 SI __clzsi2(USI x)
 {
 	SI n = 0;

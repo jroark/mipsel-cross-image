@@ -1,0 +1,32 @@
+BE-300 2.4.18: make sys_pipe() actually return the second descriptor.
+
+MIPS sys_pipe() takes the saved user registers by value
+(`struct pt_regs regs`, which is the pt_regs frame on the kernel stack)
+and returns the write end of the pipe by storing it in regs.regs[3]
+(user v1).  To a modern compiler that is a store to a by-value parameter
+that is never read again, so gcc 10 deletes it: the compiled sys_pipe()
+only returns fd[0] in v0, and userspace reads whatever happened to be in
+v1 as the write end.
+
+Every pipe() on the source-rebuilt 2.4.18 kernel therefore got a bogus
+second descriptor.  Shell pipelines lost their writer, $(...) printed a
+garbled error and hung the shell, and any Qt/OPIE code using pipes broke.
+Store through a volatile pointer so the write to the pt_regs frame is
+kept.
+
+--- a/arch/mips/kernel/syscall.c
++++ b/arch/mips/kernel/syscall.c
+@@ -47,7 +47,12 @@
+ 		res = error;
+ 		goto out;
+ 	}
+-	regs.regs[3] = fd[1];
++	/*
++	 * regs is the caller's pt_regs frame passed by value; a plain store
++	 * to it is dead to the compiler and gcc >= 4 drops it, losing the
++	 * second descriptor.
++	 */
++	((volatile struct pt_regs *)&regs)->regs[3] = fd[1];
+ 	res = fd[0];
+ out:
+ 	return res;
