@@ -1,0 +1,91 @@
+be300: keep the 2.4 ttyS0 driver off the Stowaway UART
+
+serial_be300 and stowaway_be300 share the VRC4173 SIU at 0xAA008680.
+Once init opened ttyS0 for the askfirst shell, the tty RX poller (10 ms)
+raced the Stowaway poller (20 ms) for RBR and swallowed key bytes, and
+the open/set_termios LCR writes (DLAB=1) reset the dock connection.
+The Stowaway driver now claims the UART from its first probe until it
+gives up on finding a dock; while claimed the tty neither reads RBR nor
+reprograms the port.
+
+--- a/arch/mips/vr41xx/vr4131/casio-be300/stowaway_be300.c
++++ b/arch/mips/vr41xx/vr4131/casio-be300/stowaway_be300.c
+@@ -106,6 +106,10 @@
+ static unsigned stow_ticks;
+ static int stow_registered;
+ 
++/* Read by serial_be300.c: keep the ttyS0 RX poller and LCR writes off the
++ * shared SIU from the first probe until we give up on finding a dock. */
++int be300_stowaway_owns_uart;
++
+ static void stow_drain_rx(void)
+ {
+ 	while (*SIU_LSR & LSR_DR)
+@@ -137,6 +141,7 @@
+ 
+ 	switch (stow_state) {
+ 	case STOW_INIT:
++		be300_stowaway_owns_uart = 1;
+ 		stow_reset_port();
+ 		stow_state = STOW_RTS_LOW;
+ 		stow_ticks = 0;
+@@ -163,6 +168,7 @@
+ 		}
+ 		if (++stow_ticks >= PROBE_GIVEUP) {
+ 			stow_state = STOW_GIVE_UP;
++			be300_stowaway_owns_uart = 0;
+ 			requeue = 0;
+ 			break;
+ 		}
+--- a/drivers/char/serial_be300.c
++++ b/drivers/char/serial_be300.c
+@@ -44,6 +44,20 @@
+ static struct tty_struct *be300_open_tty;
+ static struct timer_list be300_rx_timer;
+ 
++/*
++ * Set by stowaway_be300.c while it is probing or talking to the Stowaway
++ * keyboard on this same SIU.  The tty must not read RBR then (it would
++ * steal key bytes) or reprogram LCR (the dock treats a DLAB write as a
++ * reset and drops the connection).  Weak so the tty still links without
++ * CONFIG_CASIO_BE300_STOWAWAY.
++ */
++extern int be300_stowaway_owns_uart __attribute__((weak));
++
++static int be300_uart_claimed(void)
++{
++	return &be300_stowaway_owns_uart && be300_stowaway_owns_uart;
++}
++
+ static 	int baud_table[] = {
+ 		110, 10473,
+ 		300,  3840,
+@@ -101,7 +115,7 @@
+ 	int budget = 256;
+ 	int pushed = 0;
+ 
+-	while (tty && budget-- > 0 &&
++	while (tty && !be300_uart_claimed() && budget-- > 0 &&
+ 	       (serial_inb(UART_LSR) & UART_LSR_DR)) {
+ 		unsigned char ch = serial_inb(UART_RX);
+ 
+@@ -270,7 +284,8 @@
+ 
+ 	MOD_INC_USE_COUNT;
+ 	be300_open_tty = tty;
+-	be300_configure_uart(tty_get_baud_rate(tty));
++	if (!be300_uart_claimed())
++		be300_configure_uart(tty_get_baud_rate(tty));
+ 	
+ 	return 0;
+ }
+@@ -278,7 +293,8 @@
+ static void be300_serial_set_termios(struct tty_struct *tty, 
+ 	struct termios *old_termios)
+ {
+-	be300_configure_uart(tty_get_baud_rate(tty));
++	if (!be300_uart_claimed())
++		be300_configure_uart(tty_get_baud_rate(tty));
+ }
+ 
+ static int be300_serial_ioctl(struct tty_struct * tty, struct file * filp, 

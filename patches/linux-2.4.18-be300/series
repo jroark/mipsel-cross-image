@@ -13,6 +13,7 @@
 0012-be300-ip-fast-csum-portable-c.patch
 0013-be300-pcmcia-bridge-enable.patch
 0014-be300-2_4-sys-pipe-second-fd.patch
+0015-be300-2_4-stowaway-owns-siu.patch
 # 0011-be300-2_4-touch-poll-debug.patch -- DISABLED (May 16 2026):
 #   throwaway diagnostic (poll-tick coord dump + input_dev handler
 #   chain dump + evdev open/event/poll/read probes gated to minor 1).

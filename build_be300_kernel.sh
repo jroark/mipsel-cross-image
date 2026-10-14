@@ -495,6 +495,10 @@ PY
     enable_uclibc_config UCLIBC_HAS_FNMATCH
     enable_uclibc_config UCLIBC_HAS_GLOB
     enable_uclibc_config UCLIBC_HAS_PTY
+    # Folds openpty()/forkpty()/login_tty() into libc (libutil.a stays an
+    # empty stub).  Without it OPIE embeddedkonsole's openpty is unresolved
+    # at runtime and Terminal calls address 0 on launch.
+    enable_uclibc_config UCLIBC_HAS_LIBUTIL
     enable_uclibc_config UCLIBC_HAS_REALTIME
     enable_uclibc_config UCLIBC_SUSV3_LEGACY
     enable_uclibc_config MALLOC_STANDARD

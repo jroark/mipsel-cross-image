@@ -4334,6 +4334,17 @@ FONTDIR
 		copy_if_exists "$OPIE_SRC/bin/$app" "$ROOTFS/opt/QtPalmtop/bin/$app"
 	done
 
+	# Terminal leaves openpty() undefined (-lutil matches an empty libutil.a)
+	# and binds it from libc at runtime.  uClibc-ng only exports it with
+	# UCLIBC_HAS_LIBUTIL; without it Terminal calls address 0 on launch.
+	if [ "$BE300_LIBC" = "uclibc" ] &&
+			[ -f "$ROOTFS/opt/QtPalmtop/plugins/application/libembeddedkonsole.so.1.0.0" ] &&
+			! mipsel-linux-gnu-readelf -Ws --dyn-syms "$ROOTFS/lib/libc.so.0" |
+				awk '$8 == "openpty" && $7 != "UND" { found = 1 } END { exit !found }'; then
+		echo "ERROR: uClibc-ng libc does not export openpty (enable UCLIBC_HAS_LIBUTIL)" >&2
+		exit 1
+	fi
+
 	install_selected_desktop_files
 	install_selected_pics
 	if [ "$OPIE_PROFILE" = "opie64" ] && \
