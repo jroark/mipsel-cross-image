@@ -48,21 +48,14 @@ OPIE_NO_RELAX_LDFLAGS="${BE300_OPIE_NO_RELAX_LDFLAGS:-}"
 if [ "$BE300_LIBC" = "uclibc" ] && [ -z "$OPIE_NO_RELAX_LDFLAGS" ]; then
 	OPIE_NO_RELAX_LDFLAGS="-Wl,--no-relax"
 fi
-# Qt/OPIE source patch set.  "stock" is the May 2026 set that the Linux
-# 4.2.9 OPIE image was verified with (themed launcher, apps launch via
-# quicklauncher).  "legacy24" is the later Linux 2.4.18/uClibc workaround
-# set (simplified launcher/server shells, connect-free input pump, select
-# clamp, no-vfprintf Qt messages); applying it to 4.2.9 breaks app launch
-# and the launcher theme.  The patch set follows the libc tree because the
-# 2.4.18 build always uses the uClibc trees.
-OPIE_PATCHSET="${BE300_OPIE_PATCHSET:-}"
-if [ -z "$OPIE_PATCHSET" ]; then
-	if [ "$BE300_LIBC" = "musl" ]; then
-		OPIE_PATCHSET="stock"
-	else
-		OPIE_PATCHSET="legacy24"
-	fi
-fi
+# Qt/OPIE source patch set.  "stock" (default) is the May 2026 set: themed
+# launcher, apps launch on tap.  It runs on both Linux 4.2.9 (musl) and
+# Linux 2.4.18 (uClibc) now that uClibc-ng uses syscalls 2.4 has, the
+# soft-float libgcc entry points are real, and 2.4 sys_pipe returns both
+# descriptors.  "legacy24" is the older 2.4.18 bring-up workaround set
+# (simplified launcher/server shells, connect-free input pump, select
+# clamp, no-vfprintf Qt messages), kept opt-in for comparison.
+OPIE_PATCHSET="${BE300_OPIE_PATCHSET:-stock}"
 case "$OPIE_PATCHSET" in
 	stock)
 		PATCH_QT_SOURCES="/work/board/opie/patch_qt_sources_stock.py"

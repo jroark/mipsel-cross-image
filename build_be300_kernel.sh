@@ -114,6 +114,7 @@ prepare_be300_libgcc() {
         eqdf2.o nedf2.o gedf2.o gtdf2.o ledf2.o ltdf2.o unorddf2.o \
         _divdi3.o _moddi3.o _udivdi3.o _umoddi3.o \
         _fixdfdi.o _fixunsdfdi.o _floatdidf.o _floatundidf.o \
+        _fixsfdi.o _fixunssfdi.o _floatdisf.o _floatundisf.o \
         _lshrdi3.o _ashldi3.o _ashrdi3.o _negdi2.o \
         _clz.o _clzsi2.o _clzdi2.o _ctzsi2.o _ctzdi2.o \
         _popcount_tab.o _popcountsi2.o _popcountdi2.o _paritysi2.o _paritydi2.o \
@@ -123,7 +124,29 @@ prepare_be300_libgcc() {
     mipsel-linux-gnu-gcc -march=mips2 $LIBGCC_HELPER_FLOAT_CFLAGS -O2 -fPIC -ffreestanding -fno-builtin \
         -c -o /tmp/libgcc_helpers.o /work/board/casio-be300/libgcc_helpers.c
     mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libgcc.a /tmp/libgcc_helpers.o
+    rm -f /tmp/libgcc_patched/libbe300gcc.a
     mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libbe300gcc.a /tmp/libgcc_helpers.o
+    if [ "$LIBGCC_HELPER_FLOAT_CFLAGS" = "-msoft-float" ]; then
+        # Debian's libgcc is hard-float: its soft-float entry points take
+        # and return values in FPU registers, so soft-float callers got
+        # garbage.  Swap in soft-float-ABI versions (libgcc_softfp_shims.c).
+        mipsel-linux-gnu-ar d /tmp/libgcc_patched/libgcc.a \
+            addsf3.o subsf3.o negsf2.o mulsf3.o divsf3.o \
+            adddf3.o subdf3.o negdf2.o muldf3.o divdf3.o \
+            fixsfsi.o fixdfsi.o _fixunssfsi.o _fixunsdfsi.o \
+            floatsisf.o floatunsisf.o floatsidf.o floatunsidf.o \
+            extendsfdf2.o truncdfsf2.o _powisf2.o _powidf2.o \
+            2>/dev/null || true
+        mipsel-linux-gnu-gcc -march=mips2 -mhard-float -mfp32 -O2 -fPIC -ffreestanding -fno-builtin \
+            -c -o /tmp/libgcc_softfp_shims.o /work/board/casio-be300/libgcc_softfp_shims.c
+        if mipsel-linux-gnu-nm -u /tmp/libgcc_softfp_shims.o | grep -v ' _gp_disp$' | grep -q .; then
+            echo "ERROR: libgcc_softfp_shims.o has unresolved references:" >&2
+            mipsel-linux-gnu-nm -u /tmp/libgcc_softfp_shims.o >&2
+            exit 1
+        fi
+        mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libgcc.a /tmp/libgcc_softfp_shims.o
+        mipsel-linux-gnu-ar rcs /tmp/libgcc_patched/libbe300gcc.a /tmp/libgcc_softfp_shims.o
+    fi
 }
 
 unsupported_mips2_insn() {
@@ -345,6 +368,98 @@ old = """\t\t\telse if (ELF_ST_TYPE(sym->st_info) == STT_FUNC &&\n\t\t\t\t*got_e
 new = """\t\t\telse if (tpnt->libtype == elf_executable ||\n\t\t\t\t(tpnt->dynamic_info[DT_FLAGS] & DF_SYMBOLIC)) {\n\t\t\t\t*got_entry += (unsigned long) tpnt->loadaddr;\n\t\t\t}\n\t\t\telse if (ELF_ST_TYPE(sym->st_info) == STT_FUNC &&\n\t\t\t\t*got_entry != sym->st_value && tmp_lazy) {\n\t\t\t\t*got_entry += (unsigned long) tpnt->loadaddr;\n\t\t\t}\n\t\t\telse if (ELF_ST_TYPE(sym->st_info) == STT_SECTION) {\n\t\t\t\tif (sym->st_other == 0)\n\t\t\t\t\t*got_entry += (unsigned long) tpnt->loadaddr;\n\t\t\t}\n\t\t\telse {\n\t\t\t\tstruct symbol_ref sym_ref;\n\t\t\t\tsym_ref.sym = sym;\n\t\t\t\tsym_ref.tpnt = NULL;\n\t\t\t\t*got_entry = (unsigned long) _dl_find_hash(strtab +\n\t\t\t\t\tsym->st_name, &_dl_loaded_modules->symbol_scope, tpnt, ELF_RTYPE_CLASS_PLT, &sym_ref);\n\t\t\t}\n"""
 if old not in text:
     raise SystemExit("uClibc-ng MIPS GOT relocation context not found")
+path.write_text(text.replace(old, new, 1))
+
+# uClibc-ng is built against the 4.2.9 UAPI headers but also runs on the
+# Linux 2.4.18 profiles, whose MIPS syscall table ends at 4246.  When the
+# headers define a newer syscall, select() always uses pselect6 (4301) and
+# rename() uses renameat2 (4351); on 2.4 both return ENOSYS, which stalls
+# the Qt/Embedded event loop and every Config::write rename.  Prefer the
+# legacy syscalls whenever they exist; 4.2.9 has them too.
+path = Path("libc/sysdeps/linux/common/select.c")
+text = path.read_text()
+old_cond = "#if defined(__NR_pselect6) || defined(__NR_pselect6_time64)\n"
+new_cond = "#if (defined(__NR_pselect6) || defined(__NR_pselect6_time64)) && !defined(__NR_select)\n"
+if text.count(old_cond) != 2:
+    raise SystemExit("uClibc-ng select.c pselect6 guards not found")
+text = text.replace(old_cond, new_cond)
+old = "\treturn INLINE_SYSCALL(select, 5, n, readfds, writefds, exceptfds, ts);\n"
+if old not in text:
+    raise SystemExit("uClibc-ng select.c legacy select call not found")
+text = text.replace(old, "\treturn INLINE_SYSCALL(select, 5, n, readfds, writefds, exceptfds, timeout);\n", 1)
+path.write_text(text)
+
+path = Path("libc/sysdeps/linux/common/rename.c")
+text = path.read_text()
+old = "#elif defined __NR_renameat2\n"
+if old not in text:
+    raise SystemExit("uClibc-ng rename.c renameat2 guard not found")
+path.write_text(text.replace(old, "#elif defined __NR_renameat2 && !defined __NR_rename\n", 1))
+
+# gettimeofday() and nanosleep() are built on clock_gettime() and
+# clock_nanosleep(), which 2.4 lacks.  gettimeofday() then copied an
+# uninitialized timespec into every caller (Qt timers, Config cache), so
+# call the original syscalls directly and let clock_gettime() fall back
+# to gettimeofday for the realtime/monotonic clocks.
+path = Path("libc/sysdeps/linux/common/gettimeofday.c")
+text = path.read_text()
+old = "#if defined(__VDSO_SUPPORT__) && defined(ARCH_VDSO_GETTIMEOFDAY)\n    return ARCH_VDSO_GETTIMEOFDAY(tv, tz);\n"
+if old not in text:
+    raise SystemExit("uClibc-ng gettimeofday.c VDSO branch not found")
+path.write_text(text.replace(old, "#if defined(__NR_gettimeofday) && !defined(__UCLIBC_USE_TIME64__)\n    return INLINE_SYSCALL(gettimeofday, 2, tv, tz);\n#elif defined(__VDSO_SUPPORT__) && defined(ARCH_VDSO_GETTIMEOFDAY)\n    return ARCH_VDSO_GETTIMEOFDAY(tv, tz);\n", 1))
+
+path = Path("libc/sysdeps/linux/common/nanosleep.c")
+text = path.read_text()
+old = "{\n\tint __ret = clock_nanosleep(CLOCK_REALTIME, 0, req, rem);\n"
+if old not in text:
+    raise SystemExit("uClibc-ng nanosleep.c clock_nanosleep call not found")
+path.write_text(text.replace(old, "{\n#if defined(__NR_nanosleep) && !defined(__UCLIBC_USE_TIME64__)\n\treturn INLINE_SYSCALL(nanosleep, 2, req, rem);\n#endif\n\tint __ret = clock_nanosleep(CLOCK_REALTIME, 0, req, rem);\n", 1))
+
+path = Path("libc/sysdeps/linux/common/clock_gettime.c")
+text = path.read_text()
+old = "int __libc_clock_gettime(clockid_t clock_id, struct timespec *tp)\n{\n\treturn INLINE_SYSCALL(clock_gettime, 2, clock_id, tp);\n}\n"
+if old not in text:
+    raise SystemExit("uClibc-ng clock_gettime.c syscall branch not found")
+new = (
+    "#include <errno.h>\n#include <sys/time.h>\n"
+    "int __libc_clock_gettime(clockid_t clock_id, struct timespec *tp)\n{\n"
+    "\tint ret = INLINE_SYSCALL(clock_gettime, 2, clock_id, tp);\n"
+    "#ifdef __NR_gettimeofday\n"
+    "\tif (ret < 0 && errno == ENOSYS &&\n"
+    "\t    (clock_id == CLOCK_REALTIME || clock_id == CLOCK_MONOTONIC)) {\n"
+    "\t\tstruct timeval tv;\n"
+    "\t\tret = INLINE_SYSCALL(gettimeofday, 2, &tv, NULL);\n"
+    "\t\tif (ret == 0 && tp)\n"
+    "\t\t\tTIMEVAL_TO_TIMESPEC(&tv, tp);\n"
+    "\t}\n"
+    "#endif\n"
+    "\treturn ret;\n}\n"
+)
+path.write_text(text.replace(old, new, 1))
+
+# BusyBox is built with large-file support, so cat/cp go through
+# sendfile64 (4237), which 2.4 lacks; fall back to sendfile for the
+# offset-less copies they make.
+path = Path("libc/sysdeps/linux/common/sendfile64.c")
+text = path.read_text()
+old = "_syscall4(ssize_t,sendfile64, int, out_fd, int, in_fd, __off64_t *, offset, size_t, count)\n"
+if old not in text:
+    raise SystemExit("uClibc-ng sendfile64.c syscall stub not found")
+new = (
+    "# include <errno.h>\n"
+    "# include <stddef.h>\n"
+    "# define __NR___syscall_sendfile64 __NR_sendfile64\n"
+    "static _syscall4(ssize_t, __syscall_sendfile64, int, out_fd, int, in_fd, __off64_t *, offset, size_t, count)\n"
+    "ssize_t sendfile64(int out_fd, int in_fd, __off64_t *offset, size_t count)\n"
+    "{\n"
+    "\tssize_t ret = __syscall_sendfile64(out_fd, in_fd, offset, count);\n"
+    "# ifdef __NR_sendfile\n"
+    "\tif (ret < 0 && errno == ENOSYS && offset == NULL)\n"
+    "\t\tret = INLINE_SYSCALL(sendfile, 4, out_fd, in_fd, NULL, count);\n"
+    "# endif\n"
+    "\treturn ret;\n"
+    "}\n"
+)
 path.write_text(text.replace(old, new, 1))
 PY
     make distclean >/tmp/uclibc-ng-distclean.log 2>&1 || true
