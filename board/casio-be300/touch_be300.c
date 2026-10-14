@@ -236,12 +236,21 @@ static irqreturn_t be300_touch_isr(int irq, void *dev)
 
 	if (effective & PIUINT_PENCHGINTR) {
 		bool down = !!(piu_read(t, PIU_CNTREG) & PIUCNT_PEN_DETECTED);
-		t->pen_down = down;
-		input_report_key(t->input, BTN_TOUCH, down ? 1 : 0);
+
+		/*
+		 * Pen-down fires before the first coordinate page converts.
+		 * Reporting BTN_TOUCH=1 here would publish a press at the
+		 * previous tap's ABS_X/ABS_Y, so Qt saw press-at-old-spot,
+		 * drag, release-at-new-spot and ignored the click.  Let the
+		 * first page report the press with fresh coordinates (as the
+		 * 2.4.18 driver does) and only publish pen-up here.
+		 */
 		if (!down) {
+			t->pen_down = false;
+			input_report_key(t->input, BTN_TOUCH, 0);
 			input_report_abs(t->input, ABS_PRESSURE, 0);
+			input_sync(t->input);
 		}
-		input_sync(t->input);
 		ack |= PIUINT_PENCHGINTR;
 	}
 
