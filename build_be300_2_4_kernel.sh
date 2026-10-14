@@ -714,7 +714,8 @@ elif [[ "$ROOT_MODE" == "opie" ]]; then
     # the ttyS0 askfirst shell so the kernel console owns that UART.
     cp "$PROM_C" "$PROM_C.cmdline-bak"
     trap '[[ -f "'"$PROM_C"'.cmdline-bak" ]] && mv "'"$PROM_C"'.cmdline-bak" "'"$PROM_C"'" || true' EXIT
-    OPIE_CMDLINE="consoleblank=0 noinitrd root=/dev/mtdblock3 rootfstype=jffs2 init=/sbin/init console=${BE300_2_4_CONSOLE}"
+    # ne=0x300,72: NE2000 probe for --ne2000, same as pgui/mw below.
+    OPIE_CMDLINE="consoleblank=0 noinitrd root=/dev/mtdblock3 rootfstype=jffs2 init=/sbin/init console=${BE300_2_4_CONSOLE} ne=0x300,72"
     sed -i "s|console=tty0 consoleblank=0 root=/dev/ram rootfstype=ext2 init=/sbin/init|$OPIE_CMDLINE|" "$PROM_C"
     echo "--- patched prom.c for Opie direct JFFS2 root cmdline (${BE300_2_4_CONSOLE}) ---"
 elif [[ "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
@@ -785,11 +786,11 @@ if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]
     fi
 fi
 
-# pgui/mw: also merge networking overlay (NETDEVICES + NE2000 ISA driver)
-# so the emulator's --ne2000 PCMCIA NE2000 card registers as eth0.
-if [[ "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
+# opie/pgui/mw: also merge networking overlay (NETDEVICES + NE2000 ISA
+# driver) so the emulator's --ne2000 PCMCIA NE2000 card registers as eth0.
+if [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     if [[ -f "$REPO/configs/be300_2_4_net.config" ]]; then
-        echo "--- merging configs/be300_2_4_net.config for pgui networking ---"
+        echo "--- merging configs/be300_2_4_net.config for $ROOT_MODE networking ---"
         sed -i \
             -e '/# CONFIG_ISA is not set/d' \
             -e '/# CONFIG_NETDEVICES is not set/d' \
@@ -1783,6 +1784,17 @@ mount -t tmpfs -o size=768k tmpfs /root
 echo "rcS: mkdir /root/*"
 mkdir -p /root/Settings /root/Applications /root/Documents
 export LD_LIBRARY_PATH=/opt/QtPalmtop/lib:/lib
+# Loopback (BusyBox ifconfig on 2.4 does not add the 127/8 route itself).
+/bin/ifconfig lo 127.0.0.1 netmask 255.0.0.0 up
+/bin/route add -net 127.0.0.0 netmask 255.0.0.0 lo 2>/dev/null
+# eth0 (NE2000 at 0x300 IRQ 72; boot with --ne2000).  The emulator's
+# gxemul NAT is 10.0.0.0/8 with gateway/DNS at 10.0.0.254, as in the
+# pgui/mw profiles.  /etc/resolv.conf links to /tmp/resolv.conf.
+# printf, not echo: the console=ttyS0 build strips rcS "echo " lines.
+if /bin/ifconfig eth0 10.0.0.1 netmask 255.0.0.0 up 2>/dev/null; then
+    /bin/route add default gw 10.0.0.254 2>/dev/null
+    printf 'nameserver 10.0.0.254\n' > /tmp/resolv.conf
+fi
 echo "=== Casio BE-300 Linux 2.4.18 (BusyBox + Opie) rcS done ==="
 RCSEOF
     chmod 0755 "$OPIE_ROOTFS_DIR/etc/init.d/rcS"
