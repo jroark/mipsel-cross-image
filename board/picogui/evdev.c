@@ -35,6 +35,15 @@
 #include <fcntl.h>
 #include <stdarg.h>
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <linux/input.h>
+
 /* Diagnostic: write a line to /dev/kmsg so it appears on the kernel
  * ring buffer / serial console.  Cheap, non-buffered, survives crashes. */
 static void evdev_kmsg(const char *fmt, ...)
@@ -54,14 +63,16 @@ static void evdev_kmsg(const char *fmt, ...)
   if (n > 0 && n < (int)sizeof(buf))
     write(kmsg_fd, buf, n);
 }
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <sys/ioctl.h>
-#include <linux/input.h>
+
+/* Per-event tracing.  Off by default: a single tap produced dozens of
+ * printk lines (syscall + formatting + console work per event) inside
+ * pgserver's single-threaded input path, and it buried real messages in
+ * dmesg.  Build with -DBE300_EVDEV_TRACE to bring it back. */
+#ifdef BE300_EVDEV_TRACE
+#define evdev_trace evdev_kmsg
+#else
+#define evdev_trace(...) do { } while (0)
+#endif
 
 #define EVDEV_EVENT_FMT     "/dev/input/event%d"
 #define EVDEV_MAX_EVENTS    8
@@ -98,6 +109,9 @@ static int g_touch_y;
 static int g_touch_pressed;     /* 1 between BTN_TOUCH 1 and 0 */
 static int g_touch_have_xy;     /* 1 once we've seen ABS_X+ABS_Y at least once */
 static int g_touch_packet_dirty;/* 1 if we've seen any ABS or BTN this packet */
+static int g_touch_saw_release; /* BTN_TOUCH 0 arrived in this packet */
+static int g_touch_sent_pressed;/* button state last delivered to pgserver */
+static int g_touch_dropping;    /* SYN_DROPPED seen; skip to next SYN_REPORT */
 
 /* Modifier bookkeeping for keys. */
 static u32 g_mods;              /* current PGMOD_* mask */
@@ -134,35 +148,35 @@ scan_input_devices(void)
   int  i, fd;
   int  is_touch;
 
-  evdev_kmsg("[evdev] scan: looking for input devices\n");
+  evdev_trace("[evdev] scan: looking for input devices\n");
   for (i = 0; i < EVDEV_MAX_EVENTS; i++) {
     snprintf(path, sizeof(path), EVDEV_EVENT_FMT, i);
     fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
-      evdev_kmsg("[evdev] scan: %s: not present\n", path);
+      evdev_trace("[evdev] scan: %s: not present\n", path);
       continue;
     }
 
     memset(name, 0, sizeof(name));
     if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) < 0) {
-      evdev_kmsg("[evdev] scan: %s: EVIOCGNAME failed\n", path);
+      evdev_trace("[evdev] scan: %s: EVIOCGNAME failed\n", path);
       close(fd);
       continue;
     }
-    evdev_kmsg("[evdev] scan: %s = '%s'\n", path, name);
+    evdev_trace("[evdev] scan: %s = '%s'\n", path, name);
 
     is_touch = (strcmp(name, EVDEV_NAME_TOUCH) == 0);
     if (is_touch ||
         strcmp(name, EVDEV_NAME_BUTTONS) == 0 ||
         strcmp(name, EVDEV_NAME_STOWAWAY) == 0) {
       add_fd(fd, is_touch, path, name);
-      evdev_kmsg("[evdev] scan: matched %s -> fd=%d touch=%d\n",
+      evdev_trace("[evdev] scan: matched %s -> fd=%d touch=%d\n",
                  name, fd, is_touch);
     } else {
       close(fd);
     }
   }
-  evdev_kmsg("[evdev] scan done: %d devices matched\n", g_nfds);
+  evdev_trace("[evdev] scan done: %d devices matched\n", g_nfds);
 }
 
 /* PGKEY translation. Matches kbd_evdev.c so user-visible behavior is the
@@ -298,37 +312,83 @@ apply_printable_modifiers(u16 code, u16 pgkey)
 /* ------------------------------------------------------------------- */
 
 static void
-flush_touch_packet(void)
+send_touch_status(int pressed)
 {
-  if (!g_touch_packet_dirty || !g_touch_have_xy)
-    return;
-
   /* infilter_send_pointing() is the canonical pgserver entry point for
    * pointer events from input drivers. PG_TRIGGER_PNTR_STATUS reports an
    * absolute pointer state (matching h3600ts.c / adc7843.c); pgserver
    * synthesizes PG_TRIGGER_DOWN/UP from button-state level edges. The
    * button mask is bit 0 == LEFT. */
-  evdev_kmsg("[evdev] touch %d,%d btn=%d\n",
-             g_touch_x, g_touch_y, g_touch_pressed);
+  evdev_trace("[evdev] touch %d,%d btn=%d\n", g_touch_x, g_touch_y, pressed);
   infilter_send_pointing(PG_TRIGGER_PNTR_STATUS,
-                         g_touch_x, g_touch_y,
-                         g_touch_pressed ? 1 : 0,
-                         NULL);
-
-  g_touch_packet_dirty = 0;
+                         g_touch_x, g_touch_y, pressed ? 1 : 0, NULL);
+  g_touch_sent_pressed = pressed;
 }
 
 static void
-handle_touch_event(struct evdev_wire_event *ev)
+flush_touch_packet(void)
 {
+  if (!g_touch_packet_dirty || !g_touch_have_xy)
+    return;
+
+  /* A release for a press pgserver never saw means the pen-down packet
+   * was lost (evdev queue overflow while pgserver was busy).  Deliver
+   * the click at the release position instead of silently dropping the
+   * tap: if_pntr_normalize only makes a DOWN from a 0->1 edge. */
+  if (!g_touch_pressed && g_touch_saw_release && !g_touch_sent_pressed)
+    send_touch_status(1);
+
+  send_touch_status(g_touch_pressed);
+
+  g_touch_packet_dirty = 0;
+  g_touch_saw_release = 0;
+}
+
+/* After SYN_DROPPED the queued deltas are gone; read the device's
+ * current state back and deliver it as one packet. */
+static void
+resync_touch(struct evdev_fd *e)
+{
+  unsigned long keys[(KEY_MAX + 8 * sizeof(unsigned long)) /
+                     (8 * sizeof(unsigned long))];
+  struct input_absinfo abs;
+
+  memset(keys, 0, sizeof(keys));
+  if (ioctl(e->fd, EVIOCGKEY(sizeof(keys)), keys) >= 0)
+    g_touch_pressed = !!(keys[BTN_TOUCH / (8 * sizeof(unsigned long))] &
+                         (1UL << (BTN_TOUCH % (8 * sizeof(unsigned long)))));
+  if (ioctl(e->fd, EVIOCGABS(ABS_X), &abs) >= 0)
+    g_touch_x = abs.value;
+  if (ioctl(e->fd, EVIOCGABS(ABS_Y), &abs) >= 0)
+    g_touch_y = abs.value;
+  g_touch_have_xy = 1;
+  g_touch_packet_dirty = 1;
+  /* A drop that swallowed the press but not the release still counts
+   * as a click. */
+  if (!g_touch_pressed && !g_touch_sent_pressed)
+    g_touch_saw_release = 1;
+  flush_touch_packet();
+}
+
+static void
+handle_touch_event(struct evdev_fd *e, struct evdev_wire_event *ev)
+{
+  if (g_touch_dropping) {
+    if (ev->type == EV_SYN && ev->code == SYN_REPORT) {
+      g_touch_dropping = 0;
+      resync_touch(e);
+    }
+    return;
+  }
+
   if (ev->type == EV_ABS) {
     if (ev->code == ABS_X) {
       g_touch_x = ev->value;
-      g_touch_have_xy |= 1;
+      g_touch_have_xy = 1;
       g_touch_packet_dirty = 1;
     } else if (ev->code == ABS_Y) {
       g_touch_y = ev->value;
-      g_touch_have_xy |= 1;
+      g_touch_have_xy = 1;
       g_touch_packet_dirty = 1;
     } else if (ev->code == ABS_PRESSURE) {
       g_touch_pressed = (ev->value != 0);
@@ -336,10 +396,15 @@ handle_touch_event(struct evdev_wire_event *ev)
     }
   } else if (ev->type == EV_KEY && ev->code == BTN_TOUCH) {
     g_touch_pressed = (ev->value != 0);
+    if (!ev->value)
+      g_touch_saw_release = 1;
     g_touch_packet_dirty = 1;
   } else if (ev->type == EV_SYN) {
     if (ev->code == SYN_DROPPED) {
+      evdev_trace("[evdev] %s SYN_DROPPED\n", e->name);
       g_touch_packet_dirty = 0;
+      g_touch_saw_release = 0;
+      g_touch_dropping = 1;
       return;
     }
     flush_touch_packet();
@@ -408,25 +473,30 @@ handle_key_event(struct evdev_wire_event *ev)
 static void
 drain_fd(struct evdev_fd *e)
 {
-  struct evdev_wire_event ev;
+  struct evdev_wire_event ev[16];
   ssize_t n;
-  int events_read = 0;
+  int i, count, events_read = 0;
 
   for (;;) {
-    n = read(e->fd, &ev, sizeof(ev));
-    if (n != sizeof(ev))
+    n = read(e->fd, ev, sizeof(ev));
+    if (n < (ssize_t)sizeof(ev[0]))
       break;
-    events_read++;
-    evdev_kmsg("[evdev] %s ev type=%u code=%u value=%d\n",
-               e->name, ev.type, ev.code, ev.value);
-    if (e->is_touch)
-      handle_touch_event(&ev);
-    else
-      handle_key_event(&ev);
+    count = n / sizeof(ev[0]);
+    for (i = 0; i < count; i++) {
+      evdev_trace("[evdev] %s ev type=%u code=%u value=%d\n",
+                  e->name, ev[i].type, ev[i].code, ev[i].value);
+      if (e->is_touch)
+        handle_touch_event(e, &ev[i]);
+      else
+        handle_key_event(&ev[i]);
+    }
+    events_read += count;
+    if (count < (int)(sizeof(ev) / sizeof(ev[0])))
+      break;
   }
   if (events_read > 0)
-    evdev_kmsg("[evdev] drain_fd %s read %d events\n",
-               e->name, events_read);
+    evdev_trace("[evdev] drain_fd %s read %d events\n",
+                e->name, events_read);
 }
 
 /* ------------------------------------------------------------------- */
@@ -441,10 +511,13 @@ evdev_init(void)
   g_touch_pressed = 0;
   g_touch_have_xy = 0;
   g_touch_packet_dirty = 0;
+  g_touch_saw_release = 0;
+  g_touch_sent_pressed = 0;
+  g_touch_dropping = 0;
   g_mods = 0;
   g_caps_lock = 0;
 
-  evdev_kmsg("[evdev] init entry\n");
+  evdev_trace("[evdev] init entry\n");
   scan_input_devices();
   if (g_nfds == 0) {
     evdev_kmsg("[evdev] init FAILED — no matching evdev nodes\n");
@@ -484,7 +557,7 @@ evdev_fd_init(int *n, fd_set *readfds, struct timeval *timeout)
   }
   /* Log only the first few + every 100th call so we don't flood */
   if (trace_count < 5 || (trace_count % 100) == 0) {
-    evdev_kmsg("[evdev] fd_init #%d: n_in=%d nfds_out=%d g_nfds=%d fd0=%d fd1=%d fd2=%d\n",
+    evdev_trace("[evdev] fd_init #%d: n_in=%d nfds_out=%d g_nfds=%d fd0=%d fd1=%d fd2=%d\n",
                trace_count, n_in, *n, g_nfds,
                g_nfds > 0 ? g_fds[0].fd : -1,
                g_nfds > 1 ? g_fds[1].fd : -1,
@@ -499,7 +572,7 @@ evdev_fd_activate(int fd)
   int i;
   for (i = 0; i < g_nfds; i++) {
     if (g_fds[i].fd == fd) {
-      evdev_kmsg("[evdev] fd_activate fd=%d (%s)\n", fd, g_fds[i].name);
+      evdev_trace("[evdev] fd_activate fd=%d (%s)\n", fd, g_fds[i].name);
       drain_fd(&g_fds[i]);
       return 1;
     }
