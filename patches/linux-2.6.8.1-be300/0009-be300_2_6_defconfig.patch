@@ -1,0 +1,158 @@
+BE-300 2.6.8.1: be300_2_6_defconfig.
+
+NAND MTD + JFFS2 root on mtd3, sfb framebuffer with fbcon (8x8 font,
+30x40 like the linux4be 2.6 kernel) and the Linux4.BE logo, VT, evdev,
+the BE-300 input drivers, ttyS0, NE2000 on the PCMCIA window, UNIX/INET
+networking, SysV IPC, tmpfs and devpts for Opie, no modules, initrd, IDE,
+swap or VGA console.  The built-in command line supplies root= and the
+NE2000 address because the SPL passes no arguments.
+
+---
+ arch/mips/configs/be300_2_6_defconfig | 138 ++++++++++++++++++++++++++
+ 1 file changed, 138 insertions(+)
+ create mode 100644 arch/mips/configs/be300_2_6_defconfig
+
+diff --git a/arch/mips/configs/be300_2_6_defconfig b/arch/mips/configs/be300_2_6_defconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7420f7981bef73d3c58951e0d9e1929c02aa282
+--- /dev/null
++++ b/arch/mips/configs/be300_2_6_defconfig
+@@ -0,0 +1,138 @@
++#
++# Casio Cassiopeia BE-300 (NEC VR4131 + VRC4173), Linux 2.6.8.1
++#
++CONFIG_MIPS=y
++CONFIG_MIPS32=y
++CONFIG_EXPERIMENTAL=y
++CONFIG_CLEAN_COMPILE=y
++CONFIG_STANDALONE=y
++CONFIG_BROKEN_ON_SMP=y
++# CONFIG_SWAP is not set
++CONFIG_SYSVIPC=y
++CONFIG_SYSCTL=y
++CONFIG_LOG_BUF_SHIFT=14
++# CONFIG_HOTPLUG is not set
++# CONFIG_IKCONFIG is not set
++CONFIG_EMBEDDED=y
++# CONFIG_KALLSYMS is not set
++CONFIG_FUTEX=y
++# CONFIG_EPOLL is not set
++CONFIG_IOSCHED_NOOP=y
++# CONFIG_IOSCHED_AS is not set
++# CONFIG_IOSCHED_DEADLINE is not set
++# CONFIG_IOSCHED_CFQ is not set
++CONFIG_CC_OPTIMIZE_FOR_SIZE=y
++# CONFIG_MODULES is not set
++
++#
++# Machine selection
++#
++CONFIG_MACH_VR41XX=y
++CONFIG_CASIO_BE300=y
++CONFIG_CASIO_BE300_SDRAM_MB=16
++CONFIG_CASIO_BE300_IRQ_CASCADE=y
++CONFIG_CASIO_BE300_STOWAWAY=y
++CONFIG_CASIO_BE300_TOUCH=y
++CONFIG_CASIO_BE300_KEYS=y
++# CONFIG_CASIO_E55 is not set
++CONFIG_CPU_LITTLE_ENDIAN=y
++CONFIG_CPU_VR41XX=y
++CONFIG_PAGE_SIZE_4KB=y
++CONFIG_CPU_HAS_SYNC=y
++CONFIG_ISA=y
++CONFIG_MMU=y
++CONFIG_BINFMT_ELF=y
++# CONFIG_BINFMT_MISC is not set
++CONFIG_TRAD_SIGNALS=y
++
++#
++# Networking
++#
++CONFIG_NET=y
++CONFIG_PACKET=y
++CONFIG_UNIX=y
++CONFIG_INET=y
++# CONFIG_IPV6 is not set
++# CONFIG_XFRM is not set
++# CONFIG_NET_KEY is not set
++CONFIG_NETDEVICES=y
++CONFIG_NET_ETHERNET=y
++CONFIG_NET_ISA=y
++CONFIG_NE2000=y
++# CONFIG_NET_PCI is not set
++
++#
++# Input / console
++#
++CONFIG_INPUT=y
++# CONFIG_INPUT_MOUSEDEV is not set
++CONFIG_INPUT_EVDEV=y
++# CONFIG_SERIO is not set
++# CONFIG_SERIO_I8042 is not set
++# CONFIG_INPUT_KEYBOARD is not set
++# CONFIG_INPUT_MOUSE is not set
++CONFIG_VT=y
++CONFIG_VT_CONSOLE=y
++CONFIG_HW_CONSOLE=y
++# CONFIG_SERIAL_8250 is not set
++CONFIG_SERIAL_BE300=y
++CONFIG_SERIAL_BE300_CONSOLE=y
++CONFIG_UNIX98_PTYS=y
++# CONFIG_LEGACY_PTYS is not set
++
++#
++# Graphics
++#
++CONFIG_FB=y
++CONFIG_FB_SIMPLE=y
++# CONFIG_FB_VIRTUAL is not set
++# CONFIG_VGA_CONSOLE is not set
++# CONFIG_MDA_CONSOLE is not set
++CONFIG_DUMMY_CONSOLE=y
++CONFIG_FRAMEBUFFER_CONSOLE=y
++# 8x8 font = 30x40 text console, as in the linux4be 2.6 kernel.
++CONFIG_FONTS=y
++CONFIG_FONT_8x8=y
++# CONFIG_FONT_8x16 is not set
++# CONFIG_FONT_MINI_4x6 is not set
++CONFIG_LOGO=y
++CONFIG_LOGO_BE300_CLUT224=y
++# CONFIG_LOGO_LINUX_MONO is not set
++# CONFIG_LOGO_LINUX_VGA16 is not set
++# CONFIG_LOGO_LINUX_CLUT224 is not set
++
++#
++# Memory Technology Devices (BE-300 NAND, JFFS2 root on mtd3)
++#
++CONFIG_MTD=y
++CONFIG_MTD_PARTITIONS=y
++CONFIG_MTD_CHAR=y
++CONFIG_MTD_BLOCK=y
++CONFIG_CASIO_BE300_NAND=y
++# CONFIG_MTD_CFI is not set
++# CONFIG_MTD_JEDECPROBE is not set
++# CONFIG_MTD_NAND is not set
++
++#
++# File systems
++#
++# CONFIG_EXT2_FS is not set
++CONFIG_PROC_FS=y
++CONFIG_SYSFS=y
++CONFIG_TMPFS=y
++CONFIG_RAMFS=y
++CONFIG_DEVPTS_FS=y
++CONFIG_JFFS2_FS=y
++CONFIG_JFFS2_FS_DEBUG=0
++# CONFIG_JFFS2_FS_NAND is not set
++# CONFIG_NFS_FS is not set
++# CONFIG_NFSD is not set
++# CONFIG_IDE is not set
++# CONFIG_BLK_DEV_INITRD is not set
++# CONFIG_BLK_DEV_RAM is not set
++
++#
++# Kernel hacking
++#
++CONFIG_CROSSCOMPILE=y
++CONFIG_CMDLINE="root=/dev/mtdblock3 rootfstype=jffs2 noinitrd console=tty0 ether=72,0x300,eth0 reserve=0x280,0x80,0x320,0x80"
