@@ -638,7 +638,8 @@ def patch_appmgr_normal_recalc(root: Path) -> bool:
         "    {\n"
         "      struct divtree *tree;\n"
         "      for (tree = dts->top; tree; tree = tree->next) {\n"
-        "        tree->head->flags |= DIVNODE_NEED_RECALC;\n"
+        "        tree->head->flags |= DIVNODE_NEED_RECALC |\n"
+        "                             DIVNODE_FORCE_CHILD_RECALC;\n"
         "        tree->flags |= DIVTREE_NEED_RECALC | DIVTREE_ALL_REDRAW |\n"
         "                       DIVTREE_NEED_RESIZE;\n"
         "      }\n"
@@ -910,6 +911,316 @@ def patch_omnibar_appmenu_dir(root: Path) -> bool:
                         '  if (d) closedir(d);\n', 1)
 
     write_text(src, text)
+    return True
+
+
+def patch_closefd_full_redraw(root: Path) -> bool:
+    """Repaint everything when a client disconnects.
+
+    net/request.c:closefd frees the client's handles and unregisters its
+    apps, which detaches the app panels via widget_attach(w,NULL,...).
+    That only sets NEED_RECALC/NEED_RESIZE on the old divtree; nothing
+    marks the vacated screen area dirty, so a closed app's last frame
+    stayed on the LCD until something else happened to draw over it.
+    Only the display_owner branch of closefd forced DIVTREE_ALL_REDRAW.
+
+    Mark every divtree for recalc + full redraw before the final
+    update().  A full 240x320 repaint is cheap compared to a stale
+    screen.
+    """
+    src = root / "pg1" / "server" / "net" / "request.c"
+    if not src.exists():
+        return False
+    text = read_text(src)
+    if "BE300_CLOSEFD_REDRAW" in text:
+        return False
+    needle = (
+        "  appmgr_unregowner(fd);\n"
+        "\n"
+        "  /* Free the connection buffers */\n"
+        "  request_client_destroy(fd);\n"
+        "\n"
+        "  update(NULL,1);\n"
+    )
+    replacement = (
+        "  appmgr_unregowner(fd);\n"
+        "\n"
+        "  /* Free the connection buffers */\n"
+        "  request_client_destroy(fd);\n"
+        "\n"
+        "  /* BE300_CLOSEFD_REDRAW: the departed client's panels were\n"
+        "   * detached without invalidating the area they covered, which\n"
+        "   * left their last frame on screen.  Recalc and repaint all. */\n"
+        "  {\n"
+        "    struct divtree *tree;\n"
+        "    for (tree = dts->top; tree; tree = tree->next) {\n"
+        "      if (tree->head)\n"
+        "        tree->head->flags |= DIVNODE_NEED_RECALC |\n"
+        "                             DIVNODE_FORCE_CHILD_RECALC;\n"
+        "      tree->flags |= DIVTREE_NEED_RECALC | DIVTREE_NEED_RESIZE |\n"
+        "                     DIVTREE_ALL_REDRAW;\n"
+        "    }\n"
+        "  }\n"
+        "  update(NULL,1);\n"
+    )
+    if needle not in text:
+        raise SystemExit("patch_closefd_full_redraw: closefd needle moved")
+    write_text(src, text.replace(needle, replacement, 1))
+    return True
+
+
+def patch_omnibar_launch(root: Path) -> bool:
+    """Launch app-menu entries with fork+exec, reaped, logged per app.
+
+    Upstream btnAppMenu() did vfork() + execlp(".app") and, if exec
+    failed, called pgMessageDialogFmt() from inside the vfork child,
+    which shares omnibar's memory and socket state with the parent.
+    Children were never reaped, the path lived in a fixed char[80], and
+    every app's output was mixed into omnibar's own log.
+
+    Now: copy the menu string before anything else talks to the server,
+    fork(), and in the child reset SIGCHLD, setsid(), send stdout/stderr
+    to /tmp/<app>.log and exec the .app through /bin/sh, _exit(127) on
+    failure without touching libpgui (its socket is FD_CLOEXEC).
+    omnibar ignores SIGCHLD so the kernel reaps children with no signal
+    handler (sigreturn on this uClibc soft-float build has bitten
+    pgserver before; see patch_disable_sigalrm_timer).
+    """
+    src = root / "pg1" / "apps" / "test" / "omnibar" / "omnibar.c"
+    if not src.exists():
+        return False
+    text = read_text(src)
+    if "BE300_OMNIBAR_LAUNCH" in text:
+        return False
+
+    launch_needle = (
+        "  if (i) {\n"
+        "    char buf[80];  /* FIXME: Buffer overflow 'sploit waiting to happen! */\n"
+        "    strcpy(buf,\"/usr/share/picogui/appmenu/\");\n"
+        "    strcat(buf,pgGetString(items[i-1]));\n"
+        "    strcat(buf,\".app\");\n"
+        "    if (!vfork()) {\n"
+        "      execlp(buf,buf,NULL);\n"
+        "      pgMessageDialogFmt(\"Error\",0,\"There was an error starting the\\nfollowing program:\\n%s\",buf);\n"
+        "      exit(1);\n"
+        "    }\n"
+        "  }\n"
+    )
+    launch_replacement = (
+        "  if (i) {\n"
+        "    /* BE300_OMNIBAR_LAUNCH: fork (not vfork), per-app log, no\n"
+        "     * libpgui calls in the child. */\n"
+        "    char name[64], buf[sizeof(\"/usr/share/picogui/appmenu/\") + 64 + 4];\n"
+        "    char logpath[sizeof(\"/tmp/.log\") + 64];\n"
+        "    pid_t pid;\n"
+        "    int fd;\n"
+        "\n"
+        "    snprintf(name, sizeof(name), \"%s\", pgGetString(items[i-1]));\n"
+        "    snprintf(buf, sizeof(buf), \"%s/%s.app\", be300_appmenu_path, name);\n"
+        "    snprintf(logpath, sizeof(logpath), \"/tmp/%s.log\", name);\n"
+        "    pid = fork();\n"
+        "    if (pid == 0) {\n"
+        "      signal(SIGCHLD, SIG_DFL);\n"
+        "      setsid();\n"
+        "      fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);\n"
+        "      if (fd >= 0) {\n"
+        "        dup2(fd, 1);\n"
+        "        dup2(fd, 2);\n"
+        "        if (fd > 2)\n"
+        "          close(fd);\n"
+        "      }\n"
+        "      execl(\"/bin/sh\", \"sh\", buf, (char *)NULL);\n"
+        "      _exit(127);\n"
+        "    }\n"
+        "    if (pid < 0)\n"
+        "      pgMessageDialogFmt(\"Error\",0,\"Could not start:\\n%s\",buf);\n"
+        "  }\n"
+    )
+    if launch_needle not in text:
+        raise SystemExit("patch_omnibar_launch: launch needle moved")
+    text = text.replace(launch_needle, launch_replacement, 1)
+
+    inc_needle = "#include <picogui.h>\n#include <unistd.h>\n"
+    if inc_needle not in text:
+        raise SystemExit("patch_omnibar_launch: include needle moved")
+    text = text.replace(
+        inc_needle,
+        inc_needle + "#include <alloca.h>\n#include <fcntl.h>\n"
+                     "#include <signal.h>\n#include <stdlib.h>\n"
+                     "#include <string.h>\n", 1)
+
+    loop_needle = "  pgSetIdle(1000,&sysIdle);\n  pgEventLoop();\n"
+    if loop_needle not in text:
+        raise SystemExit("patch_omnibar_launch: event loop needle moved")
+    text = text.replace(
+        loop_needle,
+        "  signal(SIGCHLD, SIG_IGN);  /* auto-reap launched apps */\n"
+        + loop_needle, 1)
+
+    write_text(src, text)
+    return True
+
+
+def patch_root_resize_relayout(root: Path) -> bool:
+    """Relayout every layer when an app's root widget changes geometry.
+
+    widget_base_set() handles PG_WP_SIZE/SIDE by flagging only the
+    widget's own divnode for recalc (and PG_WP_SIZEMODE flags nothing).
+    For an app root widget in the root layer (toolbar, panel) that is not
+    enough: its siblings in the root divtree -- the other apps' panels
+    and the background -- keep the geometry computed before the change.
+
+    Symptom on the BE-300: pgboard registers as PG_APP_TOOLBAR, then sets
+    side/size/sizemode from its .kb file (bottom, 25%).  Nothing relaid
+    the root divtree, so the keyboard never drew and every NORMAL app
+    launched afterwards (pterm, atomicnav, canvastst, ...) got no space:
+    "the app didn't launch".  Killing any client (closefd relayout)
+    suddenly showed the keyboard and freed the space.
+    """
+    src = root / "pg1" / "server" / "widget" / "widget.c"
+    if not src.exists():
+        return False
+    text = read_text(src)
+    if "BE300_ROOT_RELAYOUT" in text:
+        return False
+    needle = (
+        "g_error widget_base_set(struct widget *w, int property, glob data) {\n"
+        "  char *str;\n"
+        "  struct divnode *maindiv = w->in->div ? w->in->div : w->in;\n"
+        "\n"
+    )
+    replacement = needle + (
+        "  /* BE300_ROOT_RELAYOUT: an app root widget's geometry decides\n"
+        "   * where its sibling apps go, so relayout and repaint all layers\n"
+        "   * rather than just this widget's divnode.  Root layer only:\n"
+        "   * popups (also isroot) live in their own layer and forcing a\n"
+        "   * root-layer recalc from them broke pterm's terminal. */\n"
+        "  if (w->isroot && w->dt == dts->root &&\n"
+        "      (property == PG_WP_SIDE || property == PG_WP_SIZE ||\n"
+        "       property == PG_WP_SIZEMODE)) {\n"
+        "    struct divtree *tree;\n"
+        "    for (tree = dts->top; tree; tree = tree->next) {\n"
+        "      if (tree->head)\n"
+        "        tree->head->flags |= DIVNODE_NEED_RECALC |\n"
+        "                             DIVNODE_FORCE_CHILD_RECALC;\n"
+        "      tree->flags |= DIVTREE_NEED_RECALC | DIVTREE_NEED_RESIZE |\n"
+        "                     DIVTREE_ALL_REDRAW;\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+    )
+    if needle not in text:
+        raise SystemExit("patch_root_resize_relayout: widget_base_set needle moved")
+    write_text(src, text.replace(needle, replacement, 1))
+    return True
+
+
+def patch_pterm_default_shell(root: Path) -> bool:
+    """Give pterm a default shell command that actually runs.
+
+    Upstream pterm runs execvp(cmd[0], cmd) with cmd = {"/bin/sh", "-sh"},
+    i.e. it passes "-sh" as an *option* (meant as a login-shell argv[0]).
+    BusyBox ash rejects it ("illegal option", exit 2); pterm's SIGCHLD
+    handler then exit(0)s, so pterm vanished every time it was started
+    without arguments -- from start-picogui, pterm.app and omnibar.
+    "-l" asks for the same login shell.
+    """
+    src = root / "pg1" / "apps" / "working" / "pterm" / "main.c"
+    if not src.exists():
+        return False
+    text = read_text(src)
+    needle = '      "/bin/sh", "-sh", NULL \n'
+    if needle not in text:
+        if '"/bin/sh", "-l", NULL' in text:
+            return False
+        raise SystemExit("patch_pterm_default_shell: cmd needle moved")
+    write_text(src, text.replace(
+        needle, '      "/bin/sh", "-l", NULL  /* BE300: was "-sh" (an option) */\n', 1))
+    return True
+
+
+def patch_omnibar_tap_menus(root: Path) -> bool:
+    """Open omnibar's menus on tap release, not on pointer-down.
+
+    Upstream binds Applications/System with PG_EXEV_PNTR_DOWN +
+    PG_WE_PNTR_DOWN: a mouse-style press-drag-release menu, where the
+    release picks the item under the pointer.  On a touchscreen a tap
+    releases on the button itself, outside every item, so the menu
+    closed the moment it opened.  Users saw "nothing happened" and only
+    launched an app when the stylus happened to slide onto an item.
+
+    Bind PG_WE_ACTIVATE (release over the button) instead, so one tap
+    opens the menu and a second tap picks the item.
+    """
+    src = root / "pg1" / "apps" / "test" / "omnibar" / "omnibar.c"
+    if not src.exists():
+        return False
+    text = read_text(src)
+    if "BE300_OMNIBAR_TAP_MENUS" in text:
+        return False
+    for label, handler in (("Applications", "btnAppMenu"),
+                           ("System", "btnSysMenu")):
+        needle = (
+            f"\t      PG_WP_TEXT,pgNewString(\"{label}\"),\n"
+            "\t      PG_WP_EXTDEVENTS,PG_EXEV_PNTR_DOWN,\n"
+            "\t      0);\n"
+            f"  pgBind(PGDEFAULT,PG_WE_PNTR_DOWN,&{handler},NULL);\n"
+        )
+        replacement = (
+            f"\t      PG_WP_TEXT,pgNewString(\"{label}\"),\n"
+            "\t      0);\n"
+            "  /* BE300_OMNIBAR_TAP_MENUS: open on release (tap), not on\n"
+            "   * pointer-down, or the tap's own release closes the menu. */\n"
+            f"  pgBind(PGDEFAULT,PG_WE_ACTIVATE,&{handler},NULL);\n"
+        )
+        if needle not in text:
+            raise SystemExit(f"patch_omnibar_tap_menus: {label} needle moved")
+        text = text.replace(needle, replacement, 1)
+    write_text(src, text)
+    return True
+
+
+def patch_full_redraw_drops_incremental(root: Path) -> bool:
+    """Make a full redraw render a divnode's full groplist.
+
+    grop_render() draws only the PG_GROPF_INCREMENTAL gropnodes when the
+    divnode has DIVNODE_INCREMENTAL set and not DIVNODE_NEED_REDRAW --
+    even inside a full (all=1) divnode_redraw.  Normally the incremental
+    flag is consumed right away by a subtree update, but update() drops
+    subtree updates from layers below the top one.  So while another
+    client's popup is up (an omnibar menu), pterm's cursor blink leaves
+    DIVNODE_INCREMENTAL set on the terminal; when the popup closes, the
+    full repaint drew only the cursor cell, and the terminal stayed
+    showing its panel background with its text gone until pterm resized.
+    """
+    src = root / "pg1" / "server" / "gcore" / "div.c"
+    if not src.exists():
+        return False
+    text = read_text(src)
+    if "BE300_FULL_REDRAW_NOT_INCREMENTAL" in text:
+        return False
+    needle = (
+        "\t!(n->flags & DIVNODE_UNDERCONSTRUCTION) ) { \n"
+        "\n"
+        "     if (n->r.w && n->r.h)\n"
+        "       grop_render(n,NULL);\n"
+    )
+    replacement = (
+        "\t!(n->flags & DIVNODE_UNDERCONSTRUCTION) ) { \n"
+        "\n"
+        "     /* BE300_FULL_REDRAW_NOT_INCREMENTAL: a full redraw must render\n"
+        "      * the whole groplist; a stale incremental flag (left by a\n"
+        "      * subtree update update() refused while a popup was on top)\n"
+        "      * would make grop_render draw only the incremental pieces. */\n"
+        "     if (all)\n"
+        "       n->flags &= ~DIVNODE_INCREMENTAL;\n"
+        "\n"
+        "     if (n->r.w && n->r.h)\n"
+        "       grop_render(n,NULL);\n"
+    )
+    if needle not in text:
+        raise SystemExit("patch_full_redraw_drops_incremental: needle moved")
+    write_text(src, text.replace(needle, replacement, 1))
     return True
 
 
@@ -1581,6 +1892,12 @@ def main() -> int:
     fbclose_ok = patch_fbdev_close_no_clear(root)
     sigkmsg_ok = patch_signals_kmsg_dump(root)
     omnibar_ok = patch_omnibar_appmenu_dir(root)
+    omnilaunch_ok = patch_omnibar_launch(root)
+    omnitap_ok = patch_omnibar_tap_menus(root)
+    closefd_ok = patch_closefd_full_redraw(root)
+    rootrelayout_ok = patch_root_resize_relayout(root)
+    fullredraw_ok = patch_full_redraw_drops_incremental(root)
+    pterm_ok = patch_pterm_default_shell(root)
     anvtrace_ok = patch_atomicnav_kmsg_trace(root)
     png_ok = patch_pgserver_png_link_order(root)
     normalrecalc_ok = patch_appmgr_normal_recalc(root)
@@ -1608,6 +1925,18 @@ def main() -> int:
           f"{'applied' if sigkmsg_ok else 'skipped'}")
     print(f"-- omnibar appmenu dir + NULL-check: "
           f"{'applied' if omnibar_ok else 'skipped'}")
+    print(f"-- omnibar fork+exec app launch: "
+          f"{'applied' if omnilaunch_ok else 'skipped'}")
+    print(f"-- omnibar menus open on tap release: "
+          f"{'applied' if omnitap_ok else 'skipped'}")
+    print(f"-- closefd full divtree redraw: "
+          f"{'applied' if closefd_ok else 'skipped'}")
+    print(f"-- root widget geometry relayout: "
+          f"{'applied' if rootrelayout_ok else 'skipped'}")
+    print(f"-- full redraw ignores stale INCREMENTAL: "
+          f"{'applied' if fullredraw_ok else 'skipped'}")
+    print(f"-- pterm default shell -sh -> -l: "
+          f"{'applied' if pterm_ok else 'skipped'}")
     print(f"-- atomicnav /dev/kmsg trace: "
           f"{'applied' if anvtrace_ok else 'skipped'}")
     print(f"-- pgserver PNG link order (-lpng before -lz): "

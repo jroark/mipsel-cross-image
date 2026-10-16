@@ -42,7 +42,7 @@ SERVER_BUILD_LOG="$LOG_DIR/be300_picogui_server_build.log"
 APPS_BUILD_LOG="$LOG_DIR/be300_picogui_apps_build.log"
 
 BE300_LIBC="${BE300_LIBC:-uclibc}"
-BE300_PICOGUI_BUILD_STAMP="${BE300_PICOGUI_BUILD_STAMP:-.be300-picogui-built-v2}"
+BE300_PICOGUI_BUILD_STAMP="${BE300_PICOGUI_BUILD_STAMP:-.be300-picogui-built-v8}"
 BE300_PICOGUI_DEFAULT_CALIBRATION="${BE300_PICOGUI_DEFAULT_CALIBRATION:-1}"
 
 CROSS="mipsel-linux-gnu-"
@@ -501,6 +501,15 @@ build_picogui_apps() {
                 ${app_ldflags} ${app_libs} \
                 -o "${working}/pg-keytest"
         fi
+        # be300-tap — touchscreen tap injector (writes evdev records to
+        # the PIU node); drives tools/be300_picogui_smoke.sh over serial.
+        # Plain libc, no libpgui.
+        if [ -f "$BOARD_DIR/be300-tap.c" ]; then
+            ${TARGET_CC} ${COMMON_CFLAGS} \
+                "$BOARD_DIR/be300-tap.c" \
+                ${COMMON_LFLAGS} ${COMMON_LIBS} \
+                -o "${working}/be300-tap"
+        fi
         # pg-desktop — BE-300 always-running launcher.  Owns the root
         # window so closing transient apps (atomicnav etc.) doesn't leave
         # the framebuffer un-owned and stale.  Buttons fork+exec the
@@ -604,6 +613,9 @@ install_picogui_apps() {
     if [ -x "${working}/pg-desktop" ]; then
         install -m 0755 "${working}/pg-desktop" "$ROOTFS/usr/bin/pg-desktop"
     fi
+    if [ -x "${working}/be300-tap" ]; then
+        install -m 0755 "${working}/be300-tap" "$ROOTFS/usr/bin/be300-tap"
+    fi
     # omnibar / canvastst live under apps/test, not apps/working
     for app in omnibar canvastst; do
         if [ -x "${test_apps_dir}/${app}/${app}" ]; then
@@ -698,7 +710,7 @@ EOF_PD
 
 strip_picogui_artifacts() {
     local f
-    for f in pgserver pgboard pterm picosm tpcal pg-demo pg-keytest pg-desktop omnibar canvastst atomicnav; do
+    for f in pgserver pgboard pterm picosm tpcal pg-demo pg-keytest pg-desktop be300-tap omnibar canvastst atomicnav; do
         if [ -e "$ROOTFS/usr/bin/$f" ]; then
             be300_strip_binary "$ROOTFS/usr/bin/$f"
         fi
