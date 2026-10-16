@@ -41,14 +41,22 @@ docker-compose run --rm mips-dev bash -c "./build_be300_tinyx_nand.sh"
 docker-compose run --rm mips-dev bash -c "./build_be300_cf_image.sh"
 
 # Pack the prebuilt linux4.be reference kernels into bootable NAND images.
-# Phase 1 (BE300_2_4_MODE=prebuilt) wraps kernels/vmlinux-2.4 / vmlinux-2.6
-# in the existing SPL + B000FF container so they boot on the modern --nand
-# emulator path (the old --kernel ELF loader is gone). 2.6 source rebuild
-# is a Phase 3 TODO in /Users/jroark/.claude/plans/.
+# BE300_2_4_MODE=prebuilt / BE300_2_6_MODE=prebuilt wrap kernels/vmlinux-2.4 /
+# vmlinux-2.6 in the existing SPL + B000FF container so they boot on the
+# modern --nand emulator path (the old --kernel ELF loader is gone).
 docker-compose run --rm mips-dev bash -c "BE300_2_4_MODE=prebuilt ./build_be300_2_4_kernel.sh"
-docker-compose run --rm mips-dev bash -c "./build_be300_2_6_kernel.sh"
+docker-compose run --rm mips-dev bash -c "BE300_2_6_MODE=prebuilt ./build_be300_2_6_kernel.sh"
 ./bin/be300 --nand linux-4.2.9/be300-2_4.nand --speed 0 --detect-stall
 ./bin/be300 --nand linux-4.2.9/be300-2_6.nand --speed 0 --detect-stall
+
+# Build Linux 2.6.8.1 from source with OPIE (same userspace as the 2.4.18
+# and 4.2.9 OPIE images).  Downloads kernel.org linux-2.6.8.1.tar.bz2 into
+# archives/, applies patches/linux-2.6.8.1-be300/series, builds vmlinux,
+# stages the uClibc-ng OPIE rootfs via scripts/stage_legacy_opie_rootfs.sh
+# and packs linux-4.2.9/be300-2_6-opie.nand.  BE300_2_6_UI=none builds the
+# kernel only.
+docker-compose run --rm mips-dev bash -c "./build_be300_2_6_opie_nand.sh"
+./bin/be300 --nand linux-4.2.9/be300-2_6-opie.nand --speed 0 --ne2000 --net-mac 02:de:ad:be:ef:01 --stowaway-keyboard
 
 # Phase 2 / 2.5: build 2.4.18 from source with the modern Debian mipsel-linux-gnu
 # cross toolchain. Extracts archives/linux4be-2.4.18-20021129.tar.gz to
@@ -213,6 +221,14 @@ Re-verified on the default 16 MiB (Oct 13, 2026): `./bin/be300 --nand linux-4.2.
 - **libgcc double↔64-bit helpers recursed forever.** `board/casio-be300/libgcc_helpers.c` had `__fixdfdi(d) { return (DI)d; }` (and siblings); on mips2 GCC lowers that cast to a call to the same helper, so BusyBox `sleep` (float sleep) and anything else converting double↔`long long` died with a stack fault far below the stack. The helpers now split into 32-bit halves.
 - **musl OPIE links need the specs.** `-specs musl-gcc.specs` must be on the Qt/OPIE shared-library link line (`OPIE_LIBC_LDFLAGS` in `build_be300_kernel.sh`); without it libqte/libqpe silently link against Debian glibc (`NEEDED libc.so.6`) and libqpe fails on `-lcrypt`. Helper compiles that pass both `COMMON_CFLAGS` and `COMMON_LFLAGS` must drop one copy of the specs (gcc rejects it loaded twice).
 
+Linux 2.6.8.1 OPIE on 16 MiB (Oct 15, 2026): `./build_be300_2_6_opie_nand.sh` builds kernel.org 2.6.8.1 + `patches/linux-2.6.8.1-be300/series` with gcc 10.3 and packs it with the same uClibc-ng OPIE rootfs as the 2.4 image (`scripts/stage_legacy_opie_rootfs.sh`, shared by both legacy kernels; 2.6 passes `--sysfs`, 2.4 passes `--fix-elf-flags`). Booting `linux-4.2.9/be300-2_6-opie.nand` shows the same themed launcher. Verified over `--serial1-bridge pty:auto`: evdev order event0 = Stowaway, event1 = touch, event2 = buttons; injected taps launch Calculator and Konsole (shell on `/dev/pts/0`); pipes and `$(...)` work; eth0 NE2000 at 0x300/IRQ 72 pings 10.0.0.254 and `/bin/wget` fetches example.com; `--stowaway-keyboard` logs `BE-300 Stowaway: connected`; ~3.4 MiB MemFree on 16 MiB. Things specific to this tree:
+- **kernel.org 2.6.8.1 is not the linux-mips CVS tree** the linux4be overlay targeted; only the BE-300 parts of `src/linux-latest/kernel-unstable-2.6.x` are imported (patch 0001). Its `early_initcall()` was never defined (board hooks silently became implicit declarations) — 0002 defines it.
+- **Case-insensitive host**: kbuild's `vmlinux.lds.s` output overwrote `vmlinux.lds.S`; 0002 adds a `%.lds: %.lds.S` rule.
+- **save_static_function fall-through** hit again (kernel_thread's clone ran sys_pipe); same explicit-tail-jump fix as 2.4.
+- **NAND is registered as MTD_NORFLASH** so 2.6.8 JFFS2 never uses OOB (the emulator's synthesized NANDWRITER OOB made NAND mode see bad/unclean blocks).
+- **No 64-bit instructions**: `mach-vr41xx/cpu-feature-overrides.h` keeps generated clear_page/copy_page on sw/lw; the build script fails if objdump finds 64-bit ops outside the dead `calibrate_div64_gettimeoffset`/`handle_vced`.
+- **Boot console**: printk is mirrored to the dock UART until late_initcall (`keep_bootcon` / `BE300_2_6_KEEP_BOOTCON=1` keeps it); it and ttyS0 stay off the SIU while the Stowaway driver owns it. `reserve=0x280,0x80,0x320,0x80` on the built-in cmdline stops ne.c sweeping other ports for eth2..7.
+
 Linux 2.4.18 OPIE on 16 MiB (Oct 13, 2026): `BE300_2_4_UI=opie ./build_be300_2_4_kernel.sh` now builds the `stock` patch set too, and `./bin/be300 --nand linux-4.2.9/be300-2_4-opie.nand --speed 0` shows the same themed launcher (real icons; Applications/Settings/Unsupported/Pim tabs). A single injected tap on Settings → Launcher starts `launchersettings`, so 2.4 touch input works; the old "qpe eventPending never drains" defect was these userspace/kernel ABI bugs, not Qt:
 - **uClibc-ng was calling syscalls 2.4 does not have.** It is built against the 4.2.9 UAPI headers, so `select()` used `pselect6`, `rename()` used `renameat2`, `gettimeofday()`/`nanosleep()` went through `clock_gettime`/`clock_nanosleep`, and BusyBox's `sendfile64` copies all got ENOSYS on 2.4 (whose MIPS table ends at 4246). `gettimeofday()` then returned an uninitialized timespec, so Qt timers and the event loop ran on garbage time. `prepare_uclibc_ng()` in `build_be300_kernel.sh` now prefers `_newselect`/`rename`/`gettimeofday`/`nanosleep`, falls back from `clock_gettime` and `sendfile64` on ENOSYS, and fails the build if a patched context moves. `readlinkat` (4298, from ld.so) and `clock_nanosleep`'s direct callers still get ENOSYS harmlessly.
 - **Soft-float libgcc entry points were hard-float.** Debian ships only a hard-float libgcc, whose `__adddf3`/`__floatsidf`/`__fixdfsi`/... are one-instruction FPU wrappers taking `$f12`/`$f14`. Soft-float (uClibc) callers pass doubles in `a0`–`a3`, so every double op returned garbage (`QImageSmoothScaler` spun forever on a zero row step; uClibc `printf("%f")`/`strtod` were wrong). For `BE300_LIBC=uclibc`, `prepare_be300_libgcc()` replaces those members with `board/casio-be300/libgcc_softfp_shims.c`: soft-float-ABI signatures (raw bits as integers) doing the math with FPU instructions the kernel FPU emulator executes. Keep FP-conditional branches (`c.cond`/`bc1t`/`bc1f`) out of that file — 2.4.18's FPU emulator runs their delay slot from a stack trampoline and returned garbage or SIGILL.
@@ -329,6 +345,10 @@ CVS repository snapshots from the linux4.be project (2002-2006):
 - `linux-latest/kernel-unstable-2.6.x/` — most recent BE-300 board support, drivers, configs
 - `linux-latest/kernel-2.6/` — earlier 2.6 board support with debug.c (UART register details)
 - `linux4be-2.4.18-20021129/` — full 2.4.18 kernel with BE-300 support
+
+### Linux 2.6.8.1 Patch Series
+
+`patches/linux-2.6.8.1-be300/series` (applied by `build_be300_2_6_kernel.sh` to kernel.org linux-2.6.8.1): 0001 linux4be board import (sfb, logo, VR4131 cache split, board init/setup, boot console), 0002 GCC 10 / binutils / make 4.3 fixes, 0003 32-bit page ops, 0004 NAND MTD, 0005 GIRQ0 cascade + PCMCIA bridge, 0006 Stowaway/touch/buttons, 0007 sys_pipe store, 0008 ttyS0, 0009 `be300_2_6_defconfig`. Board drivers live in `arch/mips/vr41xx/casio-be300/`; change them by refreshing the patch, not by editing `linux-2.6.8.1/`.
 
 ### Known-Good Reference Kernels (kernels/)
 

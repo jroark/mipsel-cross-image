@@ -1,0 +1,292 @@
+BE-300 2.6.8.1: VRC4173 GIRQ0 cascade and PCMCIA bridge enable.
+
+  * irq.c: port of the 2.4.18 irq_be300.c GIRQ0 demuxer (CF/NE2000,
+    buttons, touch behind GIU pin 0 -> IRQs 72..87).  Installed at
+    arch_initcall time, after init_IRQ() and before the NE2000 probe.
+  * setup.c: enable the PCMCIA bridge (PA 0x0A00A01C bit 2) and drain the
+    GIRQ0 source, as in the 4.2.9 board file and 2.4 patch 0013, so ne.c
+    finds the NE2000 at 0x300 / IRQ 72 (cmdline ether=72,0x300,eth0).
+
+---
+ arch/mips/Kconfig                     |   8 ++
+ arch/mips/vr41xx/casio-be300/Makefile |   1 +
+ arch/mips/vr41xx/casio-be300/irq.c    | 199 ++++++++++++++++++++++++++
+ arch/mips/vr41xx/casio-be300/setup.c  |  23 +++
+ 4 files changed, 231 insertions(+)
+ create mode 100644 arch/mips/vr41xx/casio-be300/irq.c
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 3d0d7436508b898273f7e912b0cf43d7c102d084..f69fe7e8fd06e5abcb448ae279c4842111bb4ac1 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -160,6 +160,14 @@ config CASIO_BE300_SDRAM_MB
+ 	  has 16 MiB; larger values are only valid on the emulator with a
+ 	  matching --sdram option.
+ 
++config CASIO_BE300_IRQ_CASCADE
++	bool "BE-300 VRC4173 GIRQ0 interrupt cascade"
++	depends on CASIO_BE300
++	default y
++	help
++	  Demultiplexes the VRC4173 GIRQ0 status word (CF/NE2000, buttons,
++	  touch panel) behind VR4131 GIU pin 0 into IRQs 72..87.
++
+ config CASIO_BE300_NAND
+ 	bool "BE-300 16 MiB NAND flash (VRC4173 XFER engine)"
+ 	depends on CASIO_BE300 && MTD
+diff --git a/arch/mips/vr41xx/casio-be300/Makefile b/arch/mips/vr41xx/casio-be300/Makefile
+index 7851ad7292869382e2413017aade1ec9e9c58bb6..f8215254f563dd7e7ea31cddc89e5e2b490aa574 100644
+--- a/arch/mips/vr41xx/casio-be300/Makefile
++++ b/arch/mips/vr41xx/casio-be300/Makefile
+@@ -4,4 +4,5 @@
+ 
+ obj-y	:= init.o setup.o
+ 
++obj-$(CONFIG_CASIO_BE300_IRQ_CASCADE)	+= irq.o
+ obj-$(CONFIG_CASIO_BE300_NAND)	+= nand.o
+diff --git a/arch/mips/vr41xx/casio-be300/irq.c b/arch/mips/vr41xx/casio-be300/irq.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..34a21895490c23627083f84eaf1150b4a835cb86
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/irq.c
+@@ -0,0 +1,199 @@
++/*
++ * arch/mips/vr41xx/casio-be300/irq.c
++ *
++ * Second-level interrupt demuxer for the BE-300 (Linux 2.6.8.1).  Port of
++ * the 2.4.18 irq_be300.c, which mirrors the 4.2.9 board/casio-be300/irq.c
++ * driver; 2.6.8's vr41xx_cascade_irq() is the same API as 2.4's.
++ *
++ * The VR4131 ICU (arch/mips/vr41xx/common/icu.c) reports the GIU summary
++ * as SYSINT1 bit 8, which Linux exposes as GIU_IRQ(0..31) (= 40..71). On
++ * the BE-300 every VRC4173 sub-source (touch, buttons, CF/NE2000, PC
++ * Connect) rides on a single GPIO pin (GIU line 0). The actual cascade
++ * source is the VRC4173 GIRQ0 status register at PA 0x0A000004.
++ *
++ *   SYSINT1.bit8 (GIU)
++ *      +-- GIU0 = GIU_IRQ(0) = 40
++ *            +-- VRC4173 GIRQ0 word @ 0x0A000004:
++ *                  bit 0 -> CF / NE2000   (VRC4173_IRQ_BASE + 0 = 72)
++ *                  bit 1 -> buttons       (VRC4173_IRQ_BASE + 1 = 73)
++ *                  bit 4 -> CommMode      (VRC4173_IRQ_BASE + 4 = 76, unused)
++ *                  bit 9 -> touch (PIU)   (VRC4173_IRQ_BASE + 9 = 81)
++ *
++ * Cascade flow (arch/mips/vr41xx/common/giu.c):
++ *   - vr41xx_cascade_irq(GIU_IRQ(0), be300_girq0_get_irq) registers a
++ *     per-pin callback that returns the cascaded sub-IRQ number to
++ *     dispatch. giuint_irq_dispatch() reads GIRQ0 status via this
++ *     callback and calls do_IRQ(sub_irq, regs).
++ *   - One sub-IRQ per GIU event; multiple pending bits result in
++ *     successive GIU re-assertions (the GIU pin stays high until all
++ *     sub-IRQs are acked).
++ *
++ * GIRQ0 status / ack are write-1-to-clear in the emulator. Bit 0
++ * (CF/NE2000) has a quirk: state_change_pending is cleared only by
++ * reading the CF cause register at PA 0x0A00A03C, not by W1C on the
++ * GIRQ0 ack at 0x0A000014. Match the 4.2.9 driver's order: read cause
++ * first when bit 0 is set, then W1C the GIRQ0 status latch.
++ *
++ * Also force GIUINTENL bit 0 = 1 manually after vr41xx_cascade_irq.
++ * The 4.2.9 driver hits the same edge case where irq_set_chained_handler
++ * doesn't propagate to GIUINTENL on this board; same bare-metal fix here.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/types.h>
++#include <asm/io.h>
++#include <asm/addrspace.h>
++#include <asm/vr41xx/vr41xx.h>
++#include <asm/vr41xx/vrc4173.h>
++
++#define BE300_GIRQ0_STATUS	KSEG1ADDR(0x0A000004)
++#define BE300_GIRQ0_ACK		KSEG1ADDR(0x0A000014)
++#define BE300_GIRQ0_CAUSE	KSEG1ADDR(0x0A00A03C)
++#define BE300_GIUINTENL		KSEG1ADDR(0x0F00014C)
++
++#define BE300_GIRQ0_NR		16
++
++/* Software shadow mask. Bits 0..15 map to VRC4173_IRQ_BASE + 0..15. */
++static u32 be300_girq0_mask;
++
++static inline u32 girq0_read_status(void)
++{
++	return *(volatile u32 *)BE300_GIRQ0_STATUS;
++}
++
++static inline void girq0_write_ack(u32 bits)
++{
++	*(volatile u32 *)BE300_GIRQ0_ACK = bits;
++}
++
++static inline u32 girq0_read_cause(void)
++{
++	return *(volatile u32 *)BE300_GIRQ0_CAUSE;
++}
++
++static unsigned int be300_girq0_startup(unsigned int irq)
++{
++	be300_girq0_mask |= 1u << (irq - VRC4173_IRQ_BASE);
++	return 0;
++}
++
++static void be300_girq0_shutdown(unsigned int irq)
++{
++	be300_girq0_mask &= ~(1u << (irq - VRC4173_IRQ_BASE));
++}
++
++static void be300_girq0_enable(unsigned int irq)
++{
++	be300_girq0_mask |= 1u << (irq - VRC4173_IRQ_BASE);
++}
++
++static void be300_girq0_disable(unsigned int irq)
++{
++	be300_girq0_mask &= ~(1u << (irq - VRC4173_IRQ_BASE));
++}
++
++static void be300_girq0_ack(unsigned int irq)
++{
++	girq0_write_ack(1u << (irq - VRC4173_IRQ_BASE));
++}
++
++static void be300_girq0_end(unsigned int irq)
++{
++	if (!(irq_desc[irq].status & (IRQ_DISABLED | IRQ_INPROGRESS)))
++		be300_girq0_enable(irq);
++}
++
++static struct hw_interrupt_type be300_girq0_type = {
++	.typename	= "BE300-GIRQ0",
++	.startup	= be300_girq0_startup,
++	.shutdown	= be300_girq0_shutdown,
++	.enable		= be300_girq0_enable,
++	.disable	= be300_girq0_disable,
++	.ack		= be300_girq0_ack,
++	.end		= be300_girq0_end,
++};
++
++/*
++ * Cascade callback invoked by giuint_do_IRQ when GIU pin 0 fires.
++ * Reads GIRQ0 status, applies our software mask, returns the lowest
++ * pending sub-IRQ number; W1Cs the bit we picked (and for bit 0 also
++ * reads the CF cause register, which is the only way to clear the CF
++ * source's internal pending latch).
++ */
++static int be300_girq0_get_irq(int giu_irq)
++{
++	u32 pending = girq0_read_status();
++
++	/* Read cause to clear CF state_change_pending if bit 0 is set —
++	 * the 4.2.9 driver does this before W1Cing GIRQ0. */
++	if (pending & 0x1)
++		(void)girq0_read_cause();
++
++	pending &= be300_girq0_mask;
++	if (!pending)
++		return -EINVAL;
++
++	{
++		int bit;
++
++		/* Lowest pending bit; at most 16 iterations. */
++		for (bit = 0; bit < BE300_GIRQ0_NR; bit++)
++			if (pending & (1u << bit))
++				break;
++
++		/* W1C just the chosen bit; the GIU pin will reassert if any
++		 * remaining unmasked bit stays set, and we'll be called again. */
++		girq0_write_ack(1u << bit);
++		return VRC4173_IRQ_BASE + bit;
++	}
++}
++
++/*
++ * Installed at arch_initcall time: after init_IRQ() has set up the VR41xx
++ * ICU/GIU (board early_initcalls run before that and would be wiped), and
++ * before the ISA NE2000 probe (net device init) requests VRC4173_IRQ(0).
++ */
++static int __init be300_irq_cascade_init(void)
++{
++	int i;
++	int err;
++	volatile u16 *inten;
++
++	for (i = 0; i < BE300_GIRQ0_NR; i++) {
++		irq_desc[VRC4173_IRQ_BASE + i].handler = &be300_girq0_type;
++		irq_desc[VRC4173_IRQ_BASE + i].status = IRQ_DISABLED;
++	}
++
++	err = vr41xx_cascade_irq(GIU_IRQ(0), be300_girq0_get_irq);
++	if (err) {
++		printk(KERN_ERR "BE-300 IRQ: vr41xx_cascade_irq(GIU_IRQ(0)) = %d\n",
++		       err);
++		return err;
++	}
++
++	/*
++	 * vr41xx_cascade_irq -> setup_irq -> startup_giuint_irq should set
++	 * GIUINTENL bit 0, but the early-init ordering on this board leaves
++	 * the bit at 0 so giuint_do_IRQ never sees GIU pin 0 fire. Force it
++	 * on manually. Matches the 4.2.9 driver's bare-metal poke.
++	 */
++	inten = (volatile u16 *)BE300_GIUINTENL;
++	*inten = *inten | 0x1;
++
++	printk(KERN_INFO "BE-300 IRQ: VRC4173 GIRQ0 demux at "
++	       "PA 0x0A000004 -> VRC4173_IRQ_BASE..%d (cascade on GIU_IRQ(0))\n",
++	       VRC4173_IRQ_BASE + BE300_GIRQ0_NR - 1);
++	return 0;
++}
++
++arch_initcall(be300_irq_cascade_init);
+diff --git a/arch/mips/vr41xx/casio-be300/setup.c b/arch/mips/vr41xx/casio-be300/setup.c
+index 4edee8bc010837603156cbf675a9cb1aaf4f359f..0325d4371edd273b627c235583f497e1366ae4cf 100644
+--- a/arch/mips/vr41xx/casio-be300/setup.c
++++ b/arch/mips/vr41xx/casio-be300/setup.c
+@@ -29,6 +29,16 @@
+ #define BE300_ISA_IO_BASE	0x0a00c000
+ #define BE300_ISA_IO_SIZE	0x05ff4000
+ 
++/*
++ * VRC4173 PCMCIA bridge: bit 2 lets the card windows own I/O 0xC000-0xD7FF
++ * (NE2000 at port 0x300, CF taskfile at 0x170/0x376).  NAND goes through
++ * the XFER engine, so the bridge never steals NAND I/O.
++ */
++#define BE300_PCMCIA_BRIDGE_PA	0x0a00a01c
++#define BE300_PCMCIA_BRIDGE_EN	0x04
++#define BE300_GIRQ0_CAUSE_PA	0x0a00a03c
++#define BE300_GIRQ0_ACK_PA	0x0a000014
++
+ /* VRC4173 companion SIU (dock UART): 16550-like, 4-byte register stride. */
+ #define BE300_UART_BASE		0x0a008680
+ #define BE300_UART_OFS_THR	0x00
+@@ -94,6 +104,19 @@ static int __init casio_be300_setup(void)
+ 	ioport_resource.start = 0;
+ 	ioport_resource.end = BE300_ISA_IO_SIZE - 1;
+ 
++	/* Same bring-up as the 4.2.9 board file and 2.4 patch 0013. */
++	*(volatile u32 *)KSEG1ADDR(BE300_PCMCIA_BRIDGE_PA) |=
++		BE300_PCMCIA_BRIDGE_EN;
++
++	/*
++	 * Drain the GIRQ0 cascade source before interrupts come up: an
++	 * attached card leaves state_change_pending set (cleared only by
++	 * reading the cause register) plus the W1C GIRQ0 latch, which would
++	 * hold GIU pin 0 high as soon as local_irq_enable() runs.
++	 */
++	(void)*(volatile u32 *)KSEG1ADDR(BE300_GIRQ0_CAUSE_PA);
++	*(volatile u32 *)KSEG1ADDR(BE300_GIRQ0_ACK_PA) = 0xffffffffu;
++
+ 	register_console(&be300_bootcon);
+ 
+ 	return 0;

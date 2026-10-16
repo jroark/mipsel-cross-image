@@ -1,0 +1,809 @@
+BE-300 2.6.8.1: Stowaway keyboard, touch panel and button input drivers.
+
+  * stowaway.c: port of the 2.4.18 stowaway_be300.c (patches 0001+0015):
+    polled dock handshake + scancode decode on the VRC4173 SIU, and the
+    be300_stowaway_owns_uart flag that keeps ttyS0 and the boot console
+    off the shared UART while the dock is probed/connected.
+  * touch.c: port of the 2.4.18 touch_be300.c (0001+0010): VRC4173 PIU
+    polled at 50 Hz, ABS_X/ABS_Y/ABS_PRESSURE/BTN_TOUCH in screen pixels.
+  * keys.c: the 4.2.9 polled button driver on a kernel timer.
+
+Link order gives the same evdev minors as the 2.4 image: event0 =
+Stowaway, event1 = touch, event2 = buttons.
+
+---
+ arch/mips/Kconfig                       |  24 +++
+ arch/mips/vr41xx/casio-be300/Makefile   |   6 +
+ arch/mips/vr41xx/casio-be300/keys.c     | 249 +++++++++++++++++++++++
+ arch/mips/vr41xx/casio-be300/stowaway.c | 250 ++++++++++++++++++++++++
+ arch/mips/vr41xx/casio-be300/touch.c    | 219 +++++++++++++++++++++
+ 5 files changed, 748 insertions(+)
+ create mode 100644 arch/mips/vr41xx/casio-be300/keys.c
+ create mode 100644 arch/mips/vr41xx/casio-be300/stowaway.c
+ create mode 100644 arch/mips/vr41xx/casio-be300/touch.c
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index f69fe7e8fd06e5abcb448ae279c4842111bb4ac1..430f5d36687eca569218711c83507f6019284563 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -168,6 +168,30 @@ config CASIO_BE300_IRQ_CASCADE
+ 	  Demultiplexes the VRC4173 GIRQ0 status word (CF/NE2000, buttons,
+ 	  touch panel) behind VR4131 GIU pin 0 into IRQs 72..87.
+ 
++config CASIO_BE300_STOWAWAY
++	bool "BE-300 Stowaway dock keyboard"
++	depends on CASIO_BE300 && INPUT
++	default y
++	help
++	  Polled Targus Stowaway keyboard on the VRC4173 SIU (dock UART),
++	  reported as an input device (/dev/input/event0).
++
++config CASIO_BE300_TOUCH
++	bool "BE-300 touch panel"
++	depends on CASIO_BE300 && INPUT
++	default y
++	help
++	  Polled VRC4173 PIU touch panel, reported as an absolute input
++	  device in screen pixels (/dev/input/event1).
++
++config CASIO_BE300_KEYS
++	bool "BE-300 hardware buttons"
++	depends on CASIO_BE300 && INPUT
++	default y
++	help
++	  Polled front-panel buttons (OK/ESC/arrows/Rocket/Power) as an
++	  input device (/dev/input/event2).
++
+ config CASIO_BE300_NAND
+ 	bool "BE-300 16 MiB NAND flash (VRC4173 XFER engine)"
+ 	depends on CASIO_BE300 && MTD
+diff --git a/arch/mips/vr41xx/casio-be300/Makefile b/arch/mips/vr41xx/casio-be300/Makefile
+index f8215254f563dd7e7ea31cddc89e5e2b490aa574..b5f7236e5b35c360452a0e5551fc138d0d917dfe 100644
+--- a/arch/mips/vr41xx/casio-be300/Makefile
++++ b/arch/mips/vr41xx/casio-be300/Makefile
+@@ -6,3 +6,9 @@ obj-y	:= init.o setup.o
+ 
+ obj-$(CONFIG_CASIO_BE300_IRQ_CASCADE)	+= irq.o
+ obj-$(CONFIG_CASIO_BE300_NAND)	+= nand.o
++
++# Link order fixes the evdev minors: stowaway = event0, touch = event1
++# (keys registers at late_initcall time = event2).
++obj-$(CONFIG_CASIO_BE300_STOWAWAY)	+= stowaway.o
++obj-$(CONFIG_CASIO_BE300_TOUCH)	+= touch.o
++obj-$(CONFIG_CASIO_BE300_KEYS)	+= keys.o
+diff --git a/arch/mips/vr41xx/casio-be300/keys.c b/arch/mips/vr41xx/casio-be300/keys.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..21a1876b996df156da9b186ce696dcba7efb5f3a
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/keys.c
+@@ -0,0 +1,249 @@
++/*
++ * arch/mips/vr41xx/casio-be300/keys.c
++ *
++ * Polled button input driver for the Casio Cassiopeia BE-300.
++ *
++ * The BE-300 has 8 physical buttons read via two byte registers on the
++ * companion chip:
++ *   0xAA00A042 (set1): OK, ESC, UP, DOWN, RIGHT, LEFT
++ *   0xAA00A043 (set2): Rocket (modifier), Power
++ *
++ * A bit value of 1 means the button is currently pressed.
++ *
++ * Key scheme (matches the linux4.be scan_be300.c typing scheme):
++ *
++ *   plain                rocket + key
++ *   -----                ------------
++ *   OK    = Enter        Rocket+OK    = Space
++ *   ESC   = Tab          Rocket+ESC   = Backspace
++ *   UP    = Up           Rocket+UP    = next char in alphabet cycle
++ *   DOWN  = Down         Rocket+DOWN  = previous char in alphabet cycle
++ *   RIGHT = Right        Rocket+RIGHT = commit char and advance
++ *   LEFT  = Left         Rocket+LEFT  = backspace (overwrite previous char)
++ *   PWR   = Power        Rocket+PWR   = Ctrl+C
++ *
++ * The rocket+up/down "cycle" scheme works by emitting
++ *   <BACKSPACE> <new char> <LEFT>
++ * so the character under the cursor is replaced each tick and the cursor
++ * stays on top of the new char. Rocket+right moves the cursor past it to
++ * commit.
++ *
++ * Based on scan_be300.c from the linux4.be project (2002):
++ *   Marc <themaw@linux4.be>, John Roark <jroark@linux4.be>
++ *
++ * Ported to Linux 4.2.9 input_polled_dev API; Linux 2.6.8.1 version polls
++ * from a kernel timer (2.6.8 has no input-polldev).
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/input.h>
++#include <linux/jiffies.h>
++#include <linux/timer.h>
++#include <asm/io.h>
++
++#define BE300_KEYS_POLL_MS	50
++#define BE300_REG_SET1		0xAA00A042
++#define BE300_REG_SET2		0xAA00A043
++
++/* Set 1 bit masks */
++#define BE300_BTN_OK		0x04
++#define BE300_BTN_ESC		0x08
++#define BE300_BTN_UP		0x10
++#define BE300_BTN_DOWN		0x20
++#define BE300_BTN_RIGHT		0x40
++#define BE300_BTN_LEFT		0x80
++
++/* Set 2 bit masks */
++#define BE300_BTN_ROCKET	0x10
++#define BE300_BTN_POWER		0x80
++
++/*
++ * Character cycle for rocket+up/down. Matches the original 48-entry
++ * scheme: a-z, space, 0-9, and punctuation. Each entry is a KEY_* code.
++ * A held rocket+up cycles through these; rocket+down goes backward.
++ */
++static const unsigned short char_keys[] = {
++	KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J,
++	KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T,
++	KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z,
++	KEY_SPACE,
++	KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,
++	KEY_GRAVE, KEY_MINUS, KEY_EQUAL, KEY_LEFTBRACE, KEY_RIGHTBRACE,
++	KEY_SEMICOLON, KEY_APOSTROPHE, KEY_BACKSLASH,
++	KEY_COMMA, KEY_DOT, KEY_SLASH,
++};
++#define NUM_CHAR_KEYS ARRAY_SIZE(char_keys)
++
++struct be300_key_state {
++	u8 prev_set1;
++	u8 prev_set2;
++	int char_pos;
++	int pending_edit;
++};
++
++static struct be300_key_state be300_state;
++static struct input_dev be300_keys_input;
++static struct timer_list be300_keys_timer;
++
++static void be300_tap(struct input_dev *input, unsigned short key)
++{
++	input_report_key(input, key, 1);
++	input_sync(input);
++	input_report_key(input, key, 0);
++	input_sync(input);
++}
++
++/*
++ * Emit Ctrl+C as a held-down modifier sequence:
++ *   press Ctrl, press C, release C, release Ctrl
++ */
++static void be300_ctrl_c(struct input_dev *input)
++{
++	input_report_key(input, KEY_LEFTCTRL, 1);
++	input_sync(input);
++	input_report_key(input, KEY_C, 1);
++	input_sync(input);
++	input_report_key(input, KEY_C, 0);
++	input_sync(input);
++	input_report_key(input, KEY_LEFTCTRL, 0);
++	input_sync(input);
++}
++
++static void be300_keys_poll(unsigned long data)
++{
++	struct input_dev *input = &be300_keys_input;
++	u8 set1 = readb(BE300_REG_SET1);
++	u8 set2 = readb(BE300_REG_SET2);
++	u8 changed1 = set1 ^ be300_state.prev_set1;
++	u8 changed2 = set2 ^ be300_state.prev_set2;
++	int rocket = !!(set2 & BE300_BTN_ROCKET);
++
++	/*
++	 * Detect rising edges on the main buttons. Rocket itself is treated
++	 * as a modifier and never produces an event of its own.
++	 */
++	if ((changed1 & BE300_BTN_OK) && (set1 & BE300_BTN_OK)) {
++		be300_state.pending_edit = 0;
++		if (rocket)
++			be300_tap(input, KEY_SPACE);
++		else
++			be300_tap(input, KEY_ENTER);
++	}
++
++	if ((changed1 & BE300_BTN_ESC) && (set1 & BE300_BTN_ESC)) {
++		be300_state.pending_edit = 0;
++		if (rocket)
++			be300_tap(input, KEY_BACKSPACE);
++		else
++			be300_tap(input, KEY_TAB);
++	}
++
++	if ((changed1 & BE300_BTN_UP) && (set1 & BE300_BTN_UP)) {
++		if (rocket) {
++			if (be300_state.pending_edit) {
++				be300_state.char_pos =
++				    (be300_state.char_pos + 1) % NUM_CHAR_KEYS;
++				be300_tap(input, KEY_BACKSPACE);
++			} else {
++				be300_state.char_pos = 0;
++				be300_state.pending_edit = 1;
++			}
++			be300_tap(input, char_keys[be300_state.char_pos]);
++		} else {
++			be300_tap(input, KEY_UP);
++		}
++	}
++
++	if ((changed1 & BE300_BTN_DOWN) && (set1 & BE300_BTN_DOWN)) {
++		if (rocket) {
++			if (be300_state.pending_edit) {
++				be300_state.char_pos =
++				    (be300_state.char_pos + NUM_CHAR_KEYS - 1) %
++				    NUM_CHAR_KEYS;
++				be300_tap(input, KEY_BACKSPACE);
++			} else {
++				be300_state.char_pos = NUM_CHAR_KEYS - 1;
++				be300_state.pending_edit = 1;
++			}
++			be300_tap(input, char_keys[be300_state.char_pos]);
++		} else {
++			be300_tap(input, KEY_DOWN);
++		}
++	}
++
++	if ((changed1 & BE300_BTN_RIGHT) && (set1 & BE300_BTN_RIGHT)) {
++		be300_state.pending_edit = 0;
++		be300_tap(input, KEY_RIGHT);
++	}
++
++	if ((changed1 & BE300_BTN_LEFT) && (set1 & BE300_BTN_LEFT)) {
++		if (rocket) {
++			be300_state.pending_edit = 0;
++			be300_tap(input, KEY_BACKSPACE);
++		} else {
++			be300_tap(input, KEY_LEFT);
++		}
++	}
++
++	if ((changed2 & BE300_BTN_POWER) && (set2 & BE300_BTN_POWER)) {
++		be300_state.pending_edit = 0;
++		if (rocket)
++			be300_ctrl_c(input);
++		else
++			be300_tap(input, KEY_POWER);
++	}
++
++	/* Rocket released: commit any pending edit. */
++	if ((changed2 & BE300_BTN_ROCKET) && !(set2 & BE300_BTN_ROCKET))
++		be300_state.pending_edit = 0;
++
++	be300_state.prev_set1 = set1;
++	be300_state.prev_set2 = set2;
++
++	mod_timer(&be300_keys_timer,
++		  jiffies + (HZ * BE300_KEYS_POLL_MS + 999) / 1000);
++}
++
++static int __init be300_keys_init(void)
++{
++	struct input_dev *input = &be300_keys_input;
++	int i;
++
++	input->name = "BE-300 Buttons";
++	input->phys = "be300/input0";
++	input->id.bustype = BUS_HOST;
++
++	set_bit(EV_SYN, input->evbit);
++	set_bit(EV_KEY, input->evbit);
++	set_bit(KEY_ENTER, input->keybit);
++	set_bit(KEY_TAB, input->keybit);
++	set_bit(KEY_UP, input->keybit);
++	set_bit(KEY_DOWN, input->keybit);
++	set_bit(KEY_LEFT, input->keybit);
++	set_bit(KEY_RIGHT, input->keybit);
++	set_bit(KEY_POWER, input->keybit);
++	set_bit(KEY_SPACE, input->keybit);
++	set_bit(KEY_BACKSPACE, input->keybit);
++	set_bit(KEY_LEFTCTRL, input->keybit);
++	for (i = 0; i < NUM_CHAR_KEYS; i++)
++		set_bit(char_keys[i], input->keybit);
++
++	input_register_device(input);
++
++	init_timer(&be300_keys_timer);
++	be300_keys_timer.function = be300_keys_poll;
++	mod_timer(&be300_keys_timer,
++		  jiffies + (HZ * BE300_KEYS_POLL_MS + 999) / 1000);
++
++	printk(KERN_INFO "BE-300 buttons: polled at %d ms\n",
++	       BE300_KEYS_POLL_MS);
++	return 0;
++}
++
++/* After stowaway (event0) and touch (event1): buttons are event2. */
++late_initcall(be300_keys_init);
+diff --git a/arch/mips/vr41xx/casio-be300/stowaway.c b/arch/mips/vr41xx/casio-be300/stowaway.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c25f3b2a359c3a176d6f3e0641fca072838f0748
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/stowaway.c
+@@ -0,0 +1,250 @@
++/*
++ * arch/mips/vr41xx/casio-be300/stowaway.c
++ *
++ * Linux 2.6.8.1 port of the 2.4.18 stowaway_be300.c (patches 0001 + 0015),
++ * itself a port of board/casio-be300/stowaway_serio.c -- drives the BE-300
++ * emulator's --stowaway-keyboard Targus dock emulation. The 4.2.9 driver
++ * registers a serio port and lets drivers/input/keyboard/stowaway.c
++ * decode scancodes; 2.6.8 has serio but no stowaway decoder yet, so like
++ * the 2.4 driver both halves live in one driver: poll the
++ * SIU UART at 20 ms via a kernel timer, run the probe handshake, then
++ * decode each scancode byte against the same KEY_* table the 4.2.9
++ * in-tree stowaway driver uses (drivers/input/keyboard/stowaway.c) and
++ * emit input events via input_report_key().
++ *
++ * Wire protocol (verified against be300-framebuffer src/stowaway.c):
++ *   1. LCR write w/ DLAB=1  -> emulator resets its state.
++ *   2. IER MSI=1            -> emulator marks modem-wait.
++ *   3. MCR DTR=1            -> emulator bumps modem_events_delivered.
++ *   4. MCR RTS rising edge  -> emulator queues 0xFA, 0xFD.
++ *   5. Driver reads both    -> emulator sets connected=true.
++ *   6. Keystrokes arrive as 8-bit scancodes (bit 7 = release).
++ *
++ * The SIU UART (PA 0x0A008680, 4-byte register stride) is shared with
++ * the ttyS0 serial driver and the boot console.  be300_stowaway_owns_uart
++ * keeps both off the port from the first probe until we give up on
++ * finding a dock (~2 s); with a dock attached we keep it for good.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/jiffies.h>
++#include <linux/timer.h>
++#include <linux/input.h>
++#include <linux/string.h>
++#include <linux/spinlock.h>
++#include <asm/io.h>
++#include <asm/addrspace.h>
++
++/* VRC4173 SIU UART KSEG1 base. Register stride is 4 bytes. */
++#define SIU_BASE	KSEG1ADDR(0x0A008680)
++
++#define SIU_RBR		((volatile u8 *)(SIU_BASE + 0x00))
++#define SIU_THR		((volatile u8 *)(SIU_BASE + 0x00))
++#define SIU_IER		((volatile u8 *)(SIU_BASE + 0x04))
++#define SIU_LCR		((volatile u8 *)(SIU_BASE + 0x0c))
++#define SIU_MCR		((volatile u8 *)(SIU_BASE + 0x10))
++#define SIU_LSR		((volatile u8 *)(SIU_BASE + 0x14))
++#define SIU_MSR		((volatile u8 *)(SIU_BASE + 0x18))
++
++#define LCR_8N1		0x03
++#define LCR_DLAB	0x80
++#define IER_MSI		0x08
++#define MCR_DTR		0x01
++#define MCR_RTS		0x02
++#define LSR_DR		0x01
++
++#define PROBE_ACK_0	0xfa
++#define PROBE_ACK_1	0xfd
++
++#define SKBD_KEY_MASK	0x7f
++#define SKBD_RELEASE	0x80
++
++#define POLL_MS		20
++#define PROBE_GIVEUP	100	/* ~2 s of probe attempts before stopping */
++
++enum stow_state {
++	STOW_INIT,
++	STOW_RTS_LOW,
++	STOW_RTS_HIGH,
++	STOW_AWAIT_ACK0,
++	STOW_AWAIT_ACK1,
++	STOW_CONNECTED,
++	STOW_GIVE_UP,
++};
++
++/* Stowaway scancode -> Linux input KEY_* (lifted from 4.2.9
++ * drivers/input/keyboard/stowaway.c::skbd_keycode). */
++static const unsigned char skbd_keycode[128] = {
++	KEY_1, KEY_2, KEY_3, KEY_Z, KEY_4, KEY_5, KEY_6, KEY_7,
++	0, KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_GRAVE,
++	KEY_X, KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_SPACE,
++	KEY_CAPSLOCK, KEY_TAB, KEY_LEFTCTRL, 0, 0, 0, 0, 0,
++	0, 0, 0, KEY_LEFTALT, 0, 0, 0, 0,
++	0, 0, 0, 0, KEY_C, KEY_V, KEY_B, KEY_N,
++	KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_HOME, KEY_8, KEY_9, KEY_0, KEY_ESC,
++	KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_BACKSLASH, KEY_END, KEY_U, KEY_I, KEY_O, KEY_P,
++	KEY_APOSTROPHE, KEY_ENTER, KEY_PAGEUP, 0, KEY_J, KEY_K, KEY_L, KEY_SEMICOLON,
++	KEY_SLASH, KEY_UP, KEY_PAGEDOWN, 0, KEY_M, KEY_COMMA, KEY_DOT, KEY_INSERT,
++	KEY_DELETE, KEY_LEFT, KEY_DOWN, KEY_RIGHT, 0, 0, 0, 0,
++	KEY_LEFTSHIFT, KEY_RIGHTSHIFT, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0,
++	0, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,
++	KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12, 0, 0, 0
++};
++
++static struct input_dev stow_input;
++static struct timer_list stow_timer;
++static enum stow_state stow_state;
++static unsigned stow_ticks;
++
++/* Read by serial_be300.c and the boot console: keep the ttyS0 RX poller,
++ * LCR writes and printk output off the shared SIU from the first probe
++ * until we give up on finding a dock. */
++int be300_stowaway_owns_uart;
++
++static void stow_drain_rx(void)
++{
++	while (*SIU_LSR & LSR_DR)
++		(void)*SIU_RBR;
++}
++
++static void stow_reset_port(void)
++{
++	*SIU_LCR = LCR_8N1 | LCR_DLAB;
++	*SIU_LCR = LCR_8N1;
++	*SIU_IER = IER_MSI;
++	*SIU_MCR = MCR_DTR;
++	stow_drain_rx();
++}
++
++static void stow_dispatch_byte(u8 byte)
++{
++	unsigned code = byte & SKBD_KEY_MASK;
++	int down = !(byte & SKBD_RELEASE);
++
++	if (skbd_keycode[code]) {
++		input_report_key(&stow_input, skbd_keycode[code], down);
++		input_sync(&stow_input);
++	}
++}
++
++static void stow_tick(unsigned long _data)
++{
++	u8 byte;
++	int requeue = 1;
++
++	switch (stow_state) {
++	case STOW_INIT:
++		be300_stowaway_owns_uart = 1;
++		stow_reset_port();
++		stow_state = STOW_RTS_LOW;
++		stow_ticks = 0;
++		break;
++
++	case STOW_RTS_LOW:
++		*SIU_MCR = MCR_DTR;
++		stow_state = STOW_RTS_HIGH;
++		break;
++
++	case STOW_RTS_HIGH:
++		*SIU_MCR = MCR_DTR | MCR_RTS;
++		stow_state = STOW_AWAIT_ACK0;
++		break;
++
++	case STOW_AWAIT_ACK0:
++		if (*SIU_LSR & LSR_DR) {
++			byte = *SIU_RBR;
++			if (byte == PROBE_ACK_0)
++				stow_state = STOW_AWAIT_ACK1;
++			else
++				stow_state = STOW_RTS_LOW;
++			break;
++		}
++		if (++stow_ticks >= PROBE_GIVEUP) {
++			stow_state = STOW_GIVE_UP;
++			be300_stowaway_owns_uart = 0;
++			requeue = 0;
++			break;
++		}
++		stow_state = STOW_RTS_LOW;
++		break;
++
++	case STOW_AWAIT_ACK1:
++		if (*SIU_LSR & LSR_DR) {
++			byte = *SIU_RBR;
++			if (byte == PROBE_ACK_1) {
++				stow_state = STOW_CONNECTED;
++				printk(KERN_INFO "BE-300 Stowaway: connected\n");
++				stow_ticks = 0;
++			} else {
++				stow_state = STOW_RTS_LOW;
++			}
++			break;
++		}
++		if (++stow_ticks >= PROBE_GIVEUP) {
++			stow_state = STOW_RTS_LOW;
++			stow_ticks = 0;
++		}
++		break;
++
++	case STOW_CONNECTED:
++		while (*SIU_LSR & LSR_DR) {
++			byte = *SIU_RBR;
++			stow_dispatch_byte(byte);
++		}
++		break;
++
++	case STOW_GIVE_UP:
++		requeue = 0;
++		break;
++	}
++
++	if (requeue)
++		mod_timer(&stow_timer, jiffies + (HZ * POLL_MS + 999) / 1000);
++}
++
++static int __init be300_stowaway_init(void)
++{
++	int i;
++
++	stow_input.name = "BE-300 Stowaway keyboard";
++	stow_input.phys = "vrc4173/siu";
++	stow_input.id.bustype = BUS_RS232;
++	stow_input.id.vendor = 0x1033;	/* NEC */
++	stow_input.id.product = 0x4173;
++	stow_input.id.version = 0x0001;
++
++	set_bit(EV_SYN, stow_input.evbit);
++	set_bit(EV_KEY, stow_input.evbit);
++	for (i = 0; i < 128; i++)
++		if (skbd_keycode[i])
++			__set_bit(skbd_keycode[i], stow_input.keybit);
++
++	input_register_device(&stow_input);
++
++	init_timer(&stow_timer);
++	stow_timer.function = stow_tick;
++	stow_state = STOW_INIT;
++	stow_ticks = 0;
++	mod_timer(&stow_timer, jiffies + (HZ * POLL_MS + 999) / 1000);
++
++	printk(KERN_INFO "BE-300 Stowaway keyboard: polling SIU @ PA 0x0A008680, "
++	       "%d ms cadence; emits input events via the in-tree input layer\n",
++	       POLL_MS);
++	return 0;
++}
++
++/*
++ * Registered before the touch panel (Makefile order) so the evdev minors
++ * match the 2.4 and 4.2.9 images: event0 = Stowaway, event1 = touch.
++ */
++device_initcall(be300_stowaway_init);
+diff --git a/arch/mips/vr41xx/casio-be300/touch.c b/arch/mips/vr41xx/casio-be300/touch.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6e2144b09274245a469e00aa4b29c1bca04f43d
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/touch.c
+@@ -0,0 +1,219 @@
++/*
++ * arch/mips/vr41xx/casio-be300/touch.c
++ *
++ * VRC4173 PIU touchscreen for the Casio BE-300 (Linux 2.6.8.1).
++ *
++ * Port of the 2.4.18 touch_be300.c (patches 0001 + 0010), which follows
++ * the 4.2.9 board/casio-be300/touch_be300.c decode.  Like the 2.4 driver
++ * the panel is polled at 50 Hz from a kernel timer instead of taking the
++ * PIU interrupt through the GIRQ0 cascade, so it behaves identically on
++ * both legacy kernels.
++ *
++ *   PIU MMIO base:  PA 0x0A000300, size 0x60
++ *   PIU_CNTREG +0x00 (16-bit) -- control + readback PADSTATE/pen-down
++ *   PIU_INTREG +0x04 (16-bit) -- pending status (low byte) | mask (high)
++ *   PIU_PB0x  +0x20..+0x2C    -- page-0 ADC samples (yp, ym, xm, xp)
++ *   PIU_PB1x  +0x50..+0x5C    -- page-1 ADC samples
++ *
++ * Reported through the input layer as ABS_X/ABS_Y/ABS_PRESSURE +
++ * BTN_TOUCH in screen pixels (240x320).  Qt/Embedded's patched TPanel
++ * handler reads it as QWS_MOUSE_PROTO=TPanel:/dev/input/event1.
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/jiffies.h>
++#include <linux/timer.h>
++#include <linux/input.h>
++#include <asm/io.h>
++#include <asm/addrspace.h>
++
++#define PIU_BASE	KSEG1ADDR(0x0A000300)
++
++#define PIU_CNTREG	((volatile u16 *)(PIU_BASE + 0x00))
++#define PIU_INTREG	((volatile u16 *)(PIU_BASE + 0x04))
++#define PIU_SIVL	((volatile u16 *)(PIU_BASE + 0x08))
++#define PIU_STBL	((volatile u16 *)(PIU_BASE + 0x0c))
++#define PIU_PB00	((volatile u16 *)(PIU_BASE + 0x20))
++#define PIU_PB10	((volatile u16 *)(PIU_BASE + 0x50))
++
++#define PIUCNT_PADATSTART	0x0004
++#define PIUCNT_PIUSEQEN		0x0100
++#define PIUCNT_PIUPWR		0x0200
++#define PIUCNT_PEN_DETECTED	0x2000
++
++#define PIUINT_PENCHGINTR	0x0001
++#define PIUINT_PADDLOSTINTR	0x0004
++#define PIUINT_PADPAGE0INTR	0x0008
++#define PIUINT_PADPAGE1INTR	0x0010
++#define PIUINT_TOUCH_DATA	(PIUINT_PADPAGE0INTR | PIUINT_PADPAGE1INTR)
++#define PIUINT_PENDING_ALL	(PIUINT_PENCHGINTR | PIUINT_PADDLOSTINTR | \
++				 PIUINT_TOUCH_DATA)
++
++/* ADC linear ranges (be300-framebuffer/src/be300_devices.c). */
++#define PIU_ADC_Y_MIN		0x81E1u
++#define PIU_ADC_Y_MAX		0x8E30u
++#define PIU_ADC_X_MIN		0x8300u
++#define PIU_ADC_X_MAX		0x8D1Bu
++
++#define BE300_TOUCH_WIDTH	240
++#define BE300_TOUCH_HEIGHT	320
++#define BE300_TOUCH_PANEL_HEIGHT	359
++#define BE300_TOUCH_POLL_HZ	50
++
++static struct input_dev be300_ts_input;
++static struct timer_list be300_ts_timer;
++
++static int adc_valid(u16 v, u16 lo, u16 hi)
++{
++	return v >= lo && v <= hi;
++}
++
++static int adc_to_pos(u16 v, u16 lo, u16 hi, int span)
++{
++	if (v < lo)
++		v = lo;
++	if (v > hi)
++		v = hi;
++	return ((int)(v - lo) * (span - 1)) / (hi - lo);
++}
++
++static int adc_to_pos_inv(u16 v, u16 lo, u16 hi, int span)
++{
++	if (v < lo)
++		v = lo;
++	if (v > hi)
++		v = hi;
++	return ((int)(hi - v) * (span - 1)) / (hi - lo);
++}
++
++static void decode_page(volatile u16 *pb0, int *out_x, int *out_y)
++{
++	u16 yp = pb0[0];
++	u16 ym = pb0[2];
++	u16 xm = pb0[4];
++	u16 xp = pb0[6];
++	int x = 0, y = 0, n;
++
++	n = 0;
++	if (adc_valid(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX)) {
++		x += adc_to_pos(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++				BE300_TOUCH_WIDTH);
++		n++;
++	}
++	if (adc_valid(xm, PIU_ADC_X_MIN, PIU_ADC_X_MAX)) {
++		x += adc_to_pos_inv(xm, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++				    BE300_TOUCH_WIDTH);
++		n++;
++	}
++	x = n ? x / n : adc_to_pos(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
++				   BE300_TOUCH_WIDTH);
++
++	n = 0;
++	if (adc_valid(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX)) {
++		y += adc_to_pos(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++				BE300_TOUCH_PANEL_HEIGHT);
++		n++;
++	}
++	if (adc_valid(ym, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX)) {
++		y += adc_to_pos_inv(ym, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++				    BE300_TOUCH_PANEL_HEIGHT);
++		n++;
++	}
++	y = n ? y / n : adc_to_pos(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
++				   BE300_TOUCH_PANEL_HEIGHT);
++	if (y >= BE300_TOUCH_HEIGHT)
++		y = BE300_TOUCH_HEIGHT - 1;
++
++	*out_x = x;
++	*out_y = y;
++}
++
++static void be300_ts_report(int x, int y, int down)
++{
++	if (down) {
++		input_report_abs(&be300_ts_input, ABS_X, x);
++		input_report_abs(&be300_ts_input, ABS_Y, y);
++		input_report_abs(&be300_ts_input, ABS_PRESSURE, 1);
++		input_report_key(&be300_ts_input, BTN_TOUCH, 1);
++	} else {
++		input_report_key(&be300_ts_input, BTN_TOUCH, 0);
++		input_report_abs(&be300_ts_input, ABS_PRESSURE, 0);
++	}
++	input_sync(&be300_ts_input);
++}
++
++static void be300_ts_poll(unsigned long data)
++{
++	u16 status, pending, mask, eff;
++	int x = 0, y = 0;
++
++	status = *PIU_INTREG;
++	pending = status & 0xff;
++	mask = status >> 8;
++	eff = pending & mask;
++
++	if (eff & PIUINT_PADPAGE0INTR) {
++		decode_page(PIU_PB00, &x, &y);
++		be300_ts_report(x, y, 1);
++	}
++	if (eff & PIUINT_PADPAGE1INTR) {
++		decode_page(PIU_PB10, &x, &y);
++		be300_ts_report(x, y, 1);
++	}
++	if (eff & PIUINT_PENCHGINTR)
++		be300_ts_report(x, y, !!(*PIU_CNTREG & PIUCNT_PEN_DETECTED));
++
++	/* W1C the pending bits we observed (preserve mask in high byte). */
++	if (eff)
++		*PIU_INTREG = (mask << 8) | eff;
++
++	mod_timer(&be300_ts_timer, jiffies + HZ / BE300_TOUCH_POLL_HZ);
++}
++
++static int __init be300_touch_init(void)
++{
++	be300_ts_input.name = "BE-300 PIU touchscreen";
++	be300_ts_input.phys = "vrc4173/piu";
++	be300_ts_input.id.bustype = BUS_HOST;
++	be300_ts_input.id.vendor = 0x1033;	/* NEC */
++	be300_ts_input.id.product = 0x4173;	/* VRC4173 */
++	be300_ts_input.id.version = 0x0001;
++
++	set_bit(EV_SYN, be300_ts_input.evbit);
++	set_bit(EV_KEY, be300_ts_input.evbit);
++	set_bit(EV_ABS, be300_ts_input.evbit);
++	set_bit(BTN_TOUCH, be300_ts_input.keybit);
++	set_bit(ABS_X, be300_ts_input.absbit);
++	set_bit(ABS_Y, be300_ts_input.absbit);
++	set_bit(ABS_PRESSURE, be300_ts_input.absbit);
++	be300_ts_input.absmax[ABS_X] = BE300_TOUCH_WIDTH - 1;
++	be300_ts_input.absmax[ABS_Y] = BE300_TOUCH_HEIGHT - 1;
++	be300_ts_input.absmax[ABS_PRESSURE] = 1;
++
++	input_register_device(&be300_ts_input);
++
++	/* PIU defaults (VRC4173 UM idle dump); PIUPWR+PIUSEQEN+PADATSTART
++	 * = autoscan, with pen-change, data-lost and page0/1 enabled. */
++	*PIU_SIVL = 0x05DC;
++	*PIU_STBL = 0x00C8;
++	*PIU_INTREG = (PIUINT_PENDING_ALL << 8) | 0;
++	*PIU_CNTREG = PIUCNT_PIUPWR | PIUCNT_PIUSEQEN | PIUCNT_PADATSTART;
++
++	init_timer(&be300_ts_timer);
++	be300_ts_timer.function = be300_ts_poll;
++	mod_timer(&be300_ts_timer, jiffies + HZ / BE300_TOUCH_POLL_HZ);
++
++	printk(KERN_INFO "BE-300 touchscreen: VRC4173 PIU @ PA 0x0A000300, "
++	       "polled at %d Hz\n", BE300_TOUCH_POLL_HZ);
++	return 0;
++}
++
++device_initcall(be300_touch_init);

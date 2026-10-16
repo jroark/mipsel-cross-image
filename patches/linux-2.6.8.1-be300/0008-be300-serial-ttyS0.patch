@@ -1,0 +1,353 @@
+BE-300 2.6.8.1: ttyS0 on the VRC4173 dock UART.
+
+The linux4be 2.6 serial_be300.c was an unfinished 2.4-style driver, so
+this is a 2.6.8 rewrite carrying the 2.4.18 behaviour (patches 0009 and
+0015): ttyS0 = major 4 minor 64, polled RX at 100 Hz, synchronous TX,
+115200 8N1 with DTR/RTS for the emulator's --serial1-bridge, an optional
+console (console=ttyS0), and no RBR reads or LCR writes while the
+Stowaway keyboard owns the port.
+
+---
+ drivers/char/Kconfig        |  15 ++
+ drivers/char/Makefile       |   1 +
+ drivers/char/serial_be300.c | 293 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 309 insertions(+)
+ create mode 100644 drivers/char/serial_be300.c
+
+diff --git a/drivers/char/Kconfig b/drivers/char/Kconfig
+index 37e0673510752220d5f4b95891e5f59e26a1a54d..276f174c770b585b803a3cbd8a6b47dfc3fd10a3 100644
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -62,6 +62,21 @@ config HW_CONSOLE
+ 	depends on VT && !S390 && !UM
+ 	default y
+ 
++config SERIAL_BE300
++	bool "Casio BE-300 dock UART (VRC4173 SIU) support"
++	depends on CASIO_BE300
++	default y
++	help
++	  ttyS0 on the VRC4173 companion SIU at PA 0x0A008680, polled.
++	  Shares the port with the Stowaway dock keyboard.
++
++config SERIAL_BE300_CONSOLE
++	bool "Console on the BE-300 dock UART"
++	depends on SERIAL_BE300
++	help
++	  Allows console=ttyS0.  The default BE-300 images use the
++	  framebuffer console (tty0) instead.
++
+ config SERIAL_NONSTANDARD
+ 	bool "Non-standard serial port support"
+ 	---help---
+diff --git a/drivers/char/Makefile b/drivers/char/Makefile
+index b927c16bbb1f260d92f5ade04800f71ded2cf0b9..39028db27d3929da609825c497d4b4a91f9d825d 100644
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -70,6 +70,7 @@ obj-$(CONFIG_HW_RANDOM) += hw_random.o
+ obj-$(CONFIG_QIC02_TAPE) += tpqic02.o
+ obj-$(CONFIG_FTAPE) += ftape/
+ obj-$(CONFIG_COBALT_LCD) += lcd.o
++obj-$(CONFIG_SERIAL_BE300) += serial_be300.o
+ obj-$(CONFIG_PPDEV) += ppdev.o
+ obj-$(CONFIG_NWBUTTON) += nwbutton.o
+ obj-$(CONFIG_NWFLASH) += nwflash.o
+diff --git a/drivers/char/serial_be300.c b/drivers/char/serial_be300.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..21bd58496dee5d82377416a150d12d379eabb7fb
+--- /dev/null
++++ b/drivers/char/serial_be300.c
+@@ -0,0 +1,293 @@
++/*
++ * drivers/char/serial_be300.c
++ *
++ * Serial driver for the Casio Cassiopeia BE-300 dock UART: the NEC
++ * D89041F1001 SIU in the VRC4173 companion chip at PA 0x0A008680
++ * (16550-like registers on a 4-byte stride).  Registers ttyS0
++ * (major 4, minor 64), the same node the 2.4.18 BE-300 kernel used.
++ *
++ * Linux 2.6.8.1 rewrite of the linux4be serial_be300.c (John Roark, 2002)
++ * carrying the 2.4.18 fixes: RX is polled from a timer (the SIU interrupt
++ * is not wired up), TX is synchronous, the port runs 115200 8N1 with DTR
++ * and RTS asserted for the emulator's serial1 bridge, and the driver keeps
++ * off the SIU while the Stowaway keyboard owns it (patch 0015).
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/errno.h>
++#include <linux/console.h>
++#include <linux/tty.h>
++#include <linux/tty_driver.h>
++#include <linux/tty_flip.h>
++#include <linux/serial_reg.h>
++#include <linux/jiffies.h>
++#include <linux/timer.h>
++#include <asm/addrspace.h>
++#include <asm/uaccess.h>
++
++#define BE300_UART_BASE		KSEG1ADDR(0x0a008680)
++#define BE300_REG_SHIFT		2
++#define BE300_RX_POLL_HZ	100
++
++static struct tty_driver *be300_driver;
++static struct tty_struct *be300_open_tty;
++static int be300_open_count;
++static struct timer_list be300_rx_timer;
++
++/*
++ * Set by the Stowaway keyboard driver while it is probing or talking to
++ * the dock on this same SIU.  The tty must not read RBR then (it would
++ * steal key bytes) or reprogram LCR (the dock treats a DLAB write as a
++ * reset).  Weak so the driver links without CONFIG_CASIO_BE300_STOWAWAY.
++ */
++extern int be300_stowaway_owns_uart __attribute__((weak));
++
++static int be300_uart_claimed(void)
++{
++	return &be300_stowaway_owns_uart && be300_stowaway_owns_uart;
++}
++
++static inline unsigned int serial_inb(int offset)
++{
++	return *(volatile u8 *)(BE300_UART_BASE + (offset << BE300_REG_SHIFT));
++}
++
++static inline void serial_outb(int offset, unsigned char value)
++{
++	*(volatile u8 *)(BE300_UART_BASE + (offset << BE300_REG_SHIFT)) = value;
++}
++
++static void serial_putc(unsigned char ch)
++{
++	int timeout = 100000;
++
++	while (!(serial_inb(UART_LSR) & UART_LSR_THRE))
++		if (--timeout == 0)
++			return;
++	serial_outb(UART_TX, ch);
++}
++
++/* Divisors for the SIU's 1.152 MHz baud clock (linux4be table). */
++static const int baud_table[] = {
++	110, 10473,
++	300, 3840,
++	600, 1920,
++	1200, 960,
++	2400, 480,
++	4800, 240,
++	9600, 120,
++	19200, 60,
++	38400, 30,
++	57600, 20,
++	115200, 10,
++};
++
++static void be300_configure_uart(int baud)
++{
++	int i, divisor = 0;
++
++	if (!baud)
++		baud = 115200;
++	for (i = 0; i < ARRAY_SIZE(baud_table); i += 2)
++		if (baud_table[i] == baud)
++			divisor = baud_table[i + 1];
++
++	if (divisor) {
++		serial_outb(UART_LCR, UART_LCR_DLAB);
++		serial_outb(UART_DLL, divisor & 0xff);
++		serial_outb(UART_DLM, (divisor >> 8) & 0xff);
++	}
++	serial_outb(UART_LCR, UART_LCR_WLEN8);
++	serial_outb(UART_IER, 0);
++	serial_outb(UART_MCR, UART_MCR_DTR | UART_MCR_RTS);
++	(void)serial_inb(UART_LSR);
++}
++
++static void be300_rx_poll(unsigned long data)
++{
++	struct tty_struct *tty = be300_open_tty;
++	int budget = 256;
++	int pushed = 0;
++
++	while (tty && !be300_uart_claimed() && budget-- > 0 &&
++	       (serial_inb(UART_LSR) & UART_LSR_DR)) {
++		unsigned char ch = serial_inb(UART_RX);
++
++		if (tty->flip.count >= TTY_FLIPBUF_SIZE)
++			break;
++		tty_insert_flip_char(tty, ch, TTY_NORMAL);
++		pushed = 1;
++	}
++	if (pushed)
++		tty_flip_buffer_push(tty);
++
++	mod_timer(&be300_rx_timer, jiffies + (HZ / BE300_RX_POLL_HZ ?: 1));
++}
++
++static int be300_serial_open(struct tty_struct *tty, struct file *filp)
++{
++	if (tty->index != 0)
++		return -ENODEV;
++
++	if (be300_open_count++ == 0 && !be300_uart_claimed())
++		be300_configure_uart(tty_get_baud_rate(tty));
++	be300_open_tty = tty;
++	return 0;
++}
++
++static void be300_serial_close(struct tty_struct *tty, struct file *filp)
++{
++	if (--be300_open_count <= 0) {
++		be300_open_count = 0;
++		be300_open_tty = NULL;
++	}
++}
++
++static int be300_serial_write(struct tty_struct *tty, int from_user,
++			      const unsigned char *buf, int count)
++{
++	int i;
++
++	for (i = 0; i < count; i++) {
++		unsigned char ch;
++
++		if (from_user) {
++			if (get_user(ch, buf + i))
++				return i ? i : -EFAULT;
++		} else {
++			ch = buf[i];
++		}
++		if (!be300_uart_claimed())
++			serial_putc(ch);
++	}
++	return i;
++}
++
++static void be300_serial_put_char(struct tty_struct *tty, unsigned char ch)
++{
++	if (!be300_uart_claimed())
++		serial_putc(ch);
++}
++
++static int be300_serial_write_room(struct tty_struct *tty)
++{
++	return 256;
++}
++
++static int be300_serial_chars_in_buffer(struct tty_struct *tty)
++{
++	return 0;
++}
++
++static void be300_serial_set_termios(struct tty_struct *tty,
++				     struct termios *old)
++{
++	if (!be300_uart_claimed())
++		be300_configure_uart(tty_get_baud_rate(tty));
++}
++
++static struct tty_operations be300_serial_ops = {
++	.open		= be300_serial_open,
++	.close		= be300_serial_close,
++	.write		= be300_serial_write,
++	.put_char	= be300_serial_put_char,
++	.write_room	= be300_serial_write_room,
++	.chars_in_buffer = be300_serial_chars_in_buffer,
++	.set_termios	= be300_serial_set_termios,
++};
++
++static int __init be300_serial_init(void)
++{
++	struct tty_driver *drv;
++
++	drv = alloc_tty_driver(1);
++	if (!drv)
++		return -ENOMEM;
++
++	drv->owner = THIS_MODULE;
++	drv->driver_name = "serial_be300";
++	drv->name = "ttyS";
++	drv->devfs_name = "tts/";
++	drv->major = TTY_MAJOR;
++	drv->minor_start = 64;
++	drv->type = TTY_DRIVER_TYPE_SERIAL;
++	drv->subtype = SERIAL_TYPE_NORMAL;
++	drv->init_termios = tty_std_termios;
++	drv->init_termios.c_cflag = B115200 | CS8 | CREAD | HUPCL | CLOCAL;
++	drv->flags = TTY_DRIVER_REAL_RAW;
++	tty_set_operations(drv, &be300_serial_ops);
++
++	if (tty_register_driver(drv)) {
++		printk(KERN_ERR "serial_be300: tty_register_driver failed\n");
++		put_tty_driver(drv);
++		return -EIO;
++	}
++	be300_driver = drv;
++
++	if (!be300_uart_claimed())
++		be300_configure_uart(115200);
++
++	init_timer(&be300_rx_timer);
++	be300_rx_timer.function = be300_rx_poll;
++	mod_timer(&be300_rx_timer, jiffies + 1);
++
++	printk(KERN_INFO "ttyS0 at 0xAA008680 is a NEC D89041F1001 UART "
++	       "(VRC4173 SIU), 115200 8N1, RX polled at %d Hz\n",
++	       BE300_RX_POLL_HZ);
++	return 0;
++}
++
++module_init(be300_serial_init);
++
++#ifdef CONFIG_SERIAL_BE300_CONSOLE
++static void be300_console_write(struct console *co, const char *s,
++				unsigned count)
++{
++	if (be300_uart_claimed())
++		return;
++	while (count--) {
++		if (*s == '\n')
++			serial_putc('\r');
++		serial_putc(*s++);
++	}
++}
++
++static struct tty_driver *be300_console_device(struct console *co, int *index)
++{
++	*index = co->index;
++	return be300_driver;
++}
++
++static int __init be300_console_setup(struct console *co, char *options)
++{
++	if (co->index != 0)
++		co->index = 0;
++	if (!be300_uart_claimed())
++		be300_configure_uart(115200);
++	return 0;
++}
++
++static struct console be300_console = {
++	.name	= "ttyS",
++	.write	= be300_console_write,
++	.device	= be300_console_device,
++	.setup	= be300_console_setup,
++	.flags	= CON_PRINTBUFFER,
++	.index	= -1,
++};
++
++static int __init be300_console_init(void)
++{
++	register_console(&be300_console);
++	return 0;
++}
++
++console_initcall(be300_console_init);
++#endif /* CONFIG_SERIAL_BE300_CONSOLE */

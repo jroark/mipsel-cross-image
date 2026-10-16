@@ -1,0 +1,434 @@
+BE-300 2.6.8.1: NAND MTD driver over the VRC4173 XFER engine.
+
+Port of the 2.4.18 nand_be300.c (which follows the 4.2.9
+board/casio-be300/nand.c): a plain mtd_info over the XFER engine at PA
+0x0A00A4xx / 0x0A00B000 with the ptable/spl/kernel/rootfs partitions
+written by tools/mk_be300_nand.py.  The JFFS2 root lives on mtd3.
+
+Registered as MTD_NORFLASH: the emulator synthesizes Casio NANDWRITER
+tags in OOB and drops OOB writes, so 2.6.8 JFFS2's NAND mode would read
+every block as bad/unclean.  In NOR mode cleanmarkers stay in the data
+area and OOB is never touched -- the behaviour 2.4.18 JFFS2 had.
+
+---
+ arch/mips/Kconfig                     |   9 +
+ arch/mips/vr41xx/casio-be300/Makefile |   2 +
+ arch/mips/vr41xx/casio-be300/nand.c   | 379 ++++++++++++++++++++++++++
+ 3 files changed, 390 insertions(+)
+ create mode 100644 arch/mips/vr41xx/casio-be300/nand.c
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index a19757ea8a13b66d3e3dad3ac20280461a1a07c5..3d0d7436508b898273f7e912b0cf43d7c102d084 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -160,6 +160,15 @@ config CASIO_BE300_SDRAM_MB
+ 	  has 16 MiB; larger values are only valid on the emulator with a
+ 	  matching --sdram option.
+ 
++config CASIO_BE300_NAND
++	bool "BE-300 16 MiB NAND flash (VRC4173 XFER engine)"
++	depends on CASIO_BE300 && MTD
++	default y
++	help
++	  MTD driver for the on-board Samsung K9F2808 NAND.  Registers the
++	  ptable/spl/kernel/rootfs partitions written by
++	  tools/mk_be300_nand.py; rootfs (mtd3) carries the JFFS2 root.
++
+ config TOSHIBA_JMR3927
+ 	bool "Support for Toshiba JMR-TX3927 board"
+ 	depends on MIPS32
+diff --git a/arch/mips/vr41xx/casio-be300/Makefile b/arch/mips/vr41xx/casio-be300/Makefile
+index 8bfd6d257cca2fcad374c0fcb29f0d96ce9856e1..7851ad7292869382e2413017aade1ec9e9c58bb6 100644
+--- a/arch/mips/vr41xx/casio-be300/Makefile
++++ b/arch/mips/vr41xx/casio-be300/Makefile
+@@ -3,3 +3,5 @@
+ #
+ 
+ obj-y	:= init.o setup.o
++
++obj-$(CONFIG_CASIO_BE300_NAND)	+= nand.o
+diff --git a/arch/mips/vr41xx/casio-be300/nand.c b/arch/mips/vr41xx/casio-be300/nand.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5c2b5f6dcc269409a9892e82f4c010c2c3d0a08
+--- /dev/null
++++ b/arch/mips/vr41xx/casio-be300/nand.c
+@@ -0,0 +1,379 @@
++/*
++ * arch/mips/vr41xx/casio-be300/nand.c
++ *
++ * Custom MTD driver for the Casio BE-300 NAND (Linux 2.6.8.1 port of the
++ * 2.4.18 nand_be300.c, itself modeled on the 4.2.9 board/casio-be300/nand.c).
++ * Drives the VRC4173 NAND XFER engine (PA 0x0A00A4xx + 0x0A00B000) directly
++ * and registers a plain `struct mtd_info`; the 2.6.8 NAND framework expects
++ * direct-IO CLE/ALE/NCE access, which is not how the VRC4173 exposes the
++ * chip (and the legacy DIO ports collide with the PCMCIA window used by
++ * NE2000/CF).
++ *
++ * The device is registered as MTD_NORFLASH on purpose.  The emulator
++ * synthesizes Casio NANDWRITER tags in the OOB area and drops OOB writes,
++ * so 2.6.8 JFFS2's NAND mode (OOB cleanmarkers, OOB bad-block byte) would
++ * see every block as bad or unclean.  In NOR mode JFFS2 keeps cleanmarkers
++ * in the data area and never touches OOB -- the same behaviour the 2.4.18
++ * JFFS2 had on this driver.  Partial-page writes are handled by
++ * read-modify-write of the whole page.
++ *
++ * The XFER protocol is documented inline in the matching 4.2.9 driver
++ * and verified against the BE-300 emulator (be300-framebuffer source).
++ * Summary:
++ *   * CMD phase   -> XFER_CMD = 0x03; write opcode byte to XFER_ADDR;
++ *                    XFER_ACK = 0; poll XFER_STATUS bit 0.
++ *   * ADDR phase  -> XFER_CMD = 0x06; write up to 3 address bytes
++ *                    (col_lo, page_lo, page_hi) to XFER_ADDR; XFER_ACK = 0.
++ *   * Data stream -> KICK = 1 then MODE = 0x05 (READ) / 0x07 (PROGRAM);
++ *                    poll XFER_STATUS; data flows through STREAM_PORT
++ *                    in 4-byte units (520 bytes per page = 512 data + 8 OOB).
++ *
++ * Layout mirrors tools/mk_be300_nand.py:
++ *   ptable  : 0x000000-0x004000  (RO)
++ *   spl     : 0x004000-0x014000  (RO)
++ *   kernel  : 0x014000-0x500000  (RO)
++ *   rootfs  : 0x500000-0x1000000 (JFFS2, RW)
++ *
++ * Copyright (C) 2026 John Roark
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2.
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/string.h>
++#include <linux/slab.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/partitions.h>
++#include <asm/io.h>
++#include <asm/addrspace.h>
++
++/* VRC4173 XFER engine and stream port (uncached KSEG1 aliases). */
++#define BE300_XFER_BASE		KSEG1ADDR(0x0a00a400)
++#define BE300_STREAM_BASE	KSEG1ADDR(0x0a00b000)
++
++#define XFER_CMD		((volatile u32 *)(BE300_XFER_BASE + 0x14))
++#define XFER_ADDR_BYTE		((volatile u8  *)(BE300_XFER_BASE + 0x20))
++#define XFER_ACK		((volatile u32 *)(BE300_XFER_BASE + 0x30))
++#define XFER_STATUS		((volatile u32 *)(BE300_XFER_BASE + 0x40))
++#define XFER_KICK		((volatile u32 *)(BE300_XFER_BASE + 0x60))
++#define XFER_MODE		((volatile u32 *)(BE300_XFER_BASE + 0x64))
++#define STREAM_PORT		((volatile u32 *)(BE300_STREAM_BASE))
++#define STREAM_PORT_BYTE	((volatile u8  *)(BE300_STREAM_BASE))
++
++#define MODE_READ		0x05
++#define MODE_PROGRAM		0x07
++#define MODE_PROGRAM_OOB2	0x06
++
++#define BE300_PAGE_DATA		512
++#define BE300_PAGE_OOB		16
++#define BE300_PAGE_RAW		(BE300_PAGE_DATA + BE300_PAGE_OOB)
++#define BE300_BLOCK_PAGES	32
++#define BE300_BLOCK_SIZE	(BE300_BLOCK_PAGES * BE300_PAGE_DATA)
++#define BE300_FLASH_SIZE	(16 * 1024 * 1024)
++#define BE300_NUM_BLOCKS	(BE300_FLASH_SIZE / BE300_BLOCK_SIZE)
++
++#define NAND_CMD_READ0		0x00
++#define NAND_CMD_READ1		0x01
++#define NAND_CMD_READOOB	0x50
++#define NAND_CMD_ERASE1		0x60
++#define NAND_CMD_STATUS		0x70
++#define NAND_CMD_SEQIN		0x80
++#define NAND_CMD_READID		0x90
++#define NAND_CMD_ERASE2		0xd0
++#define NAND_CMD_PAGEPROG	0x10
++#define NAND_CMD_RESET		0xff
++
++static struct mtd_info be300_mtd;
++static u8 *be300_page_buf;	/* one PAGE_RAW buffer for read-modify-write */
++
++/* Wait for XFER engine ready. The emulator answers within a few ops; cap at
++ * a generous timeout in case real hardware is slower or the chip stalls. */
++static void xfer_wait_ready(void)
++{
++	unsigned int timeout = 200000;
++
++	while (timeout-- && !(*XFER_STATUS & 1))
++		;
++}
++
++/* Send one NAND command byte. */
++static void nand_send_cmd(u8 cmd)
++{
++	*XFER_CMD = 0x03;
++	*XFER_ADDR_BYTE = cmd;
++	*XFER_ACK = 0;
++	xfer_wait_ready();
++}
++
++/* Send the 3-byte address tuple (col_lo, page_lo, page_hi). The XFER queue
++ * holds exactly 3 bytes; pushing more shifts col out — see the SPL
++ * (board/casio-be300/spl.c) and CLAUDE.md "BE-300 boot path" notes. */
++static void nand_send_addr(u8 col, u32 page)
++{
++	*XFER_CMD = 0x06;
++	*XFER_ADDR_BYTE = col;
++	*XFER_ADDR_BYTE = page & 0xff;
++	*XFER_ADDR_BYTE = (page >> 8) & 0xff;
++	*XFER_ACK = 0;
++}
++
++/* Read one raw 520-byte page (512 data + 8 OOB) from `page` into buf.
++ * The XFER stream is consumed in 4-byte words from STREAM_PORT. */
++static void be300_read_raw_page(u32 page, u8 *buf)
++{
++	int i;
++
++	nand_send_cmd(NAND_CMD_READ0);
++	nand_send_addr(0, page);
++
++	*XFER_KICK = 1;
++	*XFER_MODE = MODE_READ;
++	xfer_wait_ready();
++
++	for (i = 0; i < BE300_PAGE_DATA / 4; i++)
++		((u32 *)buf)[i] = *STREAM_PORT;
++	/* Drain the 8-byte OOB region (we ignore content). */
++	(void)*STREAM_PORT;
++	(void)*STREAM_PORT;
++}
++
++/* Program one full 520-byte page (512 data + 8 OOB). The OOB is ignored by
++ * the emulator (it synthesizes Casio NANDWRITER tags on the fly), so we just
++ * stream 0xFF for the OOB half. After 8 OOB-1 bytes the engine wants
++ * MODE=0x06 to receive the trailing 8 OOB-2 bytes. */
++static void be300_program_page(u32 page, const u8 *data)
++{
++	int i;
++	const u32 *w = (const u32 *)data;
++
++	nand_send_cmd(NAND_CMD_SEQIN);
++	nand_send_addr(0, page);
++
++	*XFER_KICK = 1;
++	*XFER_MODE = MODE_PROGRAM;
++	xfer_wait_ready();
++
++	/* 512 data bytes. */
++	for (i = 0; i < BE300_PAGE_DATA / 4; i++)
++		*STREAM_PORT = w[i];
++
++	/* 8 OOB-1 bytes (all 0xFF — emulator preserves nothing here). */
++	*STREAM_PORT = 0xffffffff;
++	*STREAM_PORT = 0xffffffff;
++
++	/* Hand off to OOB-2 mode for the last 8 OOB bytes. */
++	*XFER_MODE = MODE_PROGRAM_OOB2;
++	xfer_wait_ready();
++	*STREAM_PORT = 0xffffffff;
++	*STREAM_PORT = 0xffffffff;
++
++	nand_send_cmd(NAND_CMD_PAGEPROG);
++}
++
++/* Erase one 16 KiB block (32 pages). */
++static void be300_erase_block(u32 block)
++{
++	u32 first_page = block * BE300_BLOCK_PAGES;
++
++	*XFER_CMD = 0x03;
++	*XFER_ADDR_BYTE = NAND_CMD_ERASE1;
++	*XFER_ACK = 0;
++	xfer_wait_ready();
++
++	/* Block-erase address is 2 bytes (page_lo, page_hi). */
++	*XFER_CMD = 0x06;
++	*XFER_ADDR_BYTE = first_page & 0xff;
++	*XFER_ADDR_BYTE = (first_page >> 8) & 0xff;
++	*XFER_ACK = 0;
++
++	*XFER_CMD = 0x03;
++	*XFER_ADDR_BYTE = NAND_CMD_ERASE2;
++	*XFER_ACK = 0;
++	xfer_wait_ready();
++}
++
++/* MTD callbacks ------------------------------------------------------ */
++
++static int be300_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
++			  size_t *retlen, u_char *buf)
++{
++	u32 page = from / BE300_PAGE_DATA;
++	u32 page_off = from % BE300_PAGE_DATA;
++	size_t copied = 0;
++
++	if (from + len > BE300_FLASH_SIZE)
++		return -EINVAL;
++
++	while (copied < len) {
++		size_t chunk = BE300_PAGE_DATA - page_off;
++
++		if (chunk > len - copied)
++			chunk = len - copied;
++
++		if (page_off == 0 && chunk == BE300_PAGE_DATA) {
++			/* Aligned full-page read — go direct to caller buf. */
++			be300_read_raw_page(page, buf + copied);
++		} else {
++			be300_read_raw_page(page, be300_page_buf);
++			memcpy(buf + copied, be300_page_buf + page_off, chunk);
++		}
++
++		copied += chunk;
++		page_off = 0;
++		page++;
++	}
++
++	*retlen = copied;
++	return 0;
++}
++
++static int be300_mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
++			   size_t *retlen, const u_char *buf)
++{
++	u32 page = to / BE300_PAGE_DATA;
++	u32 page_off = to % BE300_PAGE_DATA;
++	size_t written = 0;
++
++	if (to + len > BE300_FLASH_SIZE)
++		return -EINVAL;
++
++	/* JFFS2 always writes whole pages, but be defensive: implement the
++	 * partial-page case via read-modify-write through be300_page_buf. */
++	while (written < len) {
++		size_t chunk = BE300_PAGE_DATA - page_off;
++
++		if (chunk > len - written)
++			chunk = len - written;
++
++		if (page_off == 0 && chunk == BE300_PAGE_DATA) {
++			be300_program_page(page, buf + written);
++		} else {
++			be300_read_raw_page(page, be300_page_buf);
++			memcpy(be300_page_buf + page_off, buf + written, chunk);
++			be300_program_page(page, be300_page_buf);
++		}
++
++		written += chunk;
++		page_off = 0;
++		page++;
++	}
++
++	*retlen = written;
++	return 0;
++}
++
++static int be300_mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
++{
++	u32 block, num_blocks;
++
++	if (instr->addr % BE300_BLOCK_SIZE ||
++	    instr->len % BE300_BLOCK_SIZE) {
++		instr->state = MTD_ERASE_FAILED;
++		return -EINVAL;
++	}
++	if (instr->addr + instr->len > BE300_FLASH_SIZE) {
++		instr->state = MTD_ERASE_FAILED;
++		return -EINVAL;
++	}
++
++	block = instr->addr / BE300_BLOCK_SIZE;
++	num_blocks = instr->len / BE300_BLOCK_SIZE;
++	while (num_blocks--)
++		be300_erase_block(block++);
++
++	instr->state = MTD_ERASE_DONE;
++	mtd_erase_callback(instr);
++	return 0;
++}
++
++/* Partition table mirrors tools/mk_be300_nand.py. */
++static struct mtd_partition be300_nand_partitions[] = {
++	{
++		.name		= "ptable",
++		.offset		= 0x000000,
++		.size		= 0x004000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "spl",
++		.offset		= 0x004000,
++		.size		= 0x010000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "kernel",
++		.offset		= 0x014000,
++		.size		= 0x4ec000,
++		.mask_flags	= MTD_WRITEABLE,
++	},
++	{
++		.name		= "rootfs",
++		.offset		= 0x500000,
++		.size		= 0xb00000,
++	},
++};
++
++static int __init be300_nand_init(void)
++{
++	int ret;
++
++	be300_page_buf = kmalloc(BE300_PAGE_RAW, GFP_KERNEL);
++	if (!be300_page_buf)
++		return -ENOMEM;
++
++	memset(&be300_mtd, 0, sizeof(be300_mtd));
++	be300_mtd.type		= MTD_NORFLASH;
++	be300_mtd.flags		= MTD_CAP_NORFLASH;
++	be300_mtd.size		= BE300_FLASH_SIZE;
++	be300_mtd.erasesize	= BE300_BLOCK_SIZE;
++	be300_mtd.oobblock	= 0;
++	be300_mtd.oobsize	= 0;
++	be300_mtd.ecctype	= MTD_ECC_NONE;
++	be300_mtd.eccsize	= 0;
++	be300_mtd.name		= "BE-300 NAND";
++	be300_mtd.read		= be300_mtd_read;
++	be300_mtd.write		= be300_mtd_write;
++	be300_mtd.erase		= be300_mtd_erase;
++	be300_mtd.owner		= THIS_MODULE;
++
++	printk(KERN_INFO "BE-300 NAND: 16 MiB Samsung K9F2808 (XFER engine), "
++	       "16 KiB eraseblocks, 512 B pages\n");
++
++#ifdef CONFIG_MTD_PARTITIONS
++	ret = add_mtd_partitions(&be300_mtd, be300_nand_partitions,
++				 sizeof(be300_nand_partitions) /
++				 sizeof(be300_nand_partitions[0]));
++#else
++	ret = add_mtd_device(&be300_mtd);
++#endif
++	if (ret) {
++		printk(KERN_ERR "BE-300 NAND: failed to register MTD: %d\n", ret);
++		kfree(be300_page_buf);
++		be300_page_buf = NULL;
++		return ret;
++	}
++	return 0;
++}
++
++static void __exit be300_nand_exit(void)
++{
++#ifdef CONFIG_MTD_PARTITIONS
++	del_mtd_partitions(&be300_mtd);
++#else
++	del_mtd_device(&be300_mtd);
++#endif
++	kfree(be300_page_buf);
++	be300_page_buf = NULL;
++}
++
++module_init(be300_nand_init);
++module_exit(be300_nand_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("John Roark");
++MODULE_DESCRIPTION("Casio Cassiopeia BE-300 NAND MTD driver (VRC4173 XFER engine)");

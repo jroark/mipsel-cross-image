@@ -1,0 +1,664 @@
+BE-300 2.6.8.1: build with the Debian/Ubuntu GCC 10.3 + binutils + make 4.3.
+
+  * Top-level CFLAGS: -fgnu89-inline (C99 inline emitted duplicate
+    out-of-line copies of header inlines), no stack protector / PIE,
+    -fno-delete-null-pointer-checks, -fno-strict-overflow,
+    -fno-tree-loop-distribute-patterns, plus warning classes the 2004
+    sources trip everywhere.
+  * uaccess.h: get_user() no longer casts its lvalue (cast-as-lvalue) and
+    its asm output temporary is a plain long/long long, not a possibly
+    const typeof(*ptr).
+  * HI/LO: the "h"/"l" asm constraints and the "accum" clobber are gone
+    from GCC; time.c, delay.h and div64.h use C for the high word.
+  * sim.h save_static_function(): tail-jump explicitly into _sys_<name>
+    and mark the bodies used/noinline/noclone.  The wrappers used to fall
+    through into whatever C function followed; GCC 10 reorders functions,
+    so kernel_thread()'s clone landed in sys_pipe (same fix as 2.4).
+  * pg-r4k.c: clear_page/copy_page buffers defined in asm (GCC refuses a
+    function alias of an array).
+  * scall32-o32.S: .purgem before redefining the `sys' macro.
+  * vmlinux.lds is generated as vmlinux.lds (new %.lds: %.lds.S rule):
+    the old vmlinux.lds.s output overwrote vmlinux.lds.S on a
+    case-insensitive host file system.
+  * arch/mips/lib/gcc-helpers.c: __ashldi3/__ashrdi3/__lshrdi3 and an
+    out-of-line strcpy, which GCC 10 calls on its own (no libgcc).
+  * include/linux/init.h: define early_initcall(); kernel.org 2.6.8.1
+    reserved .initcall.early1.init but never defined the macro, so board
+    hooks such as vr41xx_pmu_init silently became implicit declarations.
+  * Small C fixes: giu.c cascade irqaction declared before use, a block
+    scope static prototype in prio_tree.c, vesa_modes declared after
+    struct fb_videomode, mconf.c's shadowed current_menu.
+
+---
+ Makefile                       |  26 +++++++--
+ arch/mips/kernel/Makefile      |   2 +-
+ arch/mips/kernel/cpu-bugs64.c  |   2 +-
+ arch/mips/kernel/scall32-o32.S |   1 +
+ arch/mips/kernel/time.c        |  20 +++----
+ arch/mips/lib/Makefile         |   4 ++
+ arch/mips/lib/gcc-helpers.c    | 103 +++++++++++++++++++++++++++++++++
+ arch/mips/mm/pg-r4k.c          |  28 +++++++--
+ arch/mips/vr41xx/common/giu.c  |   7 ++-
+ include/asm-mips/delay.h       |  15 ++---
+ include/asm-mips/div64.h       |   8 +--
+ include/asm-mips/sim.h         |   9 ++-
+ include/asm-mips/uaccess.h     |   8 +--
+ include/linux/fb.h             |   8 +--
+ include/linux/init.h           |  11 ++++
+ mm/prio_tree.c                 |   4 +-
+ scripts/Makefile.build         |   9 +++
+ scripts/kconfig/mconf.c        |  10 ++--
+ 18 files changed, 218 insertions(+), 57 deletions(-)
+ create mode 100644 arch/mips/lib/gcc-helpers.c
+
+diff --git a/Makefile b/Makefile
+index 86d8af58a9f9d87f794182ef397122001a22093d..18017a4043487847abfab0afa70b930c7b80e8dc 100644
+--- a/Makefile
++++ b/Makefile
+@@ -460,6 +460,20 @@ endif
+ # warn about C99 declaration after statement
+ CFLAGS += $(call check_gcc,-Wdeclaration-after-statement,)
+ 
++# Modern GCC (10.x) compatibility for this 2004 tree:
++#  - gnu89 "extern inline" semantics (C99 inline emits duplicate
++#    out-of-line copies of every header inline);
++#  - no stack protector / PIE (distro defaults the kernel cannot satisfy);
++#  - keep NULL checks and signed-overflow wraparound the code assumes;
++#  - do not turn open-coded loops back into memset/memcpy calls;
++#  - silence warning classes the old code trips everywhere.
++CFLAGS += -fgnu89-inline -fno-stack-protector -fno-pie \
++	  -fno-delete-null-pointer-checks -fno-strict-overflow \
++	  -fno-tree-loop-distribute-patterns \
++	  -Wno-pointer-sign -Wno-unused-but-set-variable \
++	  -Wno-format-security -Wno-address -Wno-array-bounds \
++	  -Wno-stringop-overflow -Wno-zero-length-bounds
++
+ #
+ # INSTALL_PATH specifies where to place the updated kernel and system map
+ # images.  Uncomment if you want to place them anywhere other than root.
+@@ -540,7 +554,7 @@ endef
+ 
+ do_system_map = $(NM) $(1) | grep -v '\(compiled\)\|\(\.o$$\)\|\( [aUw] \)\|\(\.\.ng$$\)\|\(LASH[RL]DI\)' | sort > $(2)
+ 
+-LDFLAGS_vmlinux += -T arch/$(ARCH)/kernel/vmlinux.lds.s
++LDFLAGS_vmlinux += -T arch/$(ARCH)/kernel/vmlinux.lds
+ 
+ #	Generate section listing all symbols and add it into vmlinux
+ #	It's a three stage process:
+@@ -584,13 +598,13 @@ cmd_kallsyms = $(NM) -n $< | $(KALLSYMS) $(foreach x,$(CONFIG_KALLSYMS_ALL),--al
+ .tmp_kallsyms%.S: .tmp_vmlinux%
+ 	$(call cmd,kallsyms)
+ 
+-.tmp_vmlinux1: $(vmlinux-objs) arch/$(ARCH)/kernel/vmlinux.lds.s FORCE
++.tmp_vmlinux1: $(vmlinux-objs) arch/$(ARCH)/kernel/vmlinux.lds FORCE
+ 	$(call if_changed_rule,vmlinux__)
+ 
+-.tmp_vmlinux2: $(vmlinux-objs) .tmp_kallsyms1.o arch/$(ARCH)/kernel/vmlinux.lds.s FORCE
++.tmp_vmlinux2: $(vmlinux-objs) .tmp_kallsyms1.o arch/$(ARCH)/kernel/vmlinux.lds FORCE
+ 	$(call if_changed_rule,vmlinux__)
+ 
+-.tmp_vmlinux3: $(vmlinux-objs) .tmp_kallsyms2.o arch/$(ARCH)/kernel/vmlinux.lds.s FORCE
++.tmp_vmlinux3: $(vmlinux-objs) .tmp_kallsyms2.o arch/$(ARCH)/kernel/vmlinux.lds FORCE
+ 	$(call if_changed_rule,vmlinux__)
+ 
+ endif
+@@ -603,13 +617,13 @@ define rule_vmlinux
+ 	$(rule_verify_kallsyms)
+ endef
+ 
+-vmlinux: $(vmlinux-objs) $(kallsyms.o) arch/$(ARCH)/kernel/vmlinux.lds.s FORCE
++vmlinux: $(vmlinux-objs) $(kallsyms.o) arch/$(ARCH)/kernel/vmlinux.lds FORCE
+ 	$(call if_changed_rule,vmlinux)
+ 
+ #	The actual objects are generated when descending, 
+ #	make sure no implicit rule kicks in
+ 
+-$(sort $(vmlinux-objs)) arch/$(ARCH)/kernel/vmlinux.lds.s: $(vmlinux-dirs) ;
++$(sort $(vmlinux-objs)) arch/$(ARCH)/kernel/vmlinux.lds: $(vmlinux-dirs) ;
+ 
+ # Handle descending into subdirectories listed in $(vmlinux-dirs)
+ # Preset locale variables to speed up the build process. Limit locale
+diff --git a/arch/mips/kernel/Makefile b/arch/mips/kernel/Makefile
+index 3fd45773771eb8fb56b46a9e9db9e13be05e395e..86783790d22c7fe85c808e4cca6e8fb18ba23a2c 100644
+--- a/arch/mips/kernel/Makefile
++++ b/arch/mips/kernel/Makefile
+@@ -2,7 +2,7 @@
+ # Makefile for the Linux/MIPS kernel.
+ #
+ 
+-extra-y		:= head.o init_task.o vmlinux.lds.s
++extra-y		:= head.o init_task.o vmlinux.lds
+ 
+ obj-y		+= cpu-probe.o branch.o entry.o genex.o irq.o process.o \
+ 		   ptrace.o reset.o semaphore.o setup.o signal.o syscall.o \
+diff --git a/arch/mips/kernel/cpu-bugs64.c b/arch/mips/kernel/cpu-bugs64.c
+index 1375d448308b9c189939b1a95d3510a3f2a17ad0..087c50bc8fabf5b84e516f2d6f89aefa539ede93 100644
+--- a/arch/mips/kernel/cpu-bugs64.c
++++ b/arch/mips/kernel/cpu-bugs64.c
+@@ -82,7 +82,7 @@ static inline void mult_sh_align_mod(long *v1, long *v2, long *w,
+ 		".set	pop"
+ 		: "=&r" (lv1), "=r" (lw)
+ 		: "r" (m1), "r" (m2), "r" (s), "I" (0)
+-		: "hi", "lo", "accum");
++		: "hi", "lo");
+ 	/* We have to use single integers for m1 and m2 and a double
+ 	 * one for p to be sure the mulsidi3 gcc's RTL multiplication
+ 	 * instruction has the workaround applied.  Older versions of
+diff --git a/arch/mips/kernel/scall32-o32.S b/arch/mips/kernel/scall32-o32.S
+index 24eab2f9d7dd53b867d059b706ddefe05e5ea049..bcde53177f3a47eb3b1512eab9020b389a15ece3 100644
+--- a/arch/mips/kernel/scall32-o32.S
++++ b/arch/mips/kernel/scall32-o32.S
+@@ -640,6 +640,7 @@ sys_call_table:
+ 	syscalltable
+ 	.size	sys_call_table, . - sys_call_table
+ 
++	.purgem	sys
+ 	.macro	sys function, nargs
+ 	.byte	\nargs
+ 	.endm
+diff --git a/arch/mips/kernel/time.c b/arch/mips/kernel/time.c
+index 0199485a4a8f354174a924fce8ae13cd48cd7472..eb02c13e47db0aba118f5aaa63c8582a8bd44446 100644
+--- a/arch/mips/kernel/time.c
++++ b/arch/mips/kernel/time.c
+@@ -275,10 +275,8 @@ static unsigned long fixed_rate_gettimeoffset(void)
+ 	/* .. relative to previous jiffy (32 bits is enough) */
+ 	count -= timerlo;
+ 
+-	__asm__("multu	%1,%2"
+-		: "=h" (res)
+-		: "r" (count), "r" (sll32_usecs_per_cycle)
+-		: "lo", "accum");
++	/* HI word of the 32x32 product (the "h" asm constraint is gone). */
++	res = ((unsigned long long)count * sll32_usecs_per_cycle) >> 32;
+ 
+ 	/*
+ 	 * Due to possible jiffies inconsistencies, we need to check
+@@ -330,10 +328,8 @@ static unsigned long calibrate_div32_gettimeoffset(void)
+ 	/* .. relative to previous jiffy (32 bits is enough) */
+ 	count -= timerlo;
+ 
+-	__asm__("multu  %1,%2"
+-		: "=h" (res)
+-		: "r" (count), "r" (quotient)
+-		: "lo", "accum");
++	/* HI word of the 32x32 product (the "h" asm constraint is gone). */
++	res = ((unsigned long long)count * quotient) >> 32;
+ 
+ 	/*
+ 	 * Due to possible jiffies inconsistencies, we need to check
+@@ -375,7 +371,7 @@ static unsigned long calibrate_div64_gettimeoffset(void)
+ 				: "r" (timerhi), "m" (timerlo),
+ 				  "r" (tmp), "r" (USECS_PER_JIFFY),
+ 				  "r" (USECS_PER_JIFFY_FRAC)
+-				: "hi", "lo", "accum");
++				: "hi", "lo");
+ 			cached_quotient = quotient;
+ 		}
+ 	}
+@@ -386,10 +382,8 @@ static unsigned long calibrate_div64_gettimeoffset(void)
+ 	/* .. relative to previous jiffy (32 bits is enough) */
+ 	count -= timerlo;
+ 
+-	__asm__("multu	%1,%2"
+-		: "=h" (res)
+-		: "r" (count), "r" (quotient)
+-		: "lo", "accum");
++	/* HI word of the 32x32 product (the "h" asm constraint is gone). */
++	res = ((unsigned long long)count * quotient) >> 32;
+ 
+ 	/*
+ 	 * Due to possible jiffies inconsistencies, we need to check
+diff --git a/arch/mips/lib/Makefile b/arch/mips/lib/Makefile
+index 92b5947e5afc23bbb80ddef1f732ade4e0dcb41f..da49980416409f8fc711408c0d4e6b36853be8e8 100644
+--- a/arch/mips/lib/Makefile
++++ b/arch/mips/lib/Makefile
+@@ -5,4 +5,8 @@
+ lib-y	+= csum_partial_copy.o dec_and_lock.o memcpy.o promlib.o strlen_user.o \
+ 	   strncpy_user.o strnlen_user.o
+ 
++# Calls GCC 10 synthesizes itself (no libgcc in the kernel).
++obj-y	+= gcc-helpers.o
++CFLAGS_gcc-helpers.o := -fno-builtin
++
+ EXTRA_AFLAGS := $(CFLAGS)
+diff --git a/arch/mips/lib/gcc-helpers.c b/arch/mips/lib/gcc-helpers.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a61d7eba144c6134e6505c1daaeec4a440e92ba
+--- /dev/null
++++ b/arch/mips/lib/gcc-helpers.c
+@@ -0,0 +1,103 @@
++/*
++ * Out-of-line helpers that modern GCC emits calls to on its own.
++ *
++ * The kernel does not link libgcc.  GCC 10 lowers 64-bit shifts on o32 to
++ * __ashldi3/__ashrdi3/__lshrdi3, and turns some sprintf()/strcat() patterns
++ * into strcpy() calls even though <asm/string.h> only offers a static
++ * inline strcpy.  This file must not include <linux/string.h> and is built
++ * with -fno-builtin so the bodies are not turned back into the same calls.
++ * The BE-300 kernel is built without modules, so nothing is exported.
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ */
++typedef int si_t;
++typedef unsigned int usi_t;
++
++struct dw_words {
++#ifdef __MIPSEL__
++	si_t low, high;
++#else
++	si_t high, low;
++#endif
++};
++
++typedef union {
++	struct dw_words s;
++	long long ll;
++} dw_t;
++
++long long __ashldi3(long long u, int b)
++{
++	dw_t uu, w;
++	int bm;
++
++	if (b == 0)
++		return u;
++	uu.ll = u;
++	bm = 32 - b;
++	if (bm <= 0) {
++		w.s.low = 0;
++		w.s.high = (usi_t)uu.s.low << -bm;
++	} else {
++		usi_t carries = (usi_t)uu.s.low >> bm;
++
++		w.s.low = (usi_t)uu.s.low << b;
++		w.s.high = ((usi_t)uu.s.high << b) | carries;
++	}
++	return w.ll;
++}
++
++long long __ashrdi3(long long u, int b)
++{
++	dw_t uu, w;
++	int bm;
++
++	if (b == 0)
++		return u;
++	uu.ll = u;
++	bm = 32 - b;
++	if (bm <= 0) {
++		/* w.s.high = 1..1 or 0..0 */
++		w.s.high = uu.s.high >> 31;
++		w.s.low = uu.s.high >> -bm;
++	} else {
++		usi_t carries = (usi_t)uu.s.high << bm;
++
++		w.s.high = uu.s.high >> b;
++		w.s.low = ((usi_t)uu.s.low >> b) | carries;
++	}
++	return w.ll;
++}
++
++long long __lshrdi3(long long u, int b)
++{
++	dw_t uu, w;
++	int bm;
++
++	if (b == 0)
++		return u;
++	uu.ll = u;
++	bm = 32 - b;
++	if (bm <= 0) {
++		w.s.high = 0;
++		w.s.low = (usi_t)uu.s.high >> -bm;
++	} else {
++		usi_t carries = (usi_t)uu.s.high << bm;
++
++		w.s.high = (usi_t)uu.s.high >> b;
++		w.s.low = ((usi_t)uu.s.low >> b) | carries;
++	}
++	return w.ll;
++}
++
++char *strcpy(char *dest, const char *src)
++{
++	char *tmp = dest;
++
++	while ((*dest++ = *src++) != '\0')
++		;
++	return tmp;
++}
++
+diff --git a/arch/mips/mm/pg-r4k.c b/arch/mips/mm/pg-r4k.c
+index 467fdfe2108cccf23da6aad0252b082c7d6a5cc0..fcb36361e60facac0ed2e31a00369e5d36be2c03 100644
+--- a/arch/mips/mm/pg-r4k.c
++++ b/arch/mips/mm/pg-r4k.c
+@@ -37,9 +37,27 @@
+  * With prefetching, 16 byte strides	0xa0 bytes
+  */
+ 
+-static unsigned int clear_page_array[0x130 / 4];
+-
+-void clear_page(void * page) __attribute__((alias("clear_page_array")));
++/*
++ * clear_page/copy_page are generated into these buffers at boot.  Modern
++ * GCC refuses a function alias of an array, so define the storage and the
++ * global function symbol in assembly and reach it from C by asm label.
++ */
++__asm__(
++	"	.data\n"
++	"	.align	3\n"
++	"	.globl	clear_page\n"
++	"	.type	clear_page, @function\n"
++	"clear_page:\n"
++	"	.space	0x130\n"
++	"	.size	clear_page, 0x130\n"
++	"	.globl	copy_page\n"
++	"	.type	copy_page, @function\n"
++	"copy_page:\n"
++	"	.space	0x148\n"
++	"	.size	copy_page, 0x148\n"
++	"	.previous\n");
++
++extern unsigned int clear_page_array[0x130 / 4] __asm__("clear_page");
+ 
+ EXPORT_SYMBOL(clear_page);
+ 
+@@ -51,9 +69,7 @@ EXPORT_SYMBOL(clear_page);
+  * R4600 v2.0:				0x07c bytes
+  * With prefetching, 16 byte strides	0x0b8 bytes
+  */
+-static unsigned int copy_page_array[0x148 / 4];
+-
+-void copy_page(void *to, void *from) __attribute__((alias("copy_page_array")));
++extern unsigned int copy_page_array[0x148 / 4] __asm__("copy_page");
+ 
+ EXPORT_SYMBOL(copy_page);
+ 
+diff --git a/arch/mips/vr41xx/common/giu.c b/arch/mips/vr41xx/common/giu.c
+index bd2978fd510bbefa8d9127e3fb0654300ae29865..fa93b033192c0d56d30f7237aa1e50b862d50555 100644
+--- a/arch/mips/vr41xx/common/giu.c
++++ b/arch/mips/vr41xx/common/giu.c
+@@ -63,6 +63,12 @@
+ 
+ static uint32_t giu_base;
+ 
++static struct irqaction giu_cascade = {
++	.handler	= no_action,
++	.mask		= CPU_MASK_NONE,
++	.name		= "cascade",
++};
++
+ #define read_giuint(offset)		readw(giu_base + (offset))
+ #define write_giuint(val, offset)	writew((val), giu_base + (offset))
+ 
+@@ -303,7 +309,6 @@ struct vr41xx_giuint_cascade {
+ };
+ 
+ static struct vr41xx_giuint_cascade giuint_cascade[GIUINT_NR_IRQS];
+-static struct irqaction giu_cascade = {no_action, 0, CPU_MASK_NONE, "cascade", NULL, NULL};
+ 
+ static int no_irq_number(int irq)
+ {
+diff --git a/include/asm-mips/delay.h b/include/asm-mips/delay.h
+index 91fdf79fd68719ff3118bf941743ed5469746018..0c62eaad67ab2f8028eda155d86981c240018b84 100644
+--- a/include/asm-mips/delay.h
++++ b/include/asm-mips/delay.h
+@@ -49,7 +49,6 @@ static inline void __delay(unsigned long loops)
+ 
+ static inline void __udelay(unsigned long usecs, unsigned long lpj)
+ {
+-	unsigned long lo;
+ 
+ 	/*
+ 	 * The common rates of 1000 and 128 are rounded wrongly by the
+@@ -66,14 +65,12 @@ static inline void __udelay(unsigned long usecs, unsigned long lpj)
+ 	                           0x80000000ULL) >> 32);
+ #endif
+ 
+-	if (sizeof(long) == 4)
+-		__asm__("multu\t%2, %3"
+-		: "=h" (usecs), "=l" (lo)
+-		: "r" (usecs),"r" (lpj));
+-	else if (sizeof(long) == 8)
+-		__asm__("dmultu\t%2, %3"
+-		: "=h" (usecs), "=l" (lo)
+-		: "r" (usecs),"r" (lpj));
++	/* HI word of the product; modern GCC dropped the "h" constraint. */
++#ifdef CONFIG_MIPS64
++	usecs = ((unsigned __int128)usecs * lpj) >> 64;
++#else
++	usecs = ((unsigned long long)usecs * lpj) >> 32;
++#endif
+ 
+ 	__delay(usecs);
+ }
+diff --git a/include/asm-mips/div64.h b/include/asm-mips/div64.h
+index 7e7e2ea0d6cf9c47bc61585ad41d8fc8e17f7172..0b6fe4cc6da6f79b32de0e86bad15fdd8c69a143 100644
+--- a/include/asm-mips/div64.h
++++ b/include/asm-mips/div64.h
+@@ -64,10 +64,10 @@
+ 	__low = __div; \
+ 	__upper = __high; \
+ 	\
+-	if (__high) \
+-		__asm__("divu	$0, %z2, %z3" \
+-			: "=h" (__upper), "=l" (__high) \
+-			: "Jr" (__high), "Jr" (__base)); \
++	if (__high) { \
++		__upper = __high % __base; \
++		__high = __high / __base; \
++	} \
+ 	\
+ 	__mod = do_div64_32(__low, __upper, __low, __base); \
+ 	\
+diff --git a/include/asm-mips/sim.h b/include/asm-mips/sim.h
+index a88c3375055524dfa0c649738333f87b264564cf..0b154a4c9a86fddf65da3b1eb20b52ffd33d3786 100644
+--- a/include/asm-mips/sim.h
++++ b/include/asm-mips/sim.h
+@@ -14,7 +14,12 @@
+ #include <asm/offset.h>
+ 
+ /* Used in declaration of save_static functions.  */
+-#define static_unused static __attribute__((unused))
++/*
++ * The _<symbol> bodies behind save_static_function() are only reached from
++ * the asm wrapper, so GCC must keep them under their own name: no dead-code
++ * removal, inlining or cloning.
++ */
++#define static_unused static __attribute__((used, noinline, noclone))
+ 
+ #define __str2(x) #x
+ #define __str(x) __str2(x)
+@@ -39,6 +44,7 @@ __asm__ (								\
+ 	"sw\t$22,"__str(PT_R22)"($29)\n\t"				\
+ 	"sw\t$23,"__str(PT_R23)"($29)\n\t"				\
+ 	"sw\t$30,"__str(PT_R30)"($29)\n\t"				\
++	"j\t_" #symbol "\n\t"						\
+ 	".end\t" #symbol "\n\t"						\
+ 	".size\t" #symbol",. - " #symbol)
+ 
+@@ -66,6 +72,7 @@ __asm__ (								\
+ 	"sd\t$22,"__str(PT_R22)"($29)\n\t"				\
+ 	"sd\t$23,"__str(PT_R23)"($29)\n\t"				\
+ 	"sd\t$30,"__str(PT_R30)"($29)\n\t"				\
++	"j\t_" #symbol "\n\t"						\
+ 	".end\t" #symbol "\n\t"						\
+ 	".size\t" #symbol",. - " #symbol)
+ 
+diff --git a/include/asm-mips/uaccess.h b/include/asm-mips/uaccess.h
+index e143e4ec62728332c61159f78edf46d7fe5533d3..6cf4a4062e5fa897d86a80b492efb5eb37016081 100644
+--- a/include/asm-mips/uaccess.h
++++ b/include/asm-mips/uaccess.h
+@@ -169,7 +169,7 @@ static inline int verify_area(int type, const void * addr, unsigned long size)
+  * On error, the variable @x is set to zero.
+  */
+ #define get_user(x,ptr) \
+-	__get_user_check((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
++	__get_user_check((x),(ptr),sizeof(*(ptr)))
+ 
+ /*
+  * __put_user: - Write a simple value into user space, with less checking.
+@@ -214,7 +214,7 @@ static inline int verify_area(int type, const void * addr, unsigned long size)
+  * On error, the variable @x is set to zero.
+  */
+ #define __get_user(x,ptr) \
+-	__get_user_nocheck((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
++	__get_user_nocheck((x),(ptr),sizeof(*(ptr)))
+ 
+ struct __large_struct { unsigned long buf[100]; };
+ #define __m(x) (*(struct __large_struct *)(x))
+@@ -232,7 +232,7 @@ struct __large_struct { unsigned long buf[100]; };
+ #define __get_user_nocheck(x,ptr,size)				\
+ ({								\
+ 	long __gu_err;						\
+-	__typeof(*(ptr)) __gu_val;				\
++	__typeof__(__builtin_choose_expr(sizeof(*(ptr)) > 4, 0LL, 0L)) __gu_val;			\
+ 	long __gu_addr;						\
+ 	might_sleep();						\
+ 	__asm__("":"=r" (__gu_val));				\
+@@ -250,7 +250,7 @@ struct __large_struct { unsigned long buf[100]; };
+ #define __get_user_check(x,ptr,size)					\
+ ({									\
+ 	long __gu_err;							\
+-	__typeof__(*(ptr)) __gu_val;					\
++	__typeof__(__builtin_choose_expr(sizeof(*(ptr)) > 4, 0LL, 0L)) __gu_val;				\
+ 	long __gu_addr;							\
+ 	might_sleep();							\
+ 	__asm__("":"=r" (__gu_val));					\
+diff --git a/include/linux/fb.h b/include/linux/fb.h
+index 9186883fcb0f765ce03b3146b571da43a4d35ce7..4006251ae5015fda0fa72664f830d40fbfcb968c 100644
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -723,10 +723,6 @@ extern int fb_get_monitor_limits(unsigned char *edid, struct fb_monspecs *specs)
+ extern struct fb_videomode *fb_create_modedb(unsigned char *edid, int *dbsize);
+ extern void fb_destroy_modedb(struct fb_videomode *modedb);
+ 
+-/* drivers/video/modedb.c */
+-#define VESA_MODEDB_SIZE 34
+-extern const struct fb_videomode vesa_modes[];
+-
+ /* drivers/video/fbcmap.c */
+ extern int fb_alloc_cmap(struct fb_cmap *cmap, int len, int transp);
+ extern void fb_dealloc_cmap(struct fb_cmap *cmap);
+@@ -754,6 +750,10 @@ struct fb_videomode {
+ 	u32 flag;
+ };
+ 
++/* drivers/video/modedb.c (needs the complete struct type above) */
++#define VESA_MODEDB_SIZE 34
++extern const struct fb_videomode vesa_modes[];
++
+ extern int fb_find_mode(struct fb_var_screeninfo *var,
+ 			struct fb_info *info, const char *mode_option,
+ 			const struct fb_videomode *db,
+diff --git a/include/linux/init.h b/include/linux/init.h
+index 7a9f69992516553699058e9b8b5284a60dcd0490..58e7bb40f7cdaa454501105fbbb5b20e889560ee 100644
+--- a/include/linux/init.h
++++ b/include/linux/init.h
+@@ -96,6 +96,17 @@ extern char saved_command_line[];
+ 
+ #define __initcall(fn) device_initcall(fn)
+ 
++/*
++ * MIPS board setup hooks run from setup_arch() via do_earlyinitcalls().
++ * arch/mips/kernel/vmlinux.lds.S collects .initcall.early1.init, but the
++ * kernel.org 2.6.8.1 tree never defined the macro the boards use, so
++ * early_initcall(fn) silently became an implicit-int declaration and the
++ * hook (e.g. vr41xx_pmu_init) never ran.
++ */
++#define early_initcall(fn) \
++	static initcall_t __initcall_##fn __attribute_used__ \
++	__attribute__((__section__(".initcall.early1.init"))) = fn
++
+ #define __exitcall(fn) \
+ 	static exitcall_t __exitcall_##fn __exit_call = fn
+ 
+diff --git a/mm/prio_tree.c b/mm/prio_tree.c
+index 6cd41a831e2d71e9c1ae7e7877ac289c5f9cb217..bc24613694f2359ff857aaeadf50b88b763db5fd 100644
+--- a/mm/prio_tree.c
++++ b/mm/prio_tree.c
+@@ -87,11 +87,11 @@ static inline unsigned long prio_tree_maxindex(unsigned int bits)
+  * However, this function is used rarely and the common case performance is
+  * not bad.
+  */
++static void prio_tree_remove(struct prio_tree_root *, struct prio_tree_node *);
++
+ static struct prio_tree_node *prio_tree_expand(struct prio_tree_root *root,
+ 		struct prio_tree_node *node, unsigned long max_heap_index)
+ {
+-	static void prio_tree_remove(struct prio_tree_root *,
+-					struct prio_tree_node *);
+ 	struct prio_tree_node *first = NULL, *prev, *last = NULL;
+ 
+ 	if (max_heap_index > prio_tree_maxindex(root->index_bits))
+diff --git a/scripts/Makefile.build b/scripts/Makefile.build
+index 008ac6cfd40511f3ee16bdaf49d5d46cfcf08718..fc1db753255d67caa86cdfe4360393d4ec7e2973 100644
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -200,6 +200,15 @@ cmd_as_s_S       = $(CPP) $(a_flags)   -o $@ $<
+ %.s: %.S FORCE
+ 	$(call if_changed_dep,as_s_S)
+ 
++# Linker scripts: %.lds.S -> %.lds.  A distinct suffix keeps the output from
++# overwriting its own source on case-insensitive file systems (macOS hosts),
++# where %.s and %.S name the same file.
++quiet_cmd_cpp_lds_S = LDS $(quiet_modtag) $@
++cmd_cpp_lds_S       = $(CPP) $(a_flags) $(AFLAGS_$(*F).lds.o) -o $@ $<
++
++%.lds: %.lds.S FORCE
++	$(call if_changed_dep,cpp_lds_S)
++
+ quiet_cmd_as_o_S = AS $(quiet_modtag)  $@
+ cmd_as_o_S       = $(CC) $(a_flags) -c -o $@ $<
+ 
+diff --git a/scripts/kconfig/mconf.c b/scripts/kconfig/mconf.c
+index 6f8bf9904da9846e7db23330004c31f71a9a538d..0977c6c6f9a4307692d8bb43c3e5b9b690f6a3ec 100644
+--- a/scripts/kconfig/mconf.c
++++ b/scripts/kconfig/mconf.c
+@@ -88,7 +88,7 @@ static char *args[1024], **argptr = args;
+ static int indent;
+ static struct termios ios_org;
+ static int rows = 0, cols = 0;
+-static struct menu *current_menu;
++static struct menu *mconf_current_menu;
+ static int child_count;
+ static int do_resize;
+ static int single_menu_mode;
+@@ -289,7 +289,7 @@ static void build_conf(struct menu *menu)
+ 	sym = menu->sym;
+ 	prop = menu->prompt;
+ 	if (!sym) {
+-		if (prop && menu != current_menu) {
++		if (prop && menu != mconf_current_menu) {
+ 			const char *prompt = menu_get_prompt(menu);
+ 			switch (prop->type) {
+ 			case P_MENU:
+@@ -368,7 +368,7 @@ static void build_conf(struct menu *menu)
+ 		}
+ 		cprint_done();
+ 	} else {
+-		if (menu == current_menu) {
++		if (menu == mconf_current_menu) {
+ 			cprint(":%p", menu);
+ 			cprint("---%*c%s", indent + 1, ' ', menu_get_prompt(menu));
+ 			goto conf_childs;
+@@ -450,7 +450,7 @@ static void conf(struct menu *menu)
+ 		cprint("%d", cols);
+ 		cprint("%d", rows - 10);
+ 		cprint("%s", active_entry);
+-		current_menu = menu;
++		mconf_current_menu = menu;
+ 		build_conf(menu);
+ 		if (!child_count)
+ 			break;
+@@ -616,7 +616,7 @@ static void conf_choice(struct menu *menu)
+ 		cprint("70");
+ 		cprint("6");
+ 
+-		current_menu = menu;
++		mconf_current_menu = menu;
+ 		for (child = menu->list; child; child = child->next) {
+ 			if (!menu_is_visible(child))
+ 				continue;

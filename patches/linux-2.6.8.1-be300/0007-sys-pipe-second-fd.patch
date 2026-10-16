@@ -1,0 +1,30 @@
+BE-300 2.6.8.1: keep sys_pipe()'s second descriptor store.
+
+Same hazard as 2.4 patch 0014: the write end goes back in $v1 of the
+trap frame that the by-value `regs' argument aliases, a store GCC 10 can
+delete as dead.  2.6.8.1 already declares the parameter volatile; make
+the store go through an explicit volatile pointer too, matching 2.4.
+
+---
+ arch/mips/kernel/syscall.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/arch/mips/kernel/syscall.c b/arch/mips/kernel/syscall.c
+index 16519f7e8c3bafd608fe573d7407a8dc82fa1748..77e96c60b84884aa5baa845e137a9f6ab373e14c 100644
+--- a/arch/mips/kernel/syscall.c
++++ b/arch/mips/kernel/syscall.c
+@@ -46,7 +46,13 @@ asmlinkage int sys_pipe(nabi_no_regargs volatile struct pt_regs regs)
+ 		res = error;
+ 		goto out;
+ 	}
+-	regs.regs[3] = fd[1];
++	/*
++	 * The write end goes back in $v1 of the caller's trap frame, which
++	 * `regs' (passed by value on the stack) aliases.  GCC 10 sees a dead
++	 * store to a by-value argument and deletes it, so every pipe() got a
++	 * garbage second descriptor; store through a volatile pointer.
++	 */
++	((volatile struct pt_regs *)&regs)->regs[3] = fd[1];
+ 	res = fd[0];
+ out:
+ 	return res;

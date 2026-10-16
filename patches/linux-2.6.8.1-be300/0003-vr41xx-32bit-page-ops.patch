@@ -1,0 +1,44 @@
+BE-300 2.6.8.1: keep VR41xx clear_page/copy_page on 32-bit loads/stores.
+
+VR41xx is MIPS III, so the generic probe reports a 64-bit zero register
+and pg-r4k.c generates sd/ld page operations even for this 32-bit kernel.
+The BE-300 emulator executes 32-bit instructions only (same constraint as
+the 4.2.9 port's clear_word_size/copy_word_size = 4), so the new
+mach-vr41xx/cpu-feature-overrides.h turns the 64-bit register features
+off for CONFIG_MIPS32.
+
+---
+ .../mach-vr41xx/cpu-feature-overrides.h       | 24 +++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+ create mode 100644 include/asm-mips/mach-vr41xx/cpu-feature-overrides.h
+
+diff --git a/include/asm-mips/mach-vr41xx/cpu-feature-overrides.h b/include/asm-mips/mach-vr41xx/cpu-feature-overrides.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..35d503ed62cd0223215fa96ba3dac2bd01097f99
+--- /dev/null
++++ b/include/asm-mips/mach-vr41xx/cpu-feature-overrides.h
+@@ -0,0 +1,24 @@
++/*
++ * NEC VR41xx CPU feature overrides.
++ *
++ * The VR41xx cores are MIPS III, so the generic probe reports a 64-bit
++ * zero register and the dynamically generated clear_page/copy_page in
++ * arch/mips/mm/pg-r4k.c use sd/ld.  This port runs a 32-bit kernel, and
++ * the BE-300 emulator executes 32-bit instructions only (the same
++ * constraint as the Linux 4.2.9 port's clear_word_size/copy_word_size = 4),
++ * so keep every generated page operation on lw/sw.
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ */
++#ifndef __ASM_MACH_VR41XX_CPU_FEATURE_OVERRIDES_H
++#define __ASM_MACH_VR41XX_CPU_FEATURE_OVERRIDES_H
++
++#ifdef CONFIG_MIPS32
++#define cpu_has_64bit_zero_reg		0
++#define cpu_has_64bit_gp_regs		0
++#define cpu_has_64bit_addresses		0
++#endif
++
++#endif /* __ASM_MACH_VR41XX_CPU_FEATURE_OVERRIDES_H */
