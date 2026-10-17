@@ -24,3 +24,4 @@
 #   and the sys_pipe bug fixed by 0014 (Oct 2026), not a touch problem.
 #   Keep the patch file for future input diagnostics; re-enable by
 #   uncommenting this line.
+0016-be300-2_4-front-buttons-evdev.patch
