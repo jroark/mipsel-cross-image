@@ -64,22 +64,22 @@ CONFIG_EARLY_PRINTK=y
 CONFIG_CMDLINE_BOOL=y
 CONFIG_CMDLINE="earlyprintk console=tty0 consoleblank=0 vt.global_cursor_default=0 root=/dev/mtdblock3 rootfstype=jffs2 rootwait ro"
 
-# Framebuffer — minimal (sfb built into board support). Nano-X owns /dev/fb0
-# directly, so the 16 MiB browser profile omits fbcon/logo/font payloads.
+# Framebuffer console shows kernel and init text before the selected GUI
+# switches tty0 to KD_GRAPHICS and takes ownership of /dev/fb0.
 CONFIG_FB=y
 CONFIG_FB_CFB_FILLRECT=y
 CONFIG_FB_CFB_COPYAREA=y
 CONFIG_FB_CFB_IMAGEBLIT=y
-# CONFIG_FRAMEBUFFER_CONSOLE is not set
-# CONFIG_FONTS is not set
-# CONFIG_FONT_8x8 is not set
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FONTS=y
+CONFIG_FONT_8x8=y
 # CONFIG_FONT_8x16 is not set
-# CONFIG_LOGO is not set
+CONFIG_LOGO=y
 # CONFIG_LOGO_LINUX_MONO is not set
 # CONFIG_LOGO_LINUX_VGA16 is not set
 # CONFIG_LOGO_LINUX_CLUT224 is not set
 # CONFIG_LOGO_TINYCORE_CLUT224 is not set
-# CONFIG_LOGO_LINUX4BE_CLUT224 is not set
+CONFIG_LOGO_LINUX4BE_CLUT224=y
 
 # Serial: two UARTs, neither a kernel console (console=tty0 stays authoritative
 # so the askfirst shells never read kernel printk as their stdin).
