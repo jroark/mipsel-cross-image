@@ -21,6 +21,11 @@
 #   opie (default) -- the BusyBox + Opie 1.2.5 / Qt-Embedded 2.3.10 uClibc-ng
 #                     userspace shared with the 2.4.18 and 4.2.9 OPIE images
 #                     (scripts/stage_legacy_opie_rootfs.sh), on mtd3.
+#   mw             -- the 2003 linux4.be Microwindows/Nano-X donor rootfs from
+#                     vmlinux-mw (BE300_2_6_RAMDISK_SRC overrides), shared
+#                     with the 2.4.18 mw image
+#                     (scripts/stage_legacy_mw_rootfs.sh); merges
+#                     configs/be300_2_6_mw.config for BSD ptys.
 #   none           -- kernel only (no rootfs; boots to "VFS: Cannot open
 #                     root device"), for kernel bring-up.
 #
@@ -79,8 +84,9 @@ UI="${BE300_2_6_UI:-opie}"
 CONSOLE="${BE300_2_6_CONSOLE:-tty0}"
 case "$UI" in
     opie) OUT="${BE300_2_6_NAND:-$REPO/linux-4.2.9/be300-2_6-opie.nand}" ;;
+    mw)   OUT="${BE300_2_6_NAND:-$REPO/linux-4.2.9/be300-2_6-mw.nand}" ;;
     none) OUT="${BE300_2_6_NAND:-$REPO/linux-4.2.9/be300-2_6-rebuilt.nand}" ;;
-    *) echo "ERROR: BE300_2_6_UI must be 'opie' or 'none' (got '$UI')" >&2; exit 2 ;;
+    *) echo "ERROR: BE300_2_6_UI must be 'opie', 'mw' or 'none' (got '$UI')" >&2; exit 2 ;;
 esac
 case "$CONSOLE" in
     tty0|ttyS0) ;;
@@ -128,6 +134,14 @@ if [[ "${BE300_2_6_KEEP_BOOTCON:-0}" == "1" ]]; then
     CMDLINE="$CMDLINE keep_bootcon"
 fi
 sed -i "s|^CONFIG_CMDLINE=.*|CONFIG_CMDLINE=\"$CMDLINE\"|" "$SOURCE_DIR/.config"
+if [[ "$UI" == "mw" ]]; then
+    echo "--- merging configs/be300_2_6_mw.config ---"
+    FRAG="$REPO/configs/be300_2_6_mw.config"
+    for opt in $(grep -oE '^CONFIG_[A-Z0-9_]+' "$FRAG"); do
+        sed -i -e "/^$opt=/d" -e "/^# $opt is not set/d" "$SOURCE_DIR/.config"
+    done
+    grep -E '^CONFIG_' "$FRAG" >> "$SOURCE_DIR/.config"
+fi
 "${KMAKE[@]}" oldconfig </dev/null >/dev/null
 echo "  cmdline  = $CMDLINE"
 
@@ -159,6 +173,12 @@ if [[ "$UI" == "opie" ]]; then
         --out "$JFFS2_ROOTFS" \
         --console "$CONSOLE" \
         --sysfs
+elif [[ "$UI" == "mw" ]]; then
+    JFFS2_ROOTFS="$REPO/linux-4.2.9/rootfs-2_6-mw.jffs2"
+    bash "$REPO/scripts/stage_legacy_mw_rootfs.sh" \
+        --donor "${BE300_2_6_RAMDISK_SRC:-$REPO/vmlinux-mw}" \
+        --devtable "$REPO/board/casio-be300/be300_2_6_devtable.txt" \
+        --out "$JFFS2_ROOTFS"
 fi
 
 # 6. Pack: SPL + flat kernel + JFFS2 mtd3 (tools/pack_legacy_kernel_nand.py

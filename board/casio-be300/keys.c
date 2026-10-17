@@ -5,8 +5,13 @@
  *
  * The BE-300 has 8 physical buttons read via two byte registers on the
  * companion chip:
- *   0xAA00A042 (set1): OK, ESC, UP, DOWN, RIGHT, LEFT
- *   0xAA00A043 (set2): Rocket (modifier), Power
+ *   0xAA00A044 (set1): OK, ESC, UP, DOWN, RIGHT, LEFT
+ *   0xAA00A045 (set2): Rocket (modifier), Power
+ *
+ * Each sample starts with a throwaway 16-bit read of 0xAA00A042, as the
+ * stock WinCE keybddr.dll does.  The 2002 linux4.be scan_be300.c read the
+ * bitmap from 0xAA00A042/0xAA00A043; keybddr.dll and the emulator model
+ * built from it use 0xAA00A044/0xAA00A045.
  *
  * A bit value of 1 means the button is currently pressed.
  *
@@ -44,8 +49,9 @@
 #include <asm/io.h>
 
 #define BE300_KEYS_POLL_MS	50
-#define BE300_REG_SET1		0xAA00A042
-#define BE300_REG_SET2		0xAA00A043
+#define BE300_REG_LATCH		0xAA00A042
+#define BE300_REG_SET1		0xAA00A044
+#define BE300_REG_SET2		0xAA00A045
 
 /* Set 1 bit masks */
 #define BE300_BTN_OK		0x04
@@ -112,11 +118,15 @@ static void be300_ctrl_c(struct input_dev *input)
 static void be300_keys_poll(struct input_polled_dev *dev)
 {
 	struct input_dev *input = dev->input;
-	u8 set1 = readb((void __iomem *)BE300_REG_SET1);
-	u8 set2 = readb((void __iomem *)BE300_REG_SET2);
-	u8 changed1 = set1 ^ be300_state.prev_set1;
-	u8 changed2 = set2 ^ be300_state.prev_set2;
-	int rocket = !!(set2 & BE300_BTN_ROCKET);
+	u8 set1, set2, changed1, changed2;
+	int rocket;
+
+	(void)readw((void __iomem *)BE300_REG_LATCH);
+	set1 = readb((void __iomem *)BE300_REG_SET1);
+	set2 = readb((void __iomem *)BE300_REG_SET2);
+	changed1 = set1 ^ be300_state.prev_set1;
+	changed2 = set2 ^ be300_state.prev_set2;
+	rocket = !!(set2 & BE300_BTN_ROCKET);
 
 	/*
 	 * Detect rising edges on the main buttons. Rocket itself is treated

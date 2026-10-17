@@ -1,0 +1,170 @@
+BE-300 2.4.18: expose the front buttons as a Linux input device.
+
+2.4 had no driver for the BE-300 front buttons (OK, Esc, the d-pad,
+Rocket and Power; live bitmap at 0xAA00A044/0xAA00A045).
+Add keys_be300.c, a polled (50 ms) input_dev named "BE-300 Buttons",
+the 2.4 counterpart of the 4.2.9 and 2.6.8.1 keys.c drivers without
+their Rocket+Up/Down text-entry cycle.  It links after touch_be300 so it
+is /dev/input/event2, as on 2.6.8.1.  Clients such as the patched
+Microwindows ntetris open it by name; CONFIG_INPUT_KEYBDEV also forwards
+the keys to the console.
+
+diff --git a/arch/mips/vr41xx/vr4131/casio-be300/Makefile b/arch/mips/vr41xx/vr4131/casio-be300/Makefile
+--- a/arch/mips/vr41xx/vr4131/casio-be300/Makefile
++++ b/arch/mips/vr41xx/vr4131/casio-be300/Makefile
+@@ -23,6 +23,9 @@
+ # QWS_MOUSE_PROTO=TPanel:/dev/input/event1 wiring.
+ obj-$(CONFIG_CASIO_BE300_STOWAWAY) += stowaway_be300.o
+ obj-$(CONFIG_CASIO_BE300_TOUCH) += touch_be300.o
++# keys_be300 links after touch_be300 so the buttons get /dev/input/event2,
++# matching the 2.6.8.1 evdev order.
++obj-$(CONFIG_INPUT) += keys_be300.o
+ obj-$(CONFIG_CASIO_BE300_CF) += cf_be300.o
+ obj-$(CONFIG_CASIO_BE300_IRQ_CASCADE) += irq_be300.o
+ 
+diff --git a/arch/mips/vr41xx/vr4131/casio-be300/keys_be300.c b/arch/mips/vr41xx/vr4131/casio-be300/keys_be300.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/vr41xx/vr4131/casio-be300/keys_be300.c
+@@ -0,0 +1,141 @@
++/*
++ * arch/mips/vr41xx/vr4131/casio-be300/keys_be300.c
++ *
++ * Polled input driver for the Casio BE-300 front buttons (Linux 2.4.18).
++ *
++ * The live button bitmap is two active-high bytes at 0xAA00A044/0xAA00A045,
++ * sampled after a throwaway 16-bit read of 0xAA00A042 as the stock WinCE
++ * keybddr.dll does.  This is the 2.4 counterpart of the 4.2.9
++ * board/casio-be300/keys.c and the 2.6.8.1 casio-be300/keys.c, without
++ * their Rocket+Up/Down character-cycle text entry:
++ *
++ *   OK    = Enter        Rocket+OK    = Space
++ *   ESC   = Tab          Rocket+ESC   = Backspace
++ *   UP    = Up           DOWN         = Down
++ *   LEFT  = Left         Rocket+LEFT  = Backspace
++ *   RIGHT = Right        PWR          = Power
++ *
++ * The device registers as "BE-300 Buttons" after stowaway_be300 and
++ * touch_be300 (link order, see Makefile), so it is /dev/input/event2 like
++ * on 2.6.8.1.  2.4 has no input_sync(); each press and release is followed
++ * by a type-0/code-0 SYN record as touch_be300 does.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/timer.h>
++#include <linux/input.h>
++#include <linux/string.h>
++
++#define BE300_KEYS_POLL_MS	50
++#define BE300_REG_LATCH		((volatile unsigned short *)0xAA00A042)
++#define BE300_REG_SET1		((volatile unsigned char *)0xAA00A044)
++#define BE300_REG_SET2		((volatile unsigned char *)0xAA00A045)
++
++/* Set 1 bit masks */
++#define BE300_BTN_OK		0x04
++#define BE300_BTN_ESC		0x08
++#define BE300_BTN_UP		0x10
++#define BE300_BTN_DOWN		0x20
++#define BE300_BTN_RIGHT		0x40
++#define BE300_BTN_LEFT		0x80
++
++/* Set 2 bit masks */
++#define BE300_BTN_ROCKET	0x10
++#define BE300_BTN_POWER		0x80
++
++static struct input_dev be300_keys_input;
++static struct timer_list be300_keys_timer;
++static unsigned char prev_set1, prev_set2;
++
++static void be300_tap(int code)
++{
++	input_report_key(&be300_keys_input, code, 1);
++	input_event(&be300_keys_input, EV_SYN, SYN_REPORT, 0);
++	input_report_key(&be300_keys_input, code, 0);
++	input_event(&be300_keys_input, EV_SYN, SYN_REPORT, 0);
++}
++
++static void be300_keys_poll(unsigned long data)
++{
++	unsigned char set1, set2, pressed1, pressed2;
++	int rocket;
++
++	(void)*BE300_REG_LATCH;
++	set1 = *BE300_REG_SET1;
++	set2 = *BE300_REG_SET2;
++	pressed1 = (set1 ^ prev_set1) & set1;
++	pressed2 = (set2 ^ prev_set2) & set2;
++	rocket = !!(set2 & BE300_BTN_ROCKET);
++
++	if (pressed1 & BE300_BTN_OK)
++		be300_tap(rocket ? KEY_SPACE : KEY_ENTER);
++	if (pressed1 & BE300_BTN_ESC)
++		be300_tap(rocket ? KEY_BACKSPACE : KEY_TAB);
++	if (pressed1 & BE300_BTN_UP)
++		be300_tap(KEY_UP);
++	if (pressed1 & BE300_BTN_DOWN)
++		be300_tap(KEY_DOWN);
++	if (pressed1 & BE300_BTN_RIGHT)
++		be300_tap(KEY_RIGHT);
++	if (pressed1 & BE300_BTN_LEFT)
++		be300_tap(rocket ? KEY_BACKSPACE : KEY_LEFT);
++	if (pressed2 & BE300_BTN_POWER)
++		be300_tap(KEY_POWER);
++
++	prev_set1 = set1;
++	prev_set2 = set2;
++
++	mod_timer(&be300_keys_timer,
++		  jiffies + (HZ * BE300_KEYS_POLL_MS + 999) / 1000);
++}
++
++static int __init be300_keys_init(void)
++{
++	memset(&be300_keys_input, 0, sizeof(be300_keys_input));
++	be300_keys_input.name = "BE-300 Buttons";
++	be300_keys_input.idbus = BUS_RS232;	/* 2.4 has no BUS_HOST yet */
++	be300_keys_input.idvendor = 0x1033;	/* NEC */
++	be300_keys_input.idproduct = 0x4173;	/* VRC4173 */
++	be300_keys_input.idversion = 0x0001;
++
++	__set_bit(EV_SYN, be300_keys_input.evbit);	/* ==0; pass SYN gate */
++	__set_bit(EV_KEY, be300_keys_input.evbit);
++	__set_bit(KEY_ENTER, be300_keys_input.keybit);
++	__set_bit(KEY_TAB, be300_keys_input.keybit);
++	__set_bit(KEY_SPACE, be300_keys_input.keybit);
++	__set_bit(KEY_BACKSPACE, be300_keys_input.keybit);
++	__set_bit(KEY_UP, be300_keys_input.keybit);
++	__set_bit(KEY_DOWN, be300_keys_input.keybit);
++	__set_bit(KEY_LEFT, be300_keys_input.keybit);
++	__set_bit(KEY_RIGHT, be300_keys_input.keybit);
++	__set_bit(KEY_POWER, be300_keys_input.keybit);
++
++	input_register_device(&be300_keys_input);
++
++	prev_set1 = *BE300_REG_SET1;
++	prev_set2 = *BE300_REG_SET2;
++	init_timer(&be300_keys_timer);
++	be300_keys_timer.function = be300_keys_poll;
++	be300_keys_timer.expires =
++		jiffies + (HZ * BE300_KEYS_POLL_MS + 999) / 1000;
++	add_timer(&be300_keys_timer);
++
++	printk(KERN_INFO "BE-300 buttons: polled at %d ms\n",
++	       BE300_KEYS_POLL_MS);
++	return 0;
++}
++
++static void __exit be300_keys_exit(void)
++{
++	del_timer_sync(&be300_keys_timer);
++	input_unregister_device(&be300_keys_input);
++}
++
++module_init(be300_keys_init);
++module_exit(be300_keys_exit);

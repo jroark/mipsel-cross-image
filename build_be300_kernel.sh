@@ -1043,6 +1043,8 @@ cp /work/board/microwindows/mou_evdev.c \
    /work/microwindows/src/drivers/mou_evdev.c
 cp /work/board/microwindows/nxweb.c \
    /work/microwindows/src/demos/nanox/nxweb.c
+python3 /work/board/microwindows/patch_nxtetris_be300.py \
+    /work/microwindows/src/demos/nanox/nxtetris.c
 python3 - <<'PY'
 from pathlib import Path
 
@@ -1380,9 +1382,11 @@ make clean >/dev/null 2>&1 || true
 make -C demos/nanox MW_DIR_SRC=/work/microwindows/src clean >/dev/null 2>&1 || true
 rm -rf /work/microwindows/src/obj /work/microwindows/src/lib /work/microwindows/src/bin
 mkdir -p /work/microwindows/src/obj /work/microwindows/src/lib /work/microwindows/src/bin
-MW_CC="$TARGET_CC"
+# Microwindows links with $(CC) $(CFLAGS) $(LDFLAGS) but never EXTRAFLAGS, so
+# the libc flags (musl -specs) must ride in CC or nano-X links Debian glibc.
+MW_CC="$TARGET_CC $TARGET_LIBC_CFLAGS"
 MW_LDFLAGS="-Wl,--gc-sections -Wl,-s $TARGET_STATIC_LDFLAGS $TARGET_LIBC_LDFLAGS"
-MW_EXTRAFLAGS="$TARGET_ARCH_CFLAGS $TARGET_LIBC_CFLAGS -DBE300_TOUCHSCREEN=1 -DFLIP_MOUSE_IN_PORTRAIT_MODE=0 -DX11_RGBTXT=\\\"/usr/share/microwindows/rgb.txt\\\""
+MW_EXTRAFLAGS="$TARGET_ARCH_CFLAGS -DBE300_TOUCHSCREEN=1 -DBE300_HW_BUTTONS=1 -DFLIP_MOUSE_IN_PORTRAIT_MODE=0 -DX11_RGBTXT=\\\"/usr/share/microwindows/rgb.txt\\\""
 MW_BUILD_LOG=/tmp/microwindows_be300_build.log
 MW_MAKE_JOBS="${BE300_MICROWINDOWS_JOBS:-1}"
 if ! make -j"$MW_MAKE_JOBS" default MIPSTOOLSPREFIX="" \
@@ -1395,7 +1399,7 @@ if ! make -j"$MW_MAKE_JOBS" default MIPSTOOLSPREFIX="" \
     tail -160 "$MW_BUILD_LOG"
     exit 1
 fi
-MW_APPS="${BE300_MICROWINDOWS_APPS:-nano-X demo-hello nxlaunch nxterm nxkbd nxweb}"
+MW_APPS="${BE300_MICROWINDOWS_APPS:-nano-X demo-hello nxlaunch nxterm nxkbd nxweb nxtetris}"
 MW_NANOX_TARGETS=""
 for app in $MW_APPS; do
     if [ "$app" != "nano-X" ]; then
@@ -1428,6 +1432,12 @@ for font in 6x13.pcf.gz 6x13B.pcf.gz 7x14.pcf.gz 9x15.pcf.gz cursor.pcf.gz vga.p
     cp "/work/microwindows/src/fonts/pcf/$font" "$ROOTFS/usr/share/microwindows/pcf/" 2>/dev/null || true
 done
 cp /work/microwindows/src/fonts/rgb.txt "$ROOTFS/usr/share/microwindows/rgb.txt"
+# 32x32 launcher icons (nxlaunch rejects any other size).
+mkdir -p "$ROOTFS/usr/share/microwindows/icons"
+for icon in nxterm.ppm nxkbd.pgm nxworld.ppm nxtetris.ppm; do
+    cp "/work/microwindows/src/images/demos/nanox/icons/$icon" \
+       "$ROOTFS/usr/share/microwindows/icons/"
+done
 
 if [ "${BE300_BUILD_DILLO:-1}" != "0" ]; then
     BE300_LIBC="$BE300_LIBC" \
@@ -1442,11 +1452,13 @@ if [ "${BE300_BUILD_DILLO:-1}" != "0" ]; then
 fi
 
 cat > "$ROOTFS/etc/nxlaunch.cnf" << 'NXLAUNCH_CNF'
-# BE-300 Nano-X launcher. Use '-' for iconless buttons to save rootfs space.
+# BE-300 Nano-X launcher. Icons are 32x32 PNM; paths are absolute because
+# the nano-X server, not nxlaunch, opens them.
 $window_background_colour BLACK
-Terminal - /bin/mw-terminal
-Browser - /bin/mw-browser
-Keyboard - /bin/mw-keyboard
+Terminal /usr/share/microwindows/icons/nxterm.ppm /bin/mw-terminal
+Browser /usr/share/microwindows/icons/nxworld.ppm /bin/mw-browser
+Keyboard /usr/share/microwindows/icons/nxkbd.pgm /bin/mw-keyboard
+Tetris /usr/share/microwindows/icons/nxtetris.ppm /bin/nxtetris
 NXLAUNCH_CNF
 
 cat > "$ROOTFS/bin/mw-terminal" << 'MW_TERMINAL'
