@@ -149,44 +149,11 @@ exec /bin/sh -i
 SHWRAP
 chmod 0755 "$JFFS2_WORK/root/usr/bin/mw-shell"
 
-# Patch nxterm's hardcoded window geometry.  The 2003 nxterm binary
-# was built without BE300_TOUCHSCREEN defined, so it uses the source
-# defaults stdcol=80 stdrow=50 (microwindows/src/demos/nanox/nxterm.c
-# lines 75-77), producing a 480x650 px window at 6x13 SystemFixed
-# which is twice the 240x320 LCD in both axes.  The -g flag in the
-# donor binary is advertised but not honored (verified at runtime).
-# Patch the two `li t8, <imm>` instructions in main() that load the
-# initial col/row values:
-#   vaddr 0x406ecc:  ADDIU t8,$0,80  (0x24180050)  -> 38 (0x24180026)
-#   vaddr 0x406fac:  ADDIU t8,$0,50  (0x24180032)  -> 20 (0x24180014)
-# giving a 228x260 px window that fits the LCD with the title bar.
-python3 - "$JFFS2_WORK/root/bin/nxterm" <<'PYEOF'
-import struct, sys
-p = sys.argv[1]
-with open(p, 'rb') as f: d = bytearray(f.read())
-e_phoff = struct.unpack_from('<I', d, 28)[0]
-e_phnum = struct.unpack_from('<H', d, 44)[0]
-def va2off(va):
-    for i in range(e_phnum):
-        base = e_phoff + i*32
-        p_type, p_offset, p_vaddr, _pa, p_filesz, _ms, _f, _a = \
-            struct.unpack_from('<IIIIIIII', d, base)
-        if p_type == 1 and p_vaddr <= va < p_vaddr + p_filesz:
-            return p_offset + (va - p_vaddr)
-    raise SystemExit("vaddr 0x%x not in any LOAD segment" % va)
-off1 = va2off(0x406ecc)  # stdcol: li t8, 80
-off2 = va2off(0x406fac)  # stdrow: li t8, 50
-if bytes(d[off1:off1+4]) != b'\x50\x00\x18\x24':
-    raise SystemExit("nxterm stdcol pattern at file off 0x%x mismatch: got %s" %
-                     (off1, bytes(d[off1:off1+4]).hex()))
-if bytes(d[off2:off2+4]) != b'\x32\x00\x18\x24':
-    raise SystemExit("nxterm stdrow pattern at file off 0x%x mismatch: got %s" %
-                     (off2, bytes(d[off2:off2+4]).hex()))
-d[off1] = 0x26  # 80 -> 38
-d[off2] = 0x14  # 50 -> 20
-open(p, 'wb').write(d)
-print("nxterm patched: stdcol 80->38, stdrow 50->20 (window fits 240x320)")
-PYEOF
+# Replace the donor nxterm with a clean static build from the matching 2003
+# source. The donor binary crashes at pc=0 when launcher fork+execs it; the
+# rebuilt uClibc-ng binary starts normally and uses a 38x20 LCD-sized window.
+"$REPO/board/microwindows/build_nxterm_2003.sh" \
+    "$JFFS2_WORK/root/bin/nxterm"
 
 # Overlay /bin/launcher.cnf with a fuller app set than the donor
 # ships.  Donor stock has Tetris / NanoBreaker / Landmine / Slider /
@@ -215,37 +182,21 @@ echo "[$(date)] mw-launch $*" >> /tmp/mw-launch.log
 LAUN_
 chmod 0755 "$JFFS2_WORK/root/usr/bin/mw-launch"
 
-# Populated launcher.cnf.  Skipping:
-#   - $window_background_image: clears LCD with the bg graphic and
-#     hides the panel.
-#   - the Terminal entry: launching nxterm via launcher fork+exec
-#     (even through /bin/sh or a double-forked /usr/bin/mw-launch)
-#     hits a pc=0 / vaddr=0 TLBL crash before nxterm can render its
-#     window.  nxterm launched directly from rcS works fine, so
-#     rcS launches a persistent nxterm instead and the launcher
-#     panel covers everything else.
-# Apps without dedicated icons use `-`.  mw-launch (small daemon-
-# style shell wrapper that double-forks + redirects stdio to
-# /dev/null) is on the wrapper path in case it helps any other
-# apps avoid the same crash.
+# Populated launcher.cnf. $window_background_image remains omitted because
+# it clears the LCD behind the panel. Keep five entries so the hardcoded
+# portrait panel stays inside the 240x320 screen. Terminal now launches the
+# rebuilt nxterm with the interactive shell wrapper as its child.
 # launcher's panel is hardcoded for a screen larger than the BE-300's
 # 240x320 LCD — empirically only 4-6 tiles fit before the panel
 # either renders off-screen or aborts entirely (verified: 3 entries
 # = panel visible, 12 entries = no panel + pc=0 crash).  Cap at 5
-# apps so the panel lays out cleanly.  Terminal omitted since
-# launcher fork+exec of nxterm crashes (rcS launches it directly).
-# 5 verified-working entries.  Terminal is omitted because
-# launcher-fork-of-nxterm crashes at pc=0 TLBL regardless of
-# wrapper / setsid / detach — the 2003 donor wired Terminal into
-# the cnf aspirationally but nxterm was probably only ever launched
-# from /bin/startx on the original distribution.  rcS auto-launches
-# a persistent nxterm so users still have a shell.
+# apps so the panel lays out cleanly.
 cat > "$JFFS2_WORK/root/bin/launcher.cnf" <<'LAUNCHCNF'
 $screensaver_timeout 120
 
+Terminal bin/nxterm.ppm bin/nxterm usr/bin/mw-shell
 Clock bin/nxclock.pgm bin/nxclock
 Tetris bin/ntetris.ppm bin/ntetris
-Roach bin/nxroach.pgm bin/nxroach
 SoftKbd bin/nxkbd.pgm bin/nxkbd
 Tux bin/tux.ppm bin/tux
 LAUNCHCNF
@@ -411,31 +362,13 @@ done
 # Window manager.
 /bin/nanowm >/tmp/nanowm.log 2>&1 &
 sleep 1
-# Terminal — full-screen on the 240x320 LCD.  /usr/bin/mw-shell exports
-# PS1/TERM/PATH and execs /bin/sh -i.  Requires the BSD pty nodes
-# /dev/ptyp0..15 and /dev/ttyp0..15 (added to be300_2_4_devtable.txt) —
-# the 2003 nxterm binary hardcodes `/dev/ptyp%d` (no fallback) and was
-# silently failing to allocate a pty before those nodes existed.
-#
-# Empirically the 2003 nxterm IGNORES the `[program {args}]` argv tail
-# (verified May 24 2026: mw-shell ran no diagnostics; BusyBox banner
-# from /bin/sh -i appeared regardless).  nxterm reads the SHELL env
-# var to pick what to launch (strings show `SHELL=` + getenv()), so
-# point that at our wrapper.  nxterm also force-sets TERM=vt52 for
-# the child; mw-shell re-exports TERM=vt100 to undo that.
-export SHELL=/usr/bin/mw-shell
 # Touch bridge: /dev/input/event1 -> GrInjectPointerEvent.  Must run
 # AFTER nano-X has created /tmp/.nano-X (the bridge retries the connect
 # up to 30 x 200 ms internally, but we still gate on the socket file
 # above for sanity).
 /usr/bin/be300_nxbridge </dev/null >/tmp/nxbridge.log 2>&1 &
-# Persistent nxterm from rcS so the user has a guaranteed shell to
-# inspect /tmp/mw-launch.log while we debug the launcher-fork-of-
-# nxterm crash.
-cd /
-/bin/nxterm >/tmp/nxterm.log 2>&1 &
-sleep 2
-# launcher renders the tappable app panel.
+# The launcher owns the initial screen. Its Terminal tile starts the rebuilt
+# nxterm with /usr/bin/mw-shell; no hidden persistent terminal is needed.
 /bin/launcher /bin/launcher.cnf >/tmp/launcher.log 2>&1 &
 wait $NANOX
 RCSMW

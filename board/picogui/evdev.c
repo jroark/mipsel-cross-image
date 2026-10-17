@@ -7,7 +7,9 @@
  *
  *   - touchscreen: "BE-300 PIU touchscreen" (event{0..7})
  *   - hardware buttons: "BE-300 Buttons"
- *   - optional Stowaway external keyboard: "Stowaway Keyboard"
+ *   - optional Stowaway external keyboard: "Stowaway Keyboard" on 4.2.9
+ *     (mainline stowaway.c), "BE-300 Stowaway keyboard" on the 2.4.18 and
+ *     2.6.8.1 stowaway_be300 drivers
  *
  * Wire format on Linux 4.2 / 32-bit MIPS / musl is the original 16-byte
  * record; modern userspace headers report a larger struct input_event
@@ -81,6 +83,7 @@ static void evdev_kmsg(const char *fmt, ...)
 #define EVDEV_NAME_TOUCH    "BE-300 PIU touchscreen"
 #define EVDEV_NAME_BUTTONS  "BE-300 Buttons"
 #define EVDEV_NAME_STOWAWAY "Stowaway Keyboard"
+#define EVDEV_NAME_STOWAWAY_LEGACY "BE-300 Stowaway keyboard"
 
 /* Linux 4.2 on 32-bit MIPS reports the original 16-byte evdev record. */
 struct evdev_wire_event {
@@ -168,7 +171,8 @@ scan_input_devices(void)
     is_touch = (strcmp(name, EVDEV_NAME_TOUCH) == 0);
     if (is_touch ||
         strcmp(name, EVDEV_NAME_BUTTONS) == 0 ||
-        strcmp(name, EVDEV_NAME_STOWAWAY) == 0) {
+        strcmp(name, EVDEV_NAME_STOWAWAY) == 0 ||
+        strcmp(name, EVDEV_NAME_STOWAWAY_LEGACY) == 0) {
       add_fd(fd, is_touch, path, name);
       evdev_trace("[evdev] scan: matched %s -> fd=%d touch=%d\n",
                  name, fd, is_touch);
