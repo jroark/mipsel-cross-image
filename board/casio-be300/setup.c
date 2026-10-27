@@ -21,6 +21,8 @@
  * published by the Free Software Foundation.
  */
 #include <linux/init.h>
+#include <linux/be300_hardware.h>
+#include <linux/be300_card.h>
 #include <linux/ioport.h>
 #include <linux/platform_device.h>
 #include <linux/serial_8250.h>
@@ -93,7 +95,7 @@ static int __init casio_be300_setup(void)
 		if (cause)
 			(void)readl(cause);
 		if (ack)
-			writel(0xffffffffu, ack);
+			be300_girq0_source_mask(1);
 		if (cause)
 			iounmap(cause);
 		if (ack)
@@ -284,6 +286,8 @@ static struct platform_device *be300_devices[] __initdata = {
 
 static int __init casio_be300_register_devices(void)
 {
+	if (be300_wireless_card())
+		return platform_device_register(&be300_serial8250_device);
 	return platform_add_devices(be300_devices, ARRAY_SIZE(be300_devices));
 }
 device_initcall(casio_be300_register_devices);

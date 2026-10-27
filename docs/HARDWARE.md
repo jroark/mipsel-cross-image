@@ -210,8 +210,9 @@ kernel. Provide the original archive to complete that verification.
 
 ## Limits
 
-This update covers initialization of the existing hardware paths. New audio
-or vendor Wi-Fi drivers are separate from these board transactions. Existing
+The follow-up [sound and Wi-Fi drivers](WIFI_SOUND.md) add OSS wave output
+and XI-825/WL54-CF station networking. Their interfaces and validation limits
+are documented separately. Existing
 APM status estimates are not calibrated battery measurements. The legacy MTD
 NOR-emulation/OOB/ECC policy is not converted into a verified physical NAND
 FTL by adding unit enables; physical flash writes still require a separately

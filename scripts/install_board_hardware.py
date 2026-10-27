@@ -13,7 +13,7 @@ HEADER = '#include <linux/be300_hardware.h>\n'
 MARKER = '/* BE300 board hardware integration v1. */\n'
 
 def function_body(text, name, change):
-    match = re.search(r'\b' + re.escape(name) + r'\([^;{}]*\)\s*\{', text)
+    match = re.search(r'\b' + re.escape(name) + r'\([^;{}()]*\)\s*\{', text)
     if not match:
         raise RuntimeError('function not found: ' + name)
     start = match.end()
@@ -26,7 +26,7 @@ def function_body(text, name, change):
 
 def inject(body, code):
     """Keep declarations first for the legacy kernel's GNU89 C style."""
-    match = re.match(r'\s*(?:(?:(?:static|const|volatile|unsigned|signed)\s+)*(?:struct\s+\w+|int|long|short|char|u[0-9]+|bool)(?:\s|\*)[^;{}\n]*;\s*)*', body)
+    match = re.match(r'\s*(?:(?:(?:static|const|volatile)\s+)*(?:(?:unsigned|signed)(?:\s+(?:int|long|short|char))?|struct\s+\w+|int|long|short|char|u[0-9]+|bool)(?:\s|\*)[^;{}\n]*;\s*)*', body)
     at = match.end()
     prefix = body[:at].rstrip()
     return (prefix + '\n\n' if prefix else '\n') + code.strip('\n').rstrip() + '\n\t' + body[at:].lstrip(' \t')
@@ -145,9 +145,10 @@ def install(tree, version):
     if not board.is_dir():
         raise RuntimeError('BE-300 board patch series must be applied first')
     source = REPO / 'board/casio-be300'
-    for name in ['hardware.c', 'hardware.h', 'hardware-regs.h']:
+    for name in ['hardware.c', 'hardware.h', 'hardware-regs.h', 'audio.c', 'audio-regs.h', 'wifi.c', 'wifi-proto.h', 'card.h']:
         copy_changed(source / name, board / name)
     copy_changed(source / 'hardware.h', tree / 'include/linux/be300_hardware.h')
+    copy_changed(source / 'card.h', tree / 'include/linux/be300_card.h')
     makefile = board / 'Makefile'
     text = makefile.read_text()
     if 'hardware.o' not in text:
@@ -155,6 +156,57 @@ def install(tree, version):
         if not count:
             raise RuntimeError('board obj-y not found')
         makefile.write_text(text)
+    text = makefile.read_text()
+    if 'audio.o' not in text:
+        makefile.write_text(text + '\nobj-$(CONFIG_BE300_AUDIO) += audio.o\n')
+    if version != '2.4':
+        config = tree / 'arch/mips/Kconfig'
+        text = config.read_text()
+        if 'config BE300_AUDIO' not in text:
+            text += ('\nconfig BE300_AUDIO\n\tbool "BE-300 Casio wave output"\n'
+                     '\tdepends on CASIO_BE300\n\tdefault y\n\tselect SOUND\n')
+            if version == '4.2':
+                text += '\tselect SOUND_OSS_CORE\n'
+            config.write_text(text)
+    text = makefile.read_text()
+    if 'wifi.o' not in text:
+        makefile.write_text(text + '\nobj-$(CONFIG_BE300_WIFI) += wifi.o\n')
+    if version != '2.4':
+        config = tree / 'arch/mips/Kconfig'
+        text = config.read_text()
+        if 'config BE300_WIFI' not in text:
+            text += ('\nconfig BE300_WIFI\n\tbool "BE-300 CF wireless stations"\n'
+                     '\tdepends on CASIO_BE300 && NET && INET\n\tdefault y\n\tselect NETDEVICES\n')
+            text += ('\tselect WIRELESS\n\tselect WIRELESS_EXT\n\tselect WEXT_CORE\n\tselect WEXT_PROC\n' if version == '4.2' else '\tselect NET_RADIO\n')
+            config.write_text(text)
+    ne = tree / ('drivers/net/ethernet/8390/ne.c' if version == '4.2' else 'drivers/net/ne.c')
+    # Generic ISA probing must never issue DP8390 commands to a wireless card.
+    if ne.exists() and 'be300_wired_card()' not in ne.read_text():
+        text = ne.read_text()
+        text = text.replace('#include <linux/module.h>', '#include <linux/module.h>\n#ifdef CONFIG_CASIO_BE300\n#include <linux/be300_card.h>\n#endif', 1)
+        text = function_body(text, 'ne_probe1', lambda b: inject(b, '#ifdef CONFIG_CASIO_BE300\n\tif (!be300_wired_card())\n\t\treturn -ENODEV;\n#endif\n'))
+        ne.write_text(text)
+    if version == '2.4':
+        config = tree / 'arch/mips/config.in'
+        text = config.read_text()
+        if 'CONFIG_BE300_AUDIO' not in text:
+            config.write_text(text + '\nif [ "$CONFIG_CASIO_BE300" = "y" ]; then\n'
+                '  if [ "$CONFIG_SOUND" = "y" ]; then\n'
+                '    define_bool CONFIG_BE300_AUDIO y\n  fi\n'
+                '  if [ "$CONFIG_NET" = "y" -a "$CONFIG_INET" = "y" ]; then\n'
+                '    define_bool CONFIG_BE300_WIFI y\n    define_bool CONFIG_NET_RADIO y\n  fi\nfi\n')
+        cf = board / 'cf_be300.c'
+        text = cf.read_text()
+        if 'be300_wireless_card()' not in text:
+            text = '#include <linux/be300_card.h>\n' + text
+            text = function_body(text, 'be300_ide_default_io_base', lambda b: inject(b, '\tif (be300_wireless_card())\n\t\treturn 0;\n'))
+            cf.write_text(text)
+    setup = board / 'setup.c'
+    text = setup.read_text()
+    old = '*(volatile u32 *)KSEG1ADDR(BE300_GIRQ0_ACK_PA) = 0xffffffffu;'
+    if old in text:
+        text = '#include <linux/be300_hardware.h>\n' + text
+        setup.write_text(text.replace(old, 'be300_girq0_source_mask(1);'))
     fb = board / 'sfb.c' if version == '4.2' else tree / 'drivers/video/sfb.c'
     adapt(fb, lambda s: framebuffer(s, version))
     adapt(board / ('touch.c' if version == '2.6' else 'touch_be300.c'), touch)
