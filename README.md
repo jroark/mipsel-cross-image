@@ -28,7 +28,8 @@ register evidence, display-device interface, source prerequisites and limits.
 Prebuilt reference kernels retain their original hardware drivers.
 
 Source builds also include OSS wave output (`/dev/dsp`, `/dev/mixer`) and
-CIS-selected XI-825/WL54-CF Wi-Fi using Linux Wireless Extensions. See
+CIS-selected XI-825/WL54-CF Wi-Fi using Linux Wireless Extensions, including
+WL54-CF WPA/WPA2 PSK through an optional wpa_supplicant build. See
 [sound and Wi-Fi setup](docs/WIFI_SOUND.md) for formats, firmware, supported
 security, usage and test results.
 

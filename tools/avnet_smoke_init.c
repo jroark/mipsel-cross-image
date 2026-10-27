@@ -1,8 +1,11 @@
 /* Freestanding Linux OSS + WEXT + packet-socket smoke test; no ROMs. */
+#include <sys/socket.h>
 #include <linux/if.h>
 #include <linux/wireless.h>
 #include <linux/soundcard.h>
 #include <linux/if_packet.h>
+#include <linux/un.h>
+#include <linux/random.h>
 static long call(long nr, long x0, long x1, long x2, long x3, long x4, long x5)
 {
 	register long v0 __asm__("v0") = nr;
@@ -51,6 +54,14 @@ void *memset(void *dst, int value, unsigned long n)
 		*p++ = value;
 	return dst;
 }
+void *memcpy(void *dst, const void *src, unsigned long n)
+{
+	unsigned char *d = dst;
+	const unsigned char *s = src;
+	while (n--)
+		*d++ = *s++;
+	return dst;
+}
 static unsigned short pixels[256 * 20];
 static unsigned char scan[4096], frame[1600];
 static short pcm[2048];
@@ -78,6 +89,130 @@ static void copy(void *dst, const void *src, unsigned n)
 	while (n--)
 		*d++ = *s++;
 }
+#ifdef TEST_WPA
+static int contains(const char *p, unsigned n, const char *text)
+{
+	unsigned i, j, size = len(text);
+	for (i = 0; i + size <= n; i++) {
+		for (j = 0; j < size && p[i + j] == text[j]; j++)
+			;
+		if (j == size)
+			return 1;
+	}
+	return 0;
+}
+static void save_log(void)
+{
+	unsigned short line[256];
+	unsigned row;
+	long log = open("/tmp/wpa.log", 0), n;
+	if (fb < 0)
+		return;
+	for (row = 20; row < 320; row++) {
+		memset(line, 0, sizeof(line));
+		n = log < 0 ? 0 : call(4003, log, (long)line, 480, 0, 0, 0);
+		if (n < 0)
+			memset(line, 0, sizeof(line));
+		call(4019, fb, row * 512, 0, 0, 0, 0);
+		call(4004, fb, (long)line, sizeof(line), 0, 0, 0);
+		if (n <= 0)
+			break;
+	}
+	close(log);
+}
+static int supplicant(void)
+{
+	struct sockaddr_un addr;
+	struct {
+		int bits, bytes;
+		unsigned char data[256];
+	} entropy;
+	char *argv[] = {
+		"/sbin/wpa_supplicant",	    "-D",  "wext", "-i", "wlan0", "-c",
+		"/etc/wpa_supplicant.conf", "-dd", 0};
+	long child, log, fd, client, ret, n, attempt;
+	int status, connected = 0;
+	call(4039, (long)"/tmp", 0700, 0, 0, 0, 0);
+	call(4039, (long)"/tmp/wpa", 0700, 0, 0, 0, 0);
+	call(4014, (long)"/dev/urandom", 0020600, (1 << 8) | 9, 0, 0, 0);
+	call(4014, (long)"/dev/random", 0020600, (1 << 8) | 8, 0, 0, 0);
+	fd = open("/entropy.seed", 0);
+	if (fd < 0)
+		return -1;
+	n = call(4003, fd, (long)entropy.data, sizeof(entropy.data), 0, 0, 0);
+	close(fd);
+	if (n != sizeof(entropy.data))
+		return -1;
+	entropy.bits = sizeof(entropy.data) * 8;
+	entropy.bytes = sizeof(entropy.data);
+	fd = open("/dev/random", 2);
+	ret = control(fd, RNDADDENTROPY, &entropy);
+	close(fd);
+	if (ret < 0)
+		return -1;
+	child = call(4002, 0, 0, 0, 0, 0, 0);
+	if (child < 0)
+		return -1;
+	if (!child) {
+		log = call(4005, (long)"/tmp/wpa.log", 0x101, 0600, 0, 0, 0);
+		if (log >= 0) {
+			call(4063, log, 1, 0, 0, 0, 0);
+			call(4063, log, 2, 0, 0, 0, 0);
+		}
+		print("AVNET: executing supplicant\n");
+		call(4011, (long)argv[0], (long)argv, 0, 0, 0, 0);
+		print("supplicant exec failed\n");
+		call(4001, 127, 0, 0, 0, 0, 0);
+		for (;;)
+			;
+	}
+	client = call(4183, AF_UNIX, SOCK_DGRAM, 0, 0, 0, 0);
+	if (client < 0)
+		return -1;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = 1;
+	copy(addr.sun_path, "/tmp/avnet-ctrl", 16);
+	if (call(4169, client, (long)&addr, sizeof(addr), 0, 0, 0) < 0)
+		return -1;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = 1;
+	copy(addr.sun_path, "/tmp/wpa/wlan0", 15);
+	for (attempt = 0; attempt < 40; attempt++) {
+		sleep_seconds(1);
+		if (!(attempt % 5))
+			save_log();
+		if (call(4007, child, (long)&status, 1, 0, 0, 0) == child) {
+			char diagnostic[] = "AVNET: child status 00000000\n";
+			unsigned i;
+			for (i = 0; i < 8; i++)
+				diagnostic[20 + i] = "0123456789abcdef"
+					[(status >> (28 - i * 4)) & 15];
+			log = open("/tmp/wpa.log", 1 | 0x8);
+			if (log >= 0) {
+				call(4004, log, (long)diagnostic,
+				     len(diagnostic), 0, 0, 0);
+				close(log);
+			}
+			close(client);
+			return -1;
+		}
+		if (!connected) {
+			if (call(4170, client, (long)&addr, sizeof(addr), 0, 0,
+				 0) < 0)
+				continue;
+			connected = 1;
+		}
+		call(4180, client, (long)"STATUS", 6, 0, 0, 0);
+		n = call(4176, client, (long)scan, sizeof(scan), 0x40, 0, 0);
+		if (n > 0 && contains((char *)scan, n, "wpa_state=COMPLETED")) {
+			close(client);
+			return 0;
+		}
+	}
+	close(client);
+	return -1;
+}
+#endif
 void _start(void)
 {
 	long console, dsp, mixer, net, raw, n, ret;
@@ -138,7 +273,7 @@ void _start(void)
 	close(mixer);
 	mark(stage++, 0x07e0);
 	print("AVNET: OSS stereo/mixer/drain PASS\n");
-	net = call(4183, 2, 2, 0, 0, 0, 0);
+	net = call(4183, AF_INET, SOCK_DGRAM, 0, 0, 0, 0);
 	if (net < 0)
 		goto fail;
 #ifdef TEST_WIRED
@@ -180,6 +315,12 @@ void _start(void)
 		goto fail;
 	mark(stage++, 0x07e0);
 	print("AVNET: scan PASS\n");
+#ifdef TEST_WPA
+	if (supplicant())
+		goto fail;
+	mark(stage++, 0x07e0);
+	print("AVNET: WPA supplicant COMPLETED\n");
+#else
 #ifdef TEST_WEP
 	w.u.encoding.pointer = (void *)"12345";
 	w.u.encoding.length = 5;
@@ -206,6 +347,7 @@ void _start(void)
 		goto fail;
 	mark(stage++, 0x07e0);
 	print("AVNET: association PASS\n");
+#endif
 	w.u.encoding.pointer = (void *)"12345";
 	w.u.encoding.length = 5;
 	w.u.encoding.flags = IW_ENCODE_OPEN | 1;
@@ -237,13 +379,13 @@ void _start(void)
 	arp[31] = 1;
 	arp[38] = 10;
 	arp[41] = 254;
+	if (call(4169, raw, (long)&address, sizeof(address), 0, 0, 0) < 0)
+		goto fail;
 	if (call(4180, raw, (long)arp, sizeof(arp), 0, (long)&address,
 		 sizeof(address)) != sizeof(arp))
 		goto fail;
 	mark(stage++, 0x07e0);
 	print("AVNET: ARP transmit PASS\n");
-	if (call(4169, raw, (long)&address, sizeof(address), 0, 0, 0) < 0)
-		goto fail;
 	for (i = 0; i < 20; i++) {
 		n = call(4176, raw, (long)frame, sizeof(frame), 0x40, 0, 0);
 		if (n >= 42 && frame[12] == 8 && frame[13] == 6 &&
@@ -265,6 +407,9 @@ fail:
 	mark(stage, 0xf800);
 	print("AVNET: FAIL\n");
 wait:
+#ifdef TEST_WPA
+	save_log();
+#endif
 	for (;;)
 		sleep_seconds(10);
 }

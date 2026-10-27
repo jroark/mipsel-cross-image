@@ -38,6 +38,7 @@
 #endif
 #include "hardware.h"
 #include "card.h"
+#include "wifi-wext.h"
 /* Protocol polling is bounded and runs in process context. Yield when
  * requested so a missing firmware response cannot monopolize this CPU.
  */
@@ -84,7 +85,7 @@ static struct tq_struct wifi_work;
 static void receive_frame(const u8 *bytes, unsigned int n)
 {
 	struct sk_buff *skb;
-	if (!station.connected || n < 14 || n > BW_MAX_FRAME) {
+	if (!bw_data_allowed(&station, bytes, n)) {
 		wifi_stats.rx_dropped++;
 		return;
 	}
@@ -161,13 +162,15 @@ static void link_event(int connected)
 }
 static void poll_card(void)
 {
-	unsigned int i, events;
+	unsigned int i, events, code;
+	const char *failure;
 	int connected = station.connected;
 	union iwreq_data event;
 	for (i = 0; i < 8; i++) {
 		events = WIFI_R16(station.kind == BW_XI825 ? 0x30 : 0x22);
 		if (events == 0xffff) {
 			station.initialized = station.connected = 0;
+			bm_revoke(&station);
 			break;
 		}
 		if (station.kind == BW_XI825) {
@@ -186,15 +189,45 @@ static void poll_card(void)
 				bm_signal(2);
 			}
 			if (events & 16) {
-				if (((WIFI_R16(0x20) >> 8) & 127) == 3)
+				code = (WIFI_R16(0x20) >> 8) & 127;
+				/* Libertas host.h: link lost, deauth, disassoc.
+				 */
+				if (code == 2 || code == 3 || code == 8 || code == 9)
 					station.connected = 0;
+				/* The WE17 custom-event form also works on
+				 * newer cores; the supplicant owns TKIP
+				 * countermeasures.
+				 */
+				if (station.connected && station.wpa &&
+				    ((code == 13 &&
+				      station.group_cipher == 1) ||
+				     (code == 14 &&
+				      station.pairwise_cipher == 1))) {
+					failure =
+						code == 14
+							? "MLME-"
+							  "MICHAELMICFAILURE."
+							  "indication unicast "
+							: "MLME-"
+							  "MICHAELMICFAILURE."
+							  "indication "
+							  "multicast ";
+					memset(&event, 0, sizeof(event));
+					event.data.length = strlen(failure);
+					wireless_send_event(wifi_dev,
+							    IWEVCUSTOM, &event,
+							    (char *)failure);
+				}
 				bm_signal(16);
 			}
 			WIFI_W16(0x22, events & 18);
 		}
 	}
-	if (connected != station.connected)
+	if (connected != station.connected) {
+		if (!station.connected)
+			bm_revoke(&station);
 		link_event(station.connected);
+	}
 	if (!station.initialized) {
 		netif_stop_queue(wifi_dev);
 		skb_queue_purge(&transmit);
@@ -226,6 +259,7 @@ static void wifi_worker(void *unused)
 		goto out;
 	if (be300_wireless_card() != station.kind) {
 		station.connected = station.initialized = 0;
+		bm_revoke(&station);
 		link_event(0);
 		netif_stop_queue(wifi_dev);
 		skb_queue_purge(&transmit);
@@ -235,8 +269,7 @@ static void wifi_worker(void *unused)
 	}
 	poll_card();
 	while ((skb = skb_dequeue(&transmit))) {
-		if (!station.connected || skb->len < 14 ||
-		    skb->len > BW_MAX_FRAME)
+		if (!bw_data_allowed(&station, skb->data, skb->len))
 			ret = -ENETDOWN;
 		else
 			ret = station.kind == BW_XI825
@@ -434,6 +467,11 @@ static int wifi_stop(struct net_device *dev)
 		}
 	}
 	station.connected = station.initialized = station.scanning = 0;
+	bm_revoke(&station);
+	station.wpa = station.assoc_ie_len = 0;
+	station.drop_unencrypted = station.countermeasures = 0;
+	station.requested_channel = station.channel = 0;
+	memset(station.requested_bssid, 0, 6);
 	memset(station.keys, 0, sizeof(station.keys));
 	memset(station.key_len, 0, sizeof(station.key_len));
 	memset(station.command, 0, sizeof(station.command));
@@ -479,6 +517,150 @@ static struct iw_statistics *wifi_get_wireless_stats(struct net_device *dev)
 #define BW_EVENT(info, p, end, e, n) iwe_stream_add_event(p, end, e, n)
 #define BW_POINT(info, p, end, e, bytes) iwe_stream_add_point(p, end, e, bytes)
 #endif
+static int wifi_disconnect(void)
+{
+	int ret = 0;
+	bm_revoke(&station);
+	station.connected = 0;
+	station.ssid_len = 0;
+	association_deadline = 0;
+	skb_queue_purge(&transmit);
+	link_event(0);
+	if (active && station.initialized &&
+	    be300_wireless_card() == station.kind)
+		ret = station.kind == BW_XI825 ? bx_command(2, 0)
+					       : bm_disconnect(&station);
+	return ret;
+}
+/* Called only with wifi_sem held; never log key/IE contents. */
+static int wifi_auth(struct iw_param *param)
+{
+	int index = param->flags & IW_AUTH_INDEX;
+	unsigned int value = param->value;
+	if (index == IW_AUTH_WPA_VERSION || index == IW_AUTH_WPA_ENABLED) {
+		if ((index == IW_AUTH_WPA_VERSION &&
+		     value == IW_AUTH_WPA_VERSION_DISABLED) ||
+		    (index == IW_AUTH_WPA_ENABLED && !value)) {
+			if (station.wpa)
+				(void)wifi_disconnect();
+			station.wpa = 0;
+			return 0;
+		}
+		if (station.kind != BW_WL54)
+			return -EOPNOTSUPP;
+		if (!station.wpa) {
+			memset(station.keys, 0, sizeof(station.keys));
+			memset(station.key_len, 0, sizeof(station.key_len));
+		}
+		if (index == IW_AUTH_WPA_ENABLED) {
+			if (value != 1)
+				return -EINVAL;
+			if (!station.wpa)
+				station.wpa = 3;
+		} else {
+			if (!value || (value & ~(IW_AUTH_WPA_VERSION_WPA |
+						 IW_AUTH_WPA_VERSION_WPA2)))
+				return -EINVAL;
+			station.wpa =
+				((value & IW_AUTH_WPA_VERSION_WPA) ? 1 : 0) |
+				((value & IW_AUTH_WPA_VERSION_WPA2) ? 2 : 0);
+		}
+		return 0;
+	}
+	switch (index) {
+	case IW_AUTH_CIPHER_PAIRWISE:
+	case IW_AUTH_CIPHER_GROUP:
+		if (value == IW_AUTH_CIPHER_NONE ||
+		    value == IW_AUTH_CIPHER_WEP40 ||
+		    value == IW_AUTH_CIPHER_WEP104)
+			value = 0;
+		else if (station.kind != BW_WL54)
+			return -EOPNOTSUPP;
+		else if (value == IW_AUTH_CIPHER_TKIP)
+			value = 1;
+		else if (value == IW_AUTH_CIPHER_CCMP)
+			value = 2;
+		else
+			return -EOPNOTSUPP;
+		if (index == IW_AUTH_CIPHER_PAIRWISE)
+			station.pairwise_cipher = value;
+		else
+			station.group_cipher = value;
+		return 0;
+	case IW_AUTH_KEY_MGMT:
+		return value == 0 || value == IW_AUTH_KEY_MGMT_PSK
+			       ? 0
+			       : -EOPNOTSUPP;
+	case IW_AUTH_80211_AUTH_ALG:
+		if (!value || (value & ~(IW_AUTH_ALG_OPEN_SYSTEM |
+					 IW_AUTH_ALG_SHARED_KEY)))
+			return -EOPNOTSUPP;
+		station.shared_auth = value == IW_AUTH_ALG_SHARED_KEY;
+		return 0;
+	case IW_AUTH_DROP_UNENCRYPTED:
+		if (value > 1)
+			return -EINVAL;
+		station.drop_unencrypted = value;
+		return 0;
+	case IW_AUTH_TKIP_COUNTERMEASURES:
+		if (value > 1)
+			return -EINVAL;
+		station.countermeasures = value;
+		return value ? wifi_disconnect() : 0;
+	case IW_AUTH_PRIVACY_INVOKED:
+	case IW_AUTH_RX_UNENCRYPTED_EAPOL:
+	case IW_AUTH_ROAMING_CONTROL:
+		return value <= 1 ? 0 : -EINVAL;
+	case IW_AUTH_MFP:
+		return value == 0 ? 0 : -EOPNOTSUPP;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+static int wifi_encode_ext(struct iw_point *point, const char *extra)
+{
+	const struct iw_encode_ext *ext = (const void *)extra;
+	unsigned int index = point->flags & IW_ENCODE_INDEX, pairwise, cipher;
+	if (point->length < sizeof(*ext) ||
+	    ext->key_len > point->length - sizeof(*ext) || index > 4)
+		return -EINVAL;
+	index = index ? index - 1 : station.key_index;
+	if (ext->alg == IW_ENCODE_ALG_WEP) {
+		if (station.ssid_len ||
+		    (ext->key_len && ext->key_len != 5 && ext->key_len != 13))
+			return -EINVAL;
+		if (ext->key_len) {
+			memset(station.keys[index], 0, 13);
+			memcpy(station.keys[index], ext->key, ext->key_len);
+			station.key_len[index] = ext->key_len;
+		}
+		if (ext->ext_flags & IW_ENCODE_EXT_SET_TX_KEY)
+			station.key_index = index;
+		return 0;
+	}
+	if (ext->alg == IW_ENCODE_ALG_NONE) {
+		if (ext->key_len)
+			return -EINVAL;
+		memset(station.keys[index], 0, 13);
+		station.key_len[index] = 0;
+		cipher = 0;
+	} else if (ext->alg == IW_ENCODE_ALG_TKIP)
+		cipher = 1;
+	else if (ext->alg == IW_ENCODE_ALG_CCMP)
+		cipher = 2;
+	else
+		return -EOPNOTSUPP;
+	if (station.kind != BW_WL54)
+		return cipher ? -EOPNOTSUPP : 0;
+	pairwise = !(ext->ext_flags & IW_ENCODE_EXT_GROUP_KEY);
+	if (cipher && pairwise && memcmp(ext->addr.sa_data, station.bssid, 6))
+		return -EINVAL;
+	if (!station.initialized) {
+		bm_revoke(&station);
+		return cipher ? -ENETDOWN : 0;
+	}
+	return bm_key(&station, pairwise, cipher, ext->key, ext->key_len);
+}
 static int wifi_ioctl_handler(struct net_device *dev,
 			      struct iw_request_info *info,
 			      union iwreq_data *request, char *extra)
@@ -489,9 +671,69 @@ static int wifi_ioctl_handler(struct net_device *dev,
 	struct iw_event event;
 	struct iw_range *range;
 	struct bw_ap *ap;
+	const struct iw_mlme *mlme;
 	if (down_interruptible(&wifi_sem))
 		return -ERESTARTSYS;
 	switch (info->cmd) {
+	case SIOCSIWAUTH:
+		ret = wifi_auth(&request->param);
+		break;
+	case SIOCSIWGENIE:
+		n = request->data.length;
+		if (n > sizeof(station.assoc_ie) ||
+		    (n && (n < 2 || (unsigned char)extra[1] + 2 != n ||
+			   ((unsigned char)extra[0] != 48 &&
+			    (n < 6 || (unsigned char)extra[0] != 221 ||
+			     memcmp(extra + 2, "\x00\x50\xf2\x01", 4)))))) {
+			ret = -EINVAL;
+			break;
+		}
+		if (n && station.kind != BW_WL54) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		memset(station.assoc_ie, 0, sizeof(station.assoc_ie));
+		memcpy(station.assoc_ie, extra, n);
+		station.assoc_ie_len = n;
+		break;
+	case SIOCSIWENCODEEXT:
+		ret = wifi_encode_ext(&request->encoding, extra);
+		memset(extra, 0, request->encoding.length);
+		break;
+	case SIOCSIWMLME:
+		if (request->data.length < sizeof(*mlme)) {
+			ret = -EINVAL;
+			break;
+		}
+		mlme = (const void *)extra;
+		ret = mlme->cmd == IW_MLME_DEAUTH ||
+				      mlme->cmd == IW_MLME_DISASSOC
+			      ? wifi_disconnect()
+			      : -EOPNOTSUPP;
+		break;
+	case SIOCSIWAP:
+		if (request->ap_addr.sa_family != ARPHRD_ETHER) {
+			ret = -EINVAL;
+			break;
+		}
+		if (!memcmp(request->ap_addr.sa_data, "\0\0\0\0\0\0", 6)) {
+			memset(station.requested_bssid, 0, 6);
+			ret = wifi_disconnect();
+		} else {
+			memcpy(station.requested_bssid,
+			       request->ap_addr.sa_data, 6);
+			if (station.ssid_len && active && station.initialized &&
+			    memcmp(station.bssid, station.requested_bssid, 6)) {
+				skb_queue_purge(&transmit);
+				link_event(0);
+				ret = station.kind == BW_WL54
+					      ? bm_connect(&station)
+					      : -EOPNOTSUPP;
+				if (!ret && station.connected)
+					link_event(1);
+			}
+		}
+		break;
 	case SIOCGIWNAME:
 		strcpy(request->name, station.kind == BW_XI825
 					      ? "IEEE 802.11b"
@@ -515,7 +757,13 @@ static int wifi_ioctl_handler(struct net_device *dev,
 		memset(range, 0, sizeof(*range));
 		request->data.length = sizeof(*range);
 		range->we_version_compiled = WIRELESS_EXT;
-		range->we_version_source = 14;
+		range->we_version_source = WIRELESS_EXT;
+#if WIRELESS_EXT >= 18
+		if (station.kind == BW_WL54)
+			range->enc_capa = IW_ENC_CAPA_WPA | IW_ENC_CAPA_WPA2 |
+					  IW_ENC_CAPA_CIPHER_TKIP |
+					  IW_ENC_CAPA_CIPHER_CCMP;
+#endif
 		range->num_encoding_sizes = 2;
 		range->encoding_size[0] = 5;
 		range->encoding_size[1] = 13;
@@ -529,10 +777,30 @@ static int wifi_ioctl_handler(struct net_device *dev,
 		}
 		break;
 	case SIOCSIWFREQ:
-		ret = -EOPNOTSUPP;
-		break; /* infrastructure AP selects channel */
+		if (!station.wpa || station.kind != BW_WL54) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		if (!request->freq.m) {
+			station.requested_channel = 0;
+			break;
+		}
+		ret = -EINVAL;
+		for (i = 1; i <= 11; i++) {
+			long frequency = 2407 + i * 5;
+			if ((request->freq.e == 0 && request->freq.m == i) ||
+			    (request->freq.e == 6 &&
+			     request->freq.m == frequency) ||
+			    (request->freq.e == 1 &&
+			     request->freq.m == frequency * 100000)) {
+				station.requested_channel = i;
+				ret = 0;
+				break;
+			}
+		}
+		break;
 	case SIOCGIWFREQ:
-		request->freq.m = 0;
+		request->freq.m = station.connected ? station.channel : 0;
 		request->freq.e = 0;
 		break;
 	case SIOCGIWESSID:
@@ -580,7 +848,7 @@ static int wifi_ioctl_handler(struct net_device *dev,
 	case SIOCGIWENCODE:
 		request->encoding.flags =
 			IW_ENCODE_NOKEY | (station.key_index + 1) |
-			(station.key_len[station.key_index]
+			((station.wpa || station.key_len[station.key_index])
 				 ? (station.shared_auth ? IW_ENCODE_RESTRICTED
 							: IW_ENCODE_OPEN)
 				 : IW_ENCODE_DISABLED);
@@ -642,7 +910,7 @@ static int wifi_ioctl_handler(struct net_device *dev,
 		}
 		end = extra + request->data.length;
 		for (i = 0; i < station.count; i++) {
-			if (end - cursor < 200) {
+			if (end - cursor < 400) {
 				ret = -E2BIG;
 				break;
 			}
@@ -653,6 +921,10 @@ static int wifi_ioctl_handler(struct net_device *dev,
 			memcpy(event.u.ap_addr.sa_data, ap->bssid, 6);
 			cursor = BW_EVENT(info, cursor, end, &event,
 					  IW_EV_ADDR_LEN);
+			event.cmd = SIOCGIWMODE;
+			event.u.mode = IW_MODE_INFRA;
+			cursor = BW_EVENT(info, cursor, end, &event,
+					  IW_EV_UINT_LEN);
 			event.cmd = SIOCGIWESSID;
 			event.u.data.length = ap->ssid_len;
 			event.u.data.flags = 1;
@@ -669,6 +941,13 @@ static int wifi_ioctl_handler(struct net_device *dev,
 					? IW_ENCODE_ENABLED | IW_ENCODE_NOKEY
 					: IW_ENCODE_DISABLED;
 			cursor = BW_POINT(info, cursor, end, &event, "");
+			if (ap->ie_len) {
+				event.cmd = IWEVGENIE;
+				event.u.data.length = ap->ie_len;
+				event.u.data.flags = 0;
+				cursor = BW_POINT(info, cursor, end, &event,
+						  ap->ie);
+			}
 		}
 		request->data.length = cursor - extra;
 		request->data.flags = 0;
@@ -681,14 +960,44 @@ static int wifi_ioctl_handler(struct net_device *dev,
 }
 #define BW_HANDLER(cmd) [cmd - SIOCIWFIRST] = wifi_ioctl_handler
 static iw_handler wifi_handlers[] = {
-	BW_HANDLER(SIOCGIWNAME),   BW_HANDLER(SIOCSIWMODE),
-	BW_HANDLER(SIOCGIWMODE),   BW_HANDLER(SIOCSIWFREQ),
-	BW_HANDLER(SIOCGIWFREQ),   BW_HANDLER(SIOCGIWRANGE),
-	BW_HANDLER(SIOCGIWAP),	   BW_HANDLER(SIOCSIWESSID),
-	BW_HANDLER(SIOCGIWESSID),  BW_HANDLER(SIOCSIWSCAN),
-	BW_HANDLER(SIOCGIWSCAN),   BW_HANDLER(SIOCSIWENCODE),
-	BW_HANDLER(SIOCGIWENCODE),
+	BW_HANDLER(SIOCGIWNAME),      BW_HANDLER(SIOCSIWMODE),
+	BW_HANDLER(SIOCGIWMODE),      BW_HANDLER(SIOCSIWFREQ),
+	BW_HANDLER(SIOCGIWFREQ),      BW_HANDLER(SIOCGIWRANGE),
+	BW_HANDLER(SIOCGIWAP),	      BW_HANDLER(SIOCSIWAP),
+	BW_HANDLER(SIOCSIWESSID),     BW_HANDLER(SIOCGIWESSID),
+	BW_HANDLER(SIOCSIWSCAN),      BW_HANDLER(SIOCGIWSCAN),
+	BW_HANDLER(SIOCSIWENCODE),    BW_HANDLER(SIOCGIWENCODE),
+#if WIRELESS_EXT >= 18
+	BW_HANDLER(SIOCSIWGENIE),     BW_HANDLER(SIOCSIWAUTH),
+	BW_HANDLER(SIOCSIWENCODEEXT), BW_HANDLER(SIOCSIWMLME),
+#endif
 };
+#if WIRELESS_EXT < 18
+/* Old wireless core passes unrecognized standard commands to do_ioctl.
+ * The core has checked CAP_NET_ADMIN; copy pointed-to bytes here because
+ * its WE17 description table cannot marshal the newer command structures.
+ */
+static int wifi_legacy_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+{
+	struct iwreq *request = (struct iwreq *)ifr;
+	struct iw_request_info info;
+	char extra[sizeof(struct iw_encode_ext) + 80];
+	unsigned int n = 0;
+	if (cmd != SIOCSIWAUTH && cmd != SIOCSIWGENIE &&
+	    cmd != SIOCSIWENCODEEXT && cmd != SIOCSIWMLME)
+		return -EOPNOTSUPP;
+	if (cmd != SIOCSIWAUTH) {
+		n = request->u.data.length;
+		if (n > sizeof(extra))
+			return -E2BIG;
+		if (n && copy_from_user(extra, request->u.data.pointer, n))
+			return -EFAULT;
+	}
+	memset(&info, 0, sizeof(info));
+	info.cmd = cmd;
+	return wifi_ioctl_handler(dev, &info, &request->u, extra);
+}
+#endif
 static struct iw_handler_def wifi_handler_def = {
 	.standard = wifi_handlers,
 	.num_standard = sizeof(wifi_handlers) / sizeof(wifi_handlers[0]),
@@ -721,6 +1030,9 @@ static int __init be300_wifi_init(void)
 	wifi_dev->stop = wifi_stop;
 	wifi_dev->hard_start_xmit = wifi_xmit;
 	wifi_dev->get_stats = wifi_get_stats;
+#if WIRELESS_EXT < 18
+	wifi_dev->do_ioctl = wifi_legacy_ioctl;
+#endif
 #endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 19)
 	wifi_dev->get_wireless_stats = wifi_get_wireless_stats;
@@ -749,8 +1061,8 @@ static int __init be300_wifi_init(void)
 	ret = register_netdev(wifi_dev);
 	if (ret)
 		goto fail_queue;
-	printk(KERN_INFO
-	       "BE-300: %s Wi-Fi registered as %s (open/WEP station)\n",
+	printk(KERN_INFO "BE-300: %s Wi-Fi registered as %s (station; WL54-CF "
+			 "WPA/WPA2 PSK)\n",
 	       station.kind == BW_XI825 ? "XI-825" : "WL54-CF", wifi_dev->name);
 	return 0;
 fail_queue:

@@ -12,7 +12,7 @@
 struct bw_ap {
 	u8 ssid[32], ssid_len, bssid[6], channel;
 	u16 capability, signal, noise;
-	u8 rates[14], nrates, ie[80], ie_len;
+	u8 rates[14], nrates, ie[160], ie_len;
 };
 struct bw_state {
 	int kind, connected, scanning, initialized;
@@ -20,6 +20,12 @@ struct bw_state {
 	u8 keys[4][13], key_len[4], key_index, shared_auth;
 	unsigned int count, sta_version;
 	u16 tx_fid, sequence;
+	/* WPA configuration is public negotiation data; key bytes are
+	 * transient. */
+	u8 wpa, pairwise_cipher, group_cipher, pairwise_key, group_key;
+	u8 countermeasures, drop_unencrypted;
+	u8 assoc_ie[80], assoc_ie_len, requested_bssid[6];
+	u8 requested_channel, channel;
 	struct bw_ap aps[BW_MAX_AP];
 	u8 command[512], packet[2048];
 };
@@ -485,9 +491,13 @@ static int bm_scan(struct bw_state *s)
 						ap.rates[ap.nrates++] =
 							b[p + size];
 				}
-				if ((tag == 48 || tag == 221) && len <= 78) {
-					ap.ie_len = len + 2;
-					memcpy(ap.ie, b + p - 2, len + 2);
+				if ((tag == 48 ||
+				     (tag == 221 && len >= 4 &&
+				      !memcmp(b + p, "\x00\x50\xf2\x01", 4))) &&
+				    len + 2 <= sizeof(ap.ie) - ap.ie_len) {
+					memcpy(ap.ie + ap.ie_len, b + p - 2,
+					       len + 2);
+					ap.ie_len += len + 2;
 				}
 				p += len;
 			}
@@ -529,16 +539,83 @@ static int bm_init(struct bw_state *s)
 	memcpy(s->mac, s->packet + 16, 6);
 	return bm_setting(s, 0x1c, 1, 1);
 }
-static int bm_disconnect(struct bw_state *s)
+static void bm_revoke(struct bw_state *s)
+{
+	s->pairwise_key = s->group_key = 0;
+}
+static int bw_data_allowed(const struct bw_state *s, const u8 *frame,
+			   unsigned int n)
+{
+	if (!s->connected || s->countermeasures || n < 14 || n > BW_MAX_FRAME)
+		return 0;
+	return (!s->wpa &&
+		(!s->drop_unencrypted || s->key_len[s->key_index])) ||
+	       (s->wpa && s->pairwise_key && s->group_key) ||
+	       (frame[12] == 0x88 && frame[13] == 0x8e);
+}
+static int bm_key(struct bw_state *s, unsigned int pairwise,
+		  unsigned int cipher, const u8 *key, unsigned int n)
 {
 	int ret;
+	u8 *c = s->command;
+	if (pairwise > 1 || cipher > 2 || (cipher == 1 && n != 32) ||
+	    (cipher == 2 && n != 16) || (!cipher && n))
+		return -EINVAL;
+	if (n && (!s->connected || !s->wpa ||
+		  cipher != (pairwise ? s->pairwise_cipher : s->group_cipher)))
+		return -EINVAL;
+	/* A fresh firmware session has no WPA key in an unconfigured slot. */
+	if (!n && !(pairwise ? s->pairwise_cipher : s->group_cipher)) {
+		if (pairwise)
+			s->pairwise_key = 0;
+		else
+			s->group_key = 0;
+		return 0;
+	}
+	/* Libertas KEY_MATERIAL: action SET, TLV, type, scope, enabled, key. */
+	memset(c, 0, 52);
+	bw_put16(c + 8, 1);
+	bw_put16(c + 10, 0x100);
+	bw_put16(c + 12, 38);
+	bw_put16(c + 14,
+		 cipher ? cipher
+			: (pairwise ? s->pairwise_cipher : s->group_cipher));
+	bw_put16(c + 16, (pairwise ? 2 : 1) | (n ? 4 : 0));
+	bw_put16(c + 18, n);
+	if (n)
+		memcpy(c + 20, key, n);
+	if (pairwise)
+		s->pairwise_key = 0;
+	else
+		s->group_key = 0;
+	ret = bm_command(s, 0x5e, 52);
+	memset(c, 0, sizeof(s->command));
+	memset(s->packet, 0, sizeof(s->packet));
+	if (ret < 0)
+		return ret;
+	if (pairwise)
+		s->pairwise_key = n != 0;
+	else
+		s->group_key = n != 0;
+	return 0;
+}
+static int bm_disconnect(struct bw_state *s)
+{
+	int ret, first = 0;
+	unsigned int clear = s->wpa || s->pairwise_key || s->group_key;
+	bm_revoke(s);
 	memset(s->command, 0, 16);
 	memcpy(s->command + 8, s->bssid, 6);
 	bw_put16(s->command + 14, 3);
-	ret = bm_command(s, 0x24, 16);
+	ret = memcmp(s->bssid, "\0\0\0\0\0\0", 6) ? bm_command(s, 0x24, 16) : 0;
 	s->connected = 0;
 	memset(s->bssid, 0, 6);
-	return ret < 0 ? ret : 0;
+	if (clear) {
+		first = bm_key(s, 0, 0, NULL, 0);
+		if (bm_key(s, 1, 0, NULL, 0) && !first)
+			first = -EIO;
+	}
+	return first ? first : (ret < 0 ? ret : 0);
 }
 static int bm_connect(struct bw_state *s)
 {
@@ -546,22 +623,39 @@ static int bm_connect(struct bw_state *s)
 	u8 *c = s->command;
 	unsigned int i, n = s->key_len[s->key_index], p;
 	int ret;
-	(void)bm_disconnect(s);
+	ret = bm_disconnect(s);
+	if (ret)
+		return ret;
+	if (s->countermeasures)
+		return -EBUSY;
 	ret = bm_scan(s);
 	if (ret)
 		return ret;
 	for (i = 0; i < s->count; i++)
 		if (s->aps[i].ssid_len == s->ssid_len &&
-		    !memcmp(s->aps[i].ssid, s->ssid, s->ssid_len)) {
+		    !memcmp(s->aps[i].ssid, s->ssid, s->ssid_len) &&
+		    (!s->requested_channel ||
+		     s->aps[i].channel == s->requested_channel) &&
+		    (!memcmp(s->requested_bssid, "\0\0\0\0\0\0", 6) ||
+		     !memcmp(s->aps[i].bssid, s->requested_bssid, 6))) {
 			ap = &s->aps[i];
 			break;
 		}
 	if (!ap)
 		return -ENOENT;
-	if (!!(ap->capability & 16) != !!n || ap->ie_len)
+	if (s->wpa) {
+		if (!(ap->capability & 16) || s->assoc_ie_len < 2 ||
+		    s->assoc_ie_len > sizeof(s->assoc_ie) ||
+		    s->assoc_ie[1] + 2 != s->assoc_ie_len ||
+		    (s->assoc_ie[0] == 48
+			     ? !(s->wpa & 2)
+			     : s->assoc_ie[0] != 221 || !(s->wpa & 1)) ||
+		    !s->pairwise_cipher || !s->group_cipher)
+			return -EINVAL;
+	} else if (!!(ap->capability & 16) != !!n || ap->ie_len)
 		return -EOPNOTSUPP;
 	memset(c, 0, 80);
-	bw_put16(c + 8, n ? 2 : 4);
+	bw_put16(c + 8, n && !s->wpa ? 2 : 4);
 	bw_put16(c + 10, s->key_index);
 	for (i = 0; i < 4; i++) {
 		c[12 + i] = s->key_len[i] == 13	 ? 2
@@ -573,12 +667,12 @@ static int bm_connect(struct bw_state *s)
 	memset(c, 0, sizeof(s->command));
 	if (ret < 0)
 		return ret;
-	if (bm_setting(s, 0x2f, 1, 0) ||
-	    bm_setting(s, 0x28, 0x43 | (n ? 8 : 0), 0))
+	if (bm_setting(s, 0x2f, 1, !!s->wpa) ||
+	    bm_setting(s, 0x28, 0x43 | (n && !s->wpa ? 8 : 0), 0))
 		return -EIO;
 	memset(c, 0, 25);
 	memcpy(c + 8, ap->bssid, 6);
-	c[14] = s->shared_auth;
+	c[14] = s->wpa ? 0 : s->shared_auth;
 	if (bm_command(s, 0x11, 25) < 0)
 		return -EIO;
 	memset(c, 0, sizeof(s->command));
@@ -602,11 +696,18 @@ static int bm_connect(struct bw_state *s)
 	bw_put16(c + p + 2, ap->nrates);
 	memcpy(c + p + 4, ap->rates, ap->nrates);
 	p += 4 + ap->nrates;
+	if (s->wpa) {
+		bw_put16(c + p, s->assoc_ie[0]);
+		bw_put16(c + p + 2, s->assoc_ie_len - 2);
+		memcpy(c + p + 4, s->assoc_ie + 2, s->assoc_ie_len - 2);
+		p += s->assoc_ie_len + 2;
+	}
 	ret = bm_command(s, 0x50, p);
 	if (ret < 14 || bw_get16(s->packet + 10))
 		return ret < 0 ? ret : -ECONNREFUSED;
 	memcpy(s->bssid, ap->bssid, 6);
 	s->connected = 1;
+	s->channel = ap->channel;
 	return 0;
 }
 static int bm_send(struct bw_state *s, const u8 *frame, unsigned int n)

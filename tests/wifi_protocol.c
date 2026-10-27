@@ -45,6 +45,7 @@ static void write_io(unsigned r, unsigned width, unsigned value)
 #include "../board/casio-be300/wifi-proto.h"
 static void capture(void *unused, const uint8_t *data, size_t n)
 {
+	(void)unused;
 	assert(n <= sizeof(sent));
 	memcpy(sent, data, n);
 	sent_n = n;
@@ -64,6 +65,8 @@ int main(void)
 {
 	static struct bw_state state;
 	static const uint8_t mac[] = {2, 0, 0, 0, 0, 1};
+	unsigned mode, i, n;
+	uint8_t key[32];
 	uint8_t helper[256] = {0}, firmware[34] = {0},
 		frame[BW_MAX_FRAME] = {0};
 	kind = 1;
@@ -144,6 +147,67 @@ int main(void)
 	memcpy(state.keys[0], "wrong", 5);
 	assert(bm_connect(&state) < 0 && !state.connected);
 	assert(!bm_disconnect(&state));
+
+	/* Transport/key scoping tests use the independent firmware model's
+	 * expected keys. Full cryptographic authentication is a guest test.
+	 */
+	assert(!bw_data_allowed(&state, frame, 60));
+#ifdef BE300_WIFI_OPENSSL
+	for (mode = 2; mode <= 3; mode++) {
+		memset(state.key_len, 0, sizeof(state.key_len));
+		assert(wifi_security_configure(&marvell.security, mode,
+					       "password"));
+		state.wpa = mode == 3 ? 2 : 1;
+		state.pairwise_cipher = state.group_cipher = mode == 3 ? 2 : 1;
+		state.assoc_ie_len = marvell.security.ie_len;
+		memcpy(state.assoc_ie, marvell.security.ie, state.assoc_ie_len);
+		assert(!bm_connect(&state));
+		assert(!bw_data_allowed(&state, frame, 60));
+		frame[12] = 0x88;
+		frame[13] = 0x8e;
+		assert(bw_data_allowed(&state, frame, 60));
+		frame[12] = 8;
+		frame[13] = 6;
+		/* Pretend the independent authenticator accepted message 2. */
+		marvell.security.stage = 2;
+		n = mode == 3 ? 16 : 32;
+		memcpy(key, marvell.security.ptk + 32, n);
+		if (mode == 2) {
+			memcpy(key + 16, marvell.security.ptk + 56, 8);
+			memcpy(key + 24, marvell.security.ptk + 48, 8);
+		}
+		assert(!bm_key(&state, 1, state.pairwise_cipher, key, n));
+		assert(!bw_data_allowed(&state, frame, 60));
+		memcpy(key, marvell.security.gtk, n);
+		if (mode == 2) {
+			memcpy(key + 16, marvell.security.gtk + 24, 8);
+			memcpy(key + 24, marvell.security.gtk + 16, 8);
+		}
+		assert(!bm_key(&state, 0, state.group_cipher, key, n));
+		assert(bw_data_allowed(&state, frame, 60));
+		state.countermeasures = 1;
+		assert(!bw_data_allowed(&state, frame, 60));
+		frame[12] = 0x88;
+		frame[13] = 0x8e;
+		assert(!bw_data_allowed(&state, frame, 60));
+		frame[12] = 8;
+		frame[13] = 6;
+		state.countermeasures = 0;
+		for (i = 0; i < sizeof(state.command); i++)
+			assert(!state.command[i]);
+		key[0] ^= 1;
+		assert(bm_key(&state, 0, state.group_cipher, key, n) == -EIO);
+		assert(!bw_data_allowed(&state, frame, 60));
+		assert(!bm_disconnect(&state));
+		assert(!state.pairwise_key && !state.group_key &&
+		       !state.connected);
+	}
+#else
+	(void)mode;
+	(void)i;
+	(void)n;
+	(void)key;
+#endif
 	unplugged = 1;
 	assert(bm_command(&state, 3, 46) == -ENODEV);
 	unplugged = 0;
@@ -153,5 +217,8 @@ int main(void)
 	assert(bm_firmware(helper, 3, firmware, sizeof(firmware)) == -EINVAL);
 	puts("PRISM/CF8385 init, scan, open/WEP, byte-exact TX, removal and "
 	     "bounded failures passed");
+#ifdef BE300_WIFI_OPENSSL
+	puts("WPA/TKIP and WPA2/CCMP key scoping and data gating passed");
+#endif
 	return 0;
 }
