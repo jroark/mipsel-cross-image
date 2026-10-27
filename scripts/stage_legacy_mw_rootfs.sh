@@ -422,6 +422,10 @@ INITTAB
     echo "--- BE300_MW_SERIAL_SHELL=1: askfirst shell on ttyS0 ---"
 fi
 
+if [[ -n "${BE300_WIFI_USERSPACE:-}" ]]; then
+    python3 "$REPO/tools/stage_wifi_userspace.py" "$BE300_WIFI_USERSPACE" "$JFFS2_WORK/root"
+fi
+
 echo "--- Building JFFS2 image $JFFS2_ROOTFS ---"
 mkfs.jffs2 --root="$JFFS2_WORK/root" \
     --devtable="$DEVTABLE_PGUI" \

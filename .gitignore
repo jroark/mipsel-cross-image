@@ -100,3 +100,6 @@ __pycache__/
 *.o
 *.a
 *.elf
+
+# Optional Wi-Fi userspace build (sources and binaries are local only)
+/build-wifi/

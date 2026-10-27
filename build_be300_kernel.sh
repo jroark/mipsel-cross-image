@@ -201,7 +201,10 @@ MUSL_BAD_INSN="$(
 
 if [ -z "$MUSL_BAD_INSN" ] \
         && [ -f "$MUSL_SRC/arch/mips/pthread_arch.h" ] \
-        && grep -q "__be300_mips_tp" "$MUSL_SRC/arch/mips/pthread_arch.h"; then
+        && cmp -s /work/board/casio-be300/musl_mips_pthread_arch.h \
+            "$MUSL_SRC/arch/mips/pthread_arch.h" \
+        && cmp -s /work/board/casio-be300/musl_mips_set_thread_area.c \
+            "$MUSL_SRC/src/thread/__set_thread_area.c"; then
     echo "--- musl-mipsel already MIPS2-compatible, skipping rebuild ---"
 else
     if [ -n "$MUSL_BAD_INSN" ]; then
@@ -2355,6 +2358,10 @@ ttyS0::askfirst:/bin/sh
 INITTAB
 fi
 
+if [[ -n "${BE300_WIFI_USERSPACE:-}" ]]; then
+    python3 /work/tools/stage_wifi_userspace.py "$BE300_WIFI_USERSPACE" "$ROOTFS"
+fi
+
 ROOTFS_BAD_INSN="$(check_rootfs_mips2)"
 if [ -n "$ROOTFS_BAD_INSN" ]; then
 	echo "ERROR: rootfs contains unsupported VR4131 instructions:" >&2
@@ -2874,6 +2881,7 @@ echo "=== Phase 7b: Building JFFS2 rootfs image ==="
 # --no-cleanmarkers is the right call for NAND (mtd's NAND wbuf path
 # regenerates them at runtime). --little-endian matches the kernel.
 ROOTFS_JFFS2="/work/linux-4.2.9/${ROOTFS_JFFS2_NAME}"
+
 mkfs.jffs2 \
     --root="$ROOTFS" \
     --output="$ROOTFS_JFFS2" \

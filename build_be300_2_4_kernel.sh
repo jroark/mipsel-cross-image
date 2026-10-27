@@ -829,6 +829,10 @@ if [[ ( "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw"
 elif [[ "$ROOT_MODE" == "opie" || "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     echo "--- keeping CONFIG_SERIAL_BE300_CONSOLE for ttyS0 console ---"
 fi
+# Shared Casio wave-output driver; do not enable unrelated ISA sound drivers.
+sed -i -e '/^CONFIG_SOUND=/d' -e '/^# CONFIG_SOUND is not set/d' "$SOURCE_DIR/.config"
+echo 'CONFIG_SOUND=y' >> "$SOURCE_DIR/.config"
+
 # `yes ""` keeps writing after `make oldconfig` closes its stdin, which raises
 # SIGPIPE on yes — with `set -o pipefail` that would fail the whole pipeline
 # even though make exited 0. Disable pipefail just for this line so we accept
