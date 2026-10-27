@@ -1,3 +1,5 @@
+/* BE300 board hardware integration v1. */
+#include <linux/be300_hardware.h>
 /*
  * arch/mips/vr41xx/casio-be300/irq.c
  *
@@ -22,9 +24,9 @@
  * numbering future-compatible with the upstream vrc4173_cardu PCMCIA driver
  * if we ever switch to that.
  *
- * GIRQ0 status / mask / ack are all write-1-to-clear in the emulator. There
- * is no separate hardware mask register at this layer; we keep a software
- * shadow mask and AND it with the live status during demux.
+ * GIRQ0 status is read at 0004. Hardware source controls at 0010+4*n
+ * use bit 3 for masking; 0014 is source 1, not a bitmap ACK. A software
+ * shadow also tracks which Linux IRQs are enabled.
  *
  * Copyright (C) 2026 John Roark
  *
@@ -56,16 +58,20 @@ static u32 be300_girq0_mask;
 static void be300_girq0_irq_mask(struct irq_data *d)
 {
 	be300_girq0_mask &= ~(1u << (d->irq - VRC4173_IRQ_BASE));
+
+	be300_girq0_source_mask(d->irq - VRC4173_IRQ_BASE);
 }
 
 static void be300_girq0_irq_unmask(struct irq_data *d)
 {
 	be300_girq0_mask |= 1u << (d->irq - VRC4173_IRQ_BASE);
+
+	be300_girq0_source_unmask(d->irq - VRC4173_IRQ_BASE);
 }
 
 static void be300_girq0_irq_ack(struct irq_data *d)
 {
-	writel(1u << (d->irq - VRC4173_IRQ_BASE), be300_girq0_ack_io);
+	be300_girq0_source_mask(d->irq - VRC4173_IRQ_BASE);
 }
 
 static struct irq_chip be300_girq0_chip = {
@@ -95,11 +101,10 @@ static void be300_girq0_demux(unsigned int irq, struct irq_desc *desc)
 		readl(be300_girq0_cause_io);
 
 	/*
-	 * W1C every observed pending bit. For bit 0 this routes through
-	 * cf_clear_irq() in the emulator, dropping irq_pending. For other
-	 * bits it just clears the GIRQ0 latch.
+	 * Mask observed sources while dispatching. The device handler clears
+	 * its own cause; the IRQ core unmasks enabled sources afterward.
 	 */
-	writel(pending, be300_girq0_ack_io);
+	be300_girq0_pending_ack(pending);
 
 	pending &= be300_girq0_mask;
 	while (pending) {
@@ -120,15 +125,14 @@ static void be300_girq0_demux(unsigned int irq, struct irq_desc *desc)
  *     still no_irq_chip, so without this the drivers print
  *     "unable to get IRQ 72 (errno=-89)" and bail.
  *
- *  2) be300_girq0_irq_ack writes to be300_girq0_ack_io. The ack path is
- *     only reached once the chained handler dispatches into
- *     handle_level_irq (late_initcall onward), so doing the ioremap here
- *     is safe.
+ *  2) The status and CF-cause mappings must exist before the chained
+ *     handler is installed at late_initcall.
  */
 static int __init be300_irq_chip_init(void)
 {
 	int i;
 
+	be300_girq0_init();
 	be300_girq0_status_io = ioremap(BE300_GIRQ0_STATUS_PA, 4);
 	be300_girq0_ack_io = ioremap(BE300_GIRQ0_ACK_PA, 4);
 	be300_girq0_cause_io = ioremap(BE300_GIRQ0_CAUSE_PA, 4);
@@ -153,6 +157,7 @@ arch_initcall(be300_irq_chip_init);
  */
 static int __init be300_irq_cascade_init(void)
 {
+	be300_giu0_prepare();
 	irq_set_chained_handler(GIU_IRQ(0), be300_girq0_demux);
 
 	/*

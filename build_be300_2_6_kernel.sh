@@ -100,27 +100,33 @@ echo "  ui       = $UI"
 echo "  console  = $CONSOLE"
 echo "  out      = $OUT"
 
-# 1. Fetch + stage the kernel.org source tree.
-if [[ ! -f "$TARBALL" ]]; then
-    echo "--- Downloading linux-$KVER ---"
-    mkdir -p "$(dirname "$TARBALL")"
-    curl -L --fail "$TARBALL_URL" -o "$TARBALL.part"
-    mv "$TARBALL.part" "$TARBALL"
-fi
-echo "$TARBALL_SHA256  $TARBALL" | sha256sum -c - >/dev/null || {
-    echo "ERROR: $TARBALL sha256 mismatch" >&2
-    exit 1
-}
+# 1. Reuse a supplied source tree, or fetch and verify the upstream archive.
+# An existing tree is useful for offline builds and pinned Git source mirrors.
 if [[ ! -f "$SOURCE_DIR/Makefile" ]]; then
-    echo "--- Extracting $TARBALL ---"
-    # The top-level directory is linux-$KVER/.  A handful of netfilter
-    # headers differ only in case; they collide harmlessly on a
-    # case-insensitive host mount and are not built for the BE-300.
+    if [[ ! -f "$TARBALL" ]]; then
+        echo "--- Downloading linux-$KVER ---"
+        mkdir -p "$(dirname "$TARBALL")"
+        curl -L --fail "$TARBALL_URL" -o "$TARBALL.part"
+        mv "$TARBALL.part" "$TARBALL"
+    fi
+    echo "$TARBALL_SHA256  $TARBALL" | sha256sum -c - >/dev/null || {
+        echo "ERROR: $TARBALL sha256 mismatch" >&2
+        exit 1
+    }
     tar -xjf "$TARBALL" -C "$REPO"
 fi
+python3 - "$SOURCE_DIR/Makefile" <<'PYCHECK'
+import re, sys
+text = open(sys.argv[1]).read()
+for key, value in [('VERSION', '2'), ('PATCHLEVEL', '6'), ('SUBLEVEL', '8'), ('EXTRAVERSION', '.1')]:
+    match = re.search(r'^' + key + r'\s*=\s*(\S+)\s*$', text, re.M)
+    if not match or match[1] != value:
+        raise SystemExit('ERROR: expected Linux 2.6.8.1 source in ' + sys.argv[1])
+PYCHECK
 
 # 2. Apply the BE-300 patch series (idempotent).
 "$REPO/scripts/apply_patch_series.sh" "$PATCH_SERIES" "$SOURCE_DIR"
+python3 "$REPO/scripts/install_board_hardware.py" "$SOURCE_DIR" --kernel 2.6
 
 # 3. Configure.  The defconfig's built-in command line carries root= and the
 #    NE2000 address because the SPL passes no arguments (a0..a3 = 0).

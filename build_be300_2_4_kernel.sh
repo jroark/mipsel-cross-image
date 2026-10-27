@@ -234,6 +234,7 @@ fi
 
 # 2. Apply modern-toolchain patch series. Wraps git apply, idempotent.
 "$REPO/scripts/apply_patch_series.sh" "$PATCH_SERIES" "$SOURCE_DIR"
+python3 "$REPO/scripts/install_board_hardware.py" "$SOURCE_DIR" --kernel 2.4
 
 # 2b. Force a kernel object clean.  $SOURCE_DIR lives on the host-mounted
 # /work volume, so the extracted/patched tree (and its .o files) persists

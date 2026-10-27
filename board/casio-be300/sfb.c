@@ -1,3 +1,5 @@
+/* BE300 board hardware integration v1. */
+#include <linux/be300_hardware.h>
 /*
  *  Simple frame buffer device for Casio Cassiopeia BE-300/BE-500
  *  Copyright (C) 2004 Filip Onkelinx - Filip@linux4.be
@@ -89,7 +91,13 @@ static int sfb_pan_display(struct fb_var_screeninfo *var,
 static int sfb_mmap(struct fb_info *info,
 		    struct vm_area_struct *vma);
 
+static int be300_sfb_blank(int blank, struct fb_info *info)
+{
+	return be300_lcd_blank(blank);
+}
+
 static struct fb_ops sfb_ops = {
+	.fb_blank = be300_sfb_blank,
 	.owner		= THIS_MODULE,
 	.fb_check_var	= sfb_check_var,
 	.fb_set_par	= sfb_set_par,
