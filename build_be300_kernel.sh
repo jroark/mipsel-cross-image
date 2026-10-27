@@ -2733,6 +2733,7 @@ cp /work/board/casio-be300/setup.c \
    /work/linux-4.2.9/arch/mips/vr41xx/casio-be300/setup.c
 cp /work/board/casio-be300/touch_be300.c \
    /work/linux-4.2.9/arch/mips/vr41xx/casio-be300/touch_be300.c
+python3 /work/scripts/install_board_hardware.py /work/linux-4.2.9 --kernel 4.2
 cp /work/board/casio-be300/logo_linux4be_clut224.ppm \
    /work/linux-4.2.9/drivers/video/logo/logo_linux4be_clut224.ppm
 

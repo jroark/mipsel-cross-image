@@ -1,3 +1,5 @@
+/* BE300 board hardware integration v1. */
+#include <linux/be300_hardware.h>
 /*
  * arch/mips/vr41xx/casio-be300/nand.c
  *
@@ -89,7 +91,8 @@ static void be300_nand_finish_addr(void)
 	if (be300_nand_phase != BE300_NAND_PHASE_ADDR)
 		return;
 
-	be300_nand_xfer_write(BE300_NAND_XFER_ACK, 0);
+	(void)be300_nand_xfer_read(BE300_NAND_XFER_ACK);
+	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x02);
 	be300_nand_wait_xfer_ready();
 	be300_nand_phase = BE300_NAND_PHASE_NONE;
 }
@@ -119,11 +122,19 @@ static void be300_nand_send_addr(int addr)
 
 static void be300_nand_send_command(u8 cmd)
 {
+	/* NK/SPL 80F0A654: select the unit explicitly. */
+	writel(1, (void *)0xaa001134UL);
+	writel(1, (void *)0xaa00a400UL);
+	writel(1, (void *)0xaa00a408UL);
+	writel(1, (void *)0xaa00a40cUL);
+	writel(1, (void *)0xaa00a410UL);
 	be300_nand_finish_addr();
 
+	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x02);
 	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x03);
 	writeb(cmd, be300_nand_xfer_io + BE300_NAND_XFER_ADDR);
-	be300_nand_xfer_write(BE300_NAND_XFER_ACK, 0);
+	(void)be300_nand_xfer_read(BE300_NAND_XFER_ACK);
+	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x02);
 	be300_nand_wait_xfer_ready();
 
 	be300_nand_last_cmd = cmd;

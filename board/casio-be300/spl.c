@@ -32,7 +32,7 @@
 #define XFER_ACK     (*(volatile uint32_t *)0xAA00A430u)  /* commit phase */
 #define XFER_STATUS  (*(volatile uint32_t *)0xAA00A440u)  /* bit 0 ready */
 #define XFER_KICK    (*(volatile uint32_t *)0xAA00A460u)  /* start busy */
-#define XFER_MODE    (*(volatile uint32_t *)0xAA00A464u)  /* 0x05 = 520-burst */
+#define XFER_MODE    (*(volatile uint32_t *)0xAA00A464u)  /* 0x05 = raw page read */
 #define STREAM_DATA  (*(volatile uint32_t *)0xAA00B000u)  /* 4-byte stream port */
 
 /* VRC4173 SIU (UART) at 0xAA008680, addr_mult=4. Used for early debug. */
@@ -41,8 +41,10 @@
 
 static void uart_putc(char c)
 {
+    unsigned int timeout = 1000000;
     while (!(SIU_LSR & 0x20u))
-        ;
+        if (!--timeout)
+            return;
     SIU_THR = (uint8_t)c;
 }
 
@@ -63,45 +65,64 @@ static void uart_puthex32(uint32_t v)
         uart_putc(hex[(v >> i) & 0xFu]);
 }
 
+static void nand_wait_ready(void)
+{
+    unsigned int timeout = 1000000;
+    while (!(XFER_STATUS & 1u))
+        if (!--timeout) {
+            uart_puts("SPL: NAND transfer timed out\n");
+            for (;;)
+                ; /* Do not jump into a partly loaded kernel. */
+        }
+}
+
 /*
- * Read one 512-byte NAND page into `dest` (4-byte aligned). The 8 trailing
- * OOB bytes from the 520-byte stream burst are discarded. `page` is the
+ * Read one 512-byte NAND page into `dest` (4-byte aligned). The 16 trailing
+ * OOB bytes from the raw page stream are discarded. `page` is the
  * absolute page index (0-based, 32 pages/block, 1024 blocks total).
  */
 static void nand_read_page(uint32_t page, uint32_t *dest)
 {
-    /* Command phase: READ0 (0x00) */
+    /* WinCE SPL 80F0A654..64: select clock/unit and PIO explicitly. */
+    *(volatile uint32_t *)0xAA001134u = 1;
+    *(volatile uint32_t *)0xAA00A400u = 1;
+    *(volatile uint32_t *)0xAA00A408u = 1;
+    *(volatile uint32_t *)0xAA00A40Cu = 1;
+    *(volatile uint32_t *)0xAA00A410u = 1;
+    /* Command phase: close, READ0, commit, close (80F0AD34..4C). */
+    XFER_CMD = 0x02u;
     XFER_CMD = 0x03u;
     XFER_ADDR8 = 0x00u;
-    XFER_ACK = 0u;
+    (void)XFER_ACK;
+    XFER_CMD = 0x02u;
+    nand_wait_ready();
 
-    /* Address phase: 3 bytes — column_lo, page_lo, page_hi. The emulator's
-     * XFER engine (`nand.c` MODE 0x05 path) decodes the address as
-     * `row = addr[1] | (addr[2] << 8); col = addr[0]`, so a 4th byte would
-     * overflow the 3-byte queue and shift `col` out. */
+    /* Small-page NAND address: column, page low, page high. */
     XFER_CMD = 0x06u;
     XFER_ADDR8 = 0x00u;                              /* col_lo = 0 (start of page) */
     XFER_ADDR8 = (uint8_t)(page & 0xFFu);            /* row byte 0 (page lo) */
     XFER_ADDR8 = (uint8_t)((page >> 8) & 0xFFu);     /* row byte 1 (page hi) */
-    XFER_ACK = 0u;
+    (void)XFER_ACK;
+    XFER_CMD = 0x02u;
+    nand_wait_ready();
 
-    /* Kick (busy = !ready), then MODE = 0x05 which the emulator's XFER
-     * engine uses to latch the address into stream_page/col, mark
-     * `stream_active`, and set `ready = true`. KICK before MODE matters:
-     * KICK alone leaves ready=false until something else flips it, and
-     * MODE=5 is the only path that activates the stream. */
+    /* Start the recovered PIO raw-page read transaction. */
     XFER_KICK = 1u;
     XFER_MODE = 0x05u;
 
-    while (!(XFER_STATUS & 1u))
-        ;
+    nand_wait_ready();
 
     /* 128 4-byte reads = 512 data bytes. */
     for (int i = 0; i < 128; i++)
         dest[i] = STREAM_DATA;
-    /* Drain the 8 OOB bytes (2 words). */
+    /* Drain the whole spare area, then release the PIO transfer. */
     (void)STREAM_DATA;
     (void)STREAM_DATA;
+    (void)STREAM_DATA;
+    (void)STREAM_DATA;
+    XFER_MODE = 0;
+    XFER_CMD = 0;
+    *(volatile uint32_t *)0xAA00A410u = 0;
 }
 
 uint32_t spl_main(void)

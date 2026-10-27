@@ -17,6 +17,16 @@ For deep hardware / porting notes see [`CLAUDE.md`](CLAUDE.md).
 - Framebuffer, polled keyboard, early printk over the companion-chip UART,
   and devtmpfs all work.
 
+## Hardware initialization
+
+Source rebuilds of the 2.4.18, 2.6.8.1 and 4.2.9 profiles install the shared
+BE-300 hardware layer after their patch series. It initializes the original
+LCD independently, exposes brightness/contrast controls, services the MCU
+watchdog and prepares touch, button, interrupt and NAND paths. See
+[hardware support and validation](docs/HARDWARE.md) for the recovered WinCE
+register evidence, display-device interface, source prerequisites and limits.
+Prebuilt reference kernels retain their original hardware drivers.
+
 ## Getting Started
 
 ### 1. Build the Docker container

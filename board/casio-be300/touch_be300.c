@@ -1,21 +1,19 @@
+/* BE300 board hardware integration v1. */
+#include <linux/be300_hardware.h>
 /*
  * arch/mips/vr41xx/casio-be300/touch_be300.c
  *
  * VRC4173 PIU (Pen Interface Unit) touchscreen driver for the Casio BE-300.
  *
- * Register protocol verified against the BE-300 emulator at
- * ../be300-framebuffer/src/be300_devices.c (the DEVICE_ACCESS(be300_touch)
- * dispatcher around line 3537 and the supporting state machine
- * piu_update_state() / piu_latch_sample() / piu_store_page_sample()).
- * The emulator is the authoritative protocol reference because the VRC4173
- * UM leaves several edge cases under-specified (W1C-on-low-byte status,
- * coordinate page valid latching, scan-restart on data-lost ack).
+ * Startup is based on stock WinCE touch.dll 01A41274..01A41374 and
+ * the VR4131/VRC4173 manuals; see docs/HARDWARE.md. The emulator is a
+ * regression target, not a specification for electrical behavior.
  *
  *   PIU MMIO base: PA 0x0A000300, size 0x60
  *
  *   +0x00 PIUCNTREG  (16-bit, RW with masks)
  *      bits 9:0   writable control (mask 0x03FE on write; bit 0 self-clears
- *                 as the scan-start command kick)
+ *                 as the reset request)
  *      bits 12:10 PADSTATE (RO, scan sequencer state — see VRC4173 UM §9.2)
  *      bit  13    pendown status (RO, reflects host pen-down OR latched
  *                 PENSTC while PENCHGINTR is set)
@@ -29,8 +27,7 @@
  *      bits 15:8  interrupt mask (RW; 1 = unmasked)
  *
  *   +0x08..+0x18 PIU configuration registers (scan interval, stable count
- *      etc.). We program them with VRC4173 UM defaults — the emulator
- *      tolerates anything here, real hardware needs the documented values.
+ *      etc.). Initialization uses the recovered stock touch.dll values.
  *
  *   +0x20..+0x2C  page-0 ADC sample buffers (y+, y-, x-, x+, each u16)
  *   +0x50..+0x5C  page-1 ADC sample buffers (same layout)
@@ -83,11 +80,11 @@
 #define PIU_PB13		0x5c
 
 /* PIUCNTREG control bits (VRC4173 UM §9.7). */
-#define PIUCNT_SCAN_KICK	0x0001	/* scan-start kick (self-clearing) */
-#define PIUCNT_PADATSTART	0x0004	/* enable data scan */
-#define PIUCNT_PADATSTOP	0x0008
-#define PIUCNT_PIUSEQEN		0x0100	/* enable scan sequencer */
-#define PIUCNT_PIUPWR		0x0200	/* power on */
+#define PIUCNT_RESET		0x0001	/* reset request (self-clearing) */
+#define PIUCNT_PADATSTART	0x0100
+#define PIUCNT_PADATSTOP	0x0200
+#define PIUCNT_PIUSEQEN		0x0004
+#define PIUCNT_PIUPWR		0x0002
 #define PIUCNT_PEN_DETECTED	0x2000
 
 /* PIUINTREG pending bits (low byte). */
@@ -271,6 +268,8 @@ static int __init be300_touch_init(void)
 	struct be300_touch *t;
 	int err;
 
+	if (be300_piu_prepare())
+		return -ETIMEDOUT;
 	t = kzalloc(sizeof(*t), GFP_KERNEL);
 	if (!t)
 		return -ENOMEM;
@@ -313,7 +312,7 @@ static int __init be300_touch_init(void)
 	/*
 	 * Configure PIU defaults from VRC4173 UM §9 idle dump
 	 * (docs/hardware/hw_dump_vrc4173.txt:983) and enable PENCHG +
-	 * page 0/1 + datalost interrupts. The 0x0304-style control word
+	 * page 0/1 + datalost interrupts. The 0x0106 control word
 	 * enables PIUPWR + PIUSEQEN + PADATSTART with mode 00 WaitPenTouch.
 	 */
 	piu_write(t, PIU_SIVL, 0x05DC);
