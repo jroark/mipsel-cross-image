@@ -74,6 +74,24 @@ int main(void)
 	regs[0x7834/4] = 3; /* real MCU status need not return zero */
 	be300_regs_watchdog_reload(); be300_regs_watchdog_poll();
 	assert(regs[0x7814/4] == 150 && regs[0x780c/4] == 0x53 && regs[0x7808/4] == 0x3a);
-	puts("LCD sequence/delays, serial contrast, duty, PIU timeout, GIU preservation and MCU protocol passed");
+	/* Power-on: only 111C is on; the SIU must not be touched until its
+	 * candidate gates are, and GPIO4/6 join GPIO5 as CE drives them. */
+	memset(regs + 0x1100/4, 0, 16 * 4);
+	regs[0x111c/4] = 1;
+	giu[0] = 0x0020; giu[2] = 0xaab2;
+	assert(!be300_regs_siu_clocked());
+	be300_regs_power_on();
+	assert(be300_regs_siu_clocked());
+	assert(regs[0x1104/4] == 1 && regs[0x1108/4] == 1 && regs[0x1120/4] == 1);
+	assert(regs[0x112c/4] == 1 && regs[0x1138/4] == 1 && regs[0x113c/4] == 1);
+	assert(regs[0x111c/4] == 1 && !regs[0x1114/4] && !regs[0x1100/4]);
+	assert(regs[0x1b20/4] == 1 && regs[0x1b24/4] == 0 && regs[0x1b2c/4] == 1);
+	assert(regs[0xa0dc/4] == 0xff);
+	assert(giu[0] == 0x0070 && giu[2] == 0xaae2);	/* CE: IOSELL 70, PIODL ..E2 */
+	regs[0xa008/4] = 0x2f9; assert(be300_regs_card_present());
+	regs[0xa008/4] = 0x3ff; assert(!be300_regs_card_present());
+	regs[0x1000/4] = 0; regs[0xa008/4] = 0x2b9;	/* cold card: 1000 reads 0 */
+	assert(be300_regs_card_present());
+	puts("LCD sequence/delays, serial contrast, duty, PIU timeout, GIU preservation, MCU protocol, power-on gates/GPIO and card detect passed");
 	return 0;
 }

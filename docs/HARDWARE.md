@@ -32,11 +32,40 @@ The emulator is a regression target, not an electrical specification.
   source words are not treated as a bitmap W1C register at offset 0014.
   Each driver retains its existing interrupt or polling delivery policy.
 - Socket power/reset/window preparation before cold-boot ATA/NIC probing,
-  without guessing card COR values or replacing a configured handoff.
+  without guessing card COR values or replacing a configured handoff. Card
+  presence comes from the `A008` card-detect inputs.
 - Explicit NAND unit clock/PIO enables. The shared SPL now frames command and
   address phases like the recovered WinCE path, reads ACK, drains the full
   spare area, deselects transfers and bounds NAND/UART waits. A failed kernel
   load stops instead of executing a partially loaded image.
+
+## Power-on rules (real hardware, 2026-10-30)
+
+A real BE-300 booted from a battery pull (Glaze CF recovery, glaze-os
+`docs/NAND_BOOT_AUDIT.md`, "Power-on findings") showed what a NAND-booted
+kernel faces. Power+Reset does not clear the companion, so earlier "cold"
+tests still ran on Windows CE's state. Each rule below was confirmed by
+switching it on and off live over USB:
+
+- **A read or write of a companion unit whose clock gate is off stalls the bus
+  for good.** No timeout can catch it. At power-on only gate `111C` is on. The
+  framebuffer stalls without `1100`/`110C`, and the companion SIU without
+  `1108`/`112C`/`1138`/`113C`. `be300_regs_power_on()` sets CE's baseline
+  first thing: gates `1104 1108 1120 112C 1138 113C`, `1B24=0 1B20=1 1B2C=1`,
+  `A0DC=FF`, and GPIO4 (low) and GPIO6 (high) as outputs, which USB needed. The
+  installer makes each kernel's first console access go through
+  `be300_console_ready()`. The SPL and CF loader stay silent unless an SIU gate
+  is already on.
+- **`0008` bit 0 is the GIRQ0 output enable**, 0 at power-on
+  (`be300_girq0_init` sets it). A source word needs bits 2 **and** 3; with bit
+  2 clear its pending latch (bit 7) never clears.
+- **`03C8` = 3 must be set before the PIU sequencer starts.** Set later, it
+  takes effect only at the next `PIUCNT` write.
+- **Card presence is `A008` bits 1-2** (active low). `1000` reads 4 only after
+  CE has configured a card: 0 with a card after power-on, 8 with none.
+
+The emulator models these since `be300` `docs/POWER_ON_STATE.md`. Images that
+break a rule stop with a `[BUS] stall:` line instead of booting.
 
 ## Source evidence
 

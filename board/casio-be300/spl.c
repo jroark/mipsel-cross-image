@@ -39,9 +39,25 @@
 #define SIU_THR      (*(volatile uint8_t *)0xAA008680u)        /* base + 0  */
 #define SIU_LSR      (*(volatile uint8_t *)(0xAA008680u + 5*4)) /* base + 5*4 */
 
+/*
+ * After a power-on the companion SIU's clock gate is off, and touching a
+ * gated companion unit stalls the bus for good, which no poll bound can
+ * catch (glaze-os docs/NAND_BOOT_AUDIT.md, "Power-on findings"). Which of
+ * the gates Windows CE leaves on clocks the SIU is still open, so stay silent
+ * unless one is on; the kernel powers the units on itself
+ * (hardware.c be300_console_ready).
+ */
+static int siu_clocked(void)
+{
+    return (*(volatile uint32_t *)0xAA001108u | *(volatile uint32_t *)0xAA00112Cu |
+            *(volatile uint32_t *)0xAA001138u | *(volatile uint32_t *)0xAA00113Cu) & 1u;
+}
+
 static void uart_putc(char c)
 {
     unsigned int timeout = 1000000;
+    if (!siu_clocked())
+        return;
     while (!(SIU_LSR & 0x20u))
         if (!--timeout)
             return;
