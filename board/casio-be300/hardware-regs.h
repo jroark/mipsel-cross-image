@@ -119,6 +119,49 @@ static void be300_regs_watchdog_poll(void)
 	BE300_W32(0x0a007808, 0x3a);
 }
 
+/*
+ * Companion state Windows CE always leaves set and a power-on does not.
+ * Measured on a real BE-300 booted from a battery pull (glaze-os
+ * docs/NAND_BOOT_AUDIT.md, "Power-on findings"): only gate 111C is on at
+ * entry, and an access to a gated unit stalls the bus for good. The
+ * companion SIU stalled until 1108/112C/1138/113C were on, and USB
+ * enumerated only with GPIO4 low and GPIO6 high as outputs and 1B2C set.
+ * 1120 is followed by 1B24 = 0, 1B20 = 1 and 1104 by A0DC = FF, as the ROM
+ * itself does. Which gate clocks which unit is not known yet.
+ */
+static void be300_regs_power_on(void)
+{
+	static const unsigned short gates[] = {
+		0x1104, 0x1108, 0x1120, 0x112c, 0x1138, 0x113c
+	};
+	unsigned int n;
+
+	for (n = 0; n < sizeof(gates) / sizeof(gates[0]); n++)
+		BE300_W32(0x0a000000UL + gates[n], 1);
+	BE300_W32(0x0a001b24, 0);
+	BE300_W32(0x0a001b20, 1);
+	BE300_W32(0x0a001b2c, 1);
+	BE300_W32(0x0a00a0dc, 0xff);
+	/* VR4131 GIU (UM ch. 15): GIUPIODL first, then GIUIOSELL. */
+	BE300_W16(0x0f000144, (BE300_R16(0x0f000144) & ~0x10U) | 0x40);
+	BE300_W16(0x0f000140, BE300_R16(0x0f000140) | 0x50);
+	BE300_DELAY(10);
+}
+
+/* Whether the companion SIU can be touched without stalling the bus. */
+static int be300_regs_siu_clocked(void)
+{
+	return (BE300_R32(0x0a001108) | BE300_R32(0x0a00112c) |
+		BE300_R32(0x0a001138) | BE300_R32(0x0a00113c)) & 1;
+}
+
+/* Card-detect inputs, active low (A008 bits 1-2). 0A001000 reads 4 only
+ * after Windows CE has set a card up: 0 with a card after a power-on. */
+static int be300_regs_card_present(void)
+{
+	return (BE300_R32(0x0a00a008) & 6) == 0;
+}
+
 static void be300_regs_giu0(void)
 {
 	/* NK 800A5F60/6C/78/80: change only the pin owned by this cascade. */

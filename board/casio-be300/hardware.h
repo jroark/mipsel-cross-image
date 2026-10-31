@@ -7,4 +7,6 @@ void be300_girq0_source_mask(unsigned int source);
 void be300_girq0_source_unmask(unsigned int source);
 void be300_girq0_pending_ack(unsigned int pending);
 void be300_girq0_init(void);
+/* Before the first companion SIU access: powers its units on if needed. */
+void be300_console_ready(void);
 #endif

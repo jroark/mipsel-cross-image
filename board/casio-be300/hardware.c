@@ -60,6 +60,11 @@ void be300_girq0_init(void)
 	BE300_W32(0x0a000008, 1);
 }
 
+void be300_console_ready(void)
+{
+	if (!be300_regs_siu_clocked())
+		be300_regs_power_on();
+}
 void be300_giu0_prepare(void)
 {
 	be300_regs_giu0();
@@ -202,7 +207,7 @@ static void __init be300_socket_prepare(void)
 	unsigned int n;
 	u32 ctrl;
 
-	if ((BE300_R32(0x0a001000) & 0x0c) != 4)
+	if (!be300_regs_card_present())
 		return;
 	ctrl = BE300_R32(0x0a00a000);
 	if ((ctrl & 0x0b) == 0x0b && !(BE300_R32(0x0a00a004) & 1))
@@ -228,6 +233,7 @@ static void __init be300_socket_prepare(void)
 static int __init be300_hardware_init(void)
 {
 	spin_lock_init(&display_lock);
+	be300_regs_power_on();	/* before any other companion unit */
 	be300_regs_lcd_init();
 	be300_socket_prepare();
 	BE300_W16(0x0a00a040, 0x9eff); /* NK 80076D58, keybddr 01A3246C */

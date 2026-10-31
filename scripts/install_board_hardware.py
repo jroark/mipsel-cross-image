@@ -134,6 +134,20 @@ def nand(text):
                             '/* Drain all 16 spare bytes and release the transfer. */\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t*XFER_MODE = 0;\n\t*XFER_CMD = 0;')
     return text
 
+def console(text, names):
+    # A power-on leaves the companion SIU's clock gate off, and touching a
+    # gated unit stalls the bus for good: power its units on before the
+    # first console access (hardware.c be300_console_ready).
+    found = False
+    for name in names:
+        if re.search(r'\b' + re.escape(name) + r'\([^;{}()]*\)\s*\{', text):
+            text = function_body(text, name,
+                lambda b: inject(b, '\n\tbe300_console_ready();\n'))
+            found = True
+    if not found:
+        raise RuntimeError('early console layout needs review: ' + ', '.join(names))
+    return text
+
 def copy_changed(source, target):
     data = source.read_bytes()
     if not target.exists() or target.read_bytes() != data:
@@ -207,6 +221,11 @@ def install(tree, version):
     if old in text:
         text = '#include <linux/be300_hardware.h>\n' + text
         setup.write_text(text.replace(old, 'be300_girq0_source_mask(1);'))
+    if version == '2.4':
+        adapt(tree / 'drivers/char/serial_be300.c',
+              lambda t: console(t, ['be300_console_init', 'be300_serial_init']))
+    else:
+        adapt(setup, lambda t: console(t, ['prom_putchar']))
     fb = board / 'sfb.c' if version == '4.2' else tree / 'drivers/video/sfb.c'
     adapt(fb, lambda s: framebuffer(s, version))
     adapt(board / ('touch.c' if version == '2.6' else 'touch_be300.c'), touch)

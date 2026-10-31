@@ -11,7 +11,10 @@ static inline int be300_card_identity(unsigned int *function_out,
 		     product = 0;
 	unsigned int i;
 	u8 data[4];
-	if ((readl((void *)0xaa001000UL) & 12) != 4)
+	/* Card-detect inputs, active low (A008 bits 1-2). 1000 reads 4 only
+	 * after Windows CE has set a card up, 0 after a power-on (glaze-os
+	 * docs/NAND_BOOT_AUDIT.md, "Power-on findings"). */
+	if (readl((void *)0xaa00a008UL) & 6)
 		return 0;
 	for (tuples = 0; tuples < 64 && pos + 2 < 256; tuples++) {
 		code = readb((void *)(0xaa00d000UL + pos * 2));
