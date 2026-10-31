@@ -63,6 +63,13 @@ switching it on and off live over USB:
   takes effect only at the next `PIUCNT` write.
 - **Card presence is `A008` bits 1-2** (active low). `1000` reads 4 only after
   CE has configured a card: 0 with a card after power-on, 8 with none.
+- **Read a NAND page's spare bytes in two parts** (2026-10-31, the first Glaze
+  boot from NAND). After the ROM's NAND boot, a MODE-5 burst ends after 520
+  bytes: 512 data plus the first 8 spare bytes. Reading a 131st word from the
+  `B000` stream hangs the bus. The ROM and Casio's SPL write MODE 4 (`A464 = 4`)
+  and then read the last 8. The shared SPL, the 4.2 driver
+  (`board/casio-be300/nand.c`, which the installer now copies into the tree)
+  and the 2.6/2.4 drivers (the installer's `nand_drain`) all split this way.
 
 The emulator models these since `be300` `docs/POWER_ON_STATE.md`. Images that
 break a rule stop with a `[BUS] stall:` line instead of booting.

@@ -110,6 +110,19 @@ def irq(text, version):
             ' * historical emulator assumptions, superseded by hardware.c. */\n' + text)
     return text
 
+def nand_drain(text):
+    # Drain all 16 spare bytes as the ROM (9FC01A98-1AAE) does: after the
+    # ROM's NAND boot a MODE-5 burst ends at 520 bytes and a further read
+    # hangs a real BE-300 for good; MODE 4 streams the last 8.
+    drain = ('/* Drain all 16 spare bytes as the ROM does: 8 in MODE 5, the last 8\n'
+             '\t * in MODE 4 (a 9th MODE-5 word hangs the bus), then release. */\n'
+             '\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t*XFER_MODE = 0x04;\n'
+             '\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t*XFER_MODE = 0;\n\t*XFER_CMD = 0;')
+    text = text.replace('/* Drain the 8-byte OOB region (we ignore content). */\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;', drain)
+    # Trees an earlier install drained in MODE 5 alone.
+    text = text.replace('/* Drain all 16 spare bytes and release the transfer. */\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t*XFER_MODE = 0;\n\t*XFER_CMD = 0;', drain)
+    return text
+
 def nand(text):
     # Select once per NAND command, not on every transfer-register write.
     modern = 'be300_nand_send_command' in text
@@ -130,8 +143,7 @@ def nand(text):
         text = text.replace('*XFER_CMD = 0x03;', '*XFER_CMD = 0x02;\n\t*XFER_CMD = 0x03;')
         text = text.replace('*XFER_ACK = 0;', '(void)*XFER_ACK;\n\t*XFER_CMD = 0x02;')
         text = function_body(text, 'nand_send_addr', lambda b: b + '\n\txfer_wait_ready();\n')
-        text = text.replace('/* Drain the 8-byte OOB region (we ignore content). */\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;',
-                            '/* Drain all 16 spare bytes and release the transfer. */\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t(void)*STREAM_PORT;\n\t*XFER_MODE = 0;\n\t*XFER_CMD = 0;')
+        text = nand_drain(text)
     return text
 
 def console(text, names):
@@ -161,6 +173,10 @@ def install(tree, version):
     source = REPO / 'board/casio-be300'
     for name in ['hardware.c', 'hardware.h', 'hardware-regs.h', 'audio.c', 'audio-regs.h', 'wifi.c', 'wifi-proto.h', 'wifi-wext.h', 'card.h']:
         copy_changed(source / name, board / name)
+    if version == '4.2':
+        # 2.6 and 2.4 bring their own 520-byte page readers in their patch
+        # series; 4.2's driver is this file, kept current here.
+        copy_changed(source / 'nand.c', board / 'nand.c')
     copy_changed(source / 'hardware.h', tree / 'include/linux/be300_hardware.h')
     copy_changed(source / 'card.h', tree / 'include/linux/be300_card.h')
     makefile = board / 'Makefile'
@@ -232,6 +248,10 @@ def install(tree, version):
     adapt(board / ('irq_be300.c' if version == '2.4' else 'irq.c'),
           lambda s: irq(s, version))
     adapt(board / ('nand_be300.c' if version == '2.4' else 'nand.c'), nand)
+    if version != '4.2':
+        # Adapted trees are skipped above; this rewrite is idempotent.
+        path = board / ('nand_be300.c' if version == '2.4' else 'nand.c')
+        path.write_text(nand_drain(path.read_text()))
     print('BE-300 hardware support staged for Linux ' + version)
 
 if __name__ == '__main__':
