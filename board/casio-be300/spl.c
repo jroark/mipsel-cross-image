@@ -131,9 +131,13 @@ static void nand_read_page(uint32_t page, uint32_t *dest)
     /* 128 4-byte reads = 512 data bytes. */
     for (int i = 0; i < 128; i++)
         dest[i] = STREAM_DATA;
-    /* Drain the whole spare area, then release the PIO transfer. */
+    /* Drain the whole spare area as the ROM (9FC01A98-1AAE) and Casio's SPL
+     * do: after the ROM's NAND boot a MODE-5 burst ends at 520 bytes, and
+     * on a real BE-300 a further read hangs the bus for good (glaze-os
+     * docs/NAND_BOOT_AUDIT.md). MODE 4 streams the last 8 spare bytes. */
     (void)STREAM_DATA;
     (void)STREAM_DATA;
+    XFER_MODE = 0x04u;
     (void)STREAM_DATA;
     (void)STREAM_DATA;
     XFER_MODE = 0;

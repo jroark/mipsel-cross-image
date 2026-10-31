@@ -38,7 +38,8 @@
 #define BE300_NAND_XFER_KICK		0x60
 #define BE300_NAND_XFER_MODE		0x64
 
-#define BE300_NAND_MODE_READ		0x05
+#define BE300_NAND_MODE_READ		0x05	/* 512 data + first 8 spare */
+#define BE300_NAND_MODE_READ_OOB2	0x04	/* last 8 spare bytes */
 #define BE300_NAND_MODE_PROGRAM		0x07
 #define BE300_NAND_MODE_PROGRAM_OOB2	0x06
 
@@ -63,6 +64,7 @@ static u16 be300_nand_area_base;
 static u16 be300_nand_read_skip;
 static bool be300_nand_read_skip_done;
 static bool be300_nand_stream_started;
+static u16 be300_nand_read_pos;
 static u16 be300_nand_program_column;
 static u16 be300_nand_program_pos;
 static bool be300_nand_program_started;
@@ -206,22 +208,38 @@ static void be300_nand_start_read_stream(void)
 				       BE300_NAND_MODE_READ);
 		be300_nand_wait_xfer_ready();
 		be300_nand_stream_started = true;
+		be300_nand_read_pos = 0;
 	}
 }
 
+/*
+ * A page streams as the ROM (9FC01A98-1AAE) and Casio's SPL read it: 520
+ * bytes in MODE 5, then MODE 4 for the last 8 spare bytes. After the ROM's
+ * NAND boot a MODE-5 burst ends at 520 bytes, and on a real BE-300 a
+ * further stream read hangs the bus for good (glaze-os
+ * docs/NAND_BOOT_AUDIT.md).
+ */
 static u8 be300_nand_stream_read_byte(void)
 {
+	if (be300_nand_read_pos >= BE300_NAND_PAGE_RAW)
+		return 0xff;
+	if (be300_nand_read_pos == BE300_NAND_PAGE_DATA + 8)
+		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
+				       BE300_NAND_MODE_READ_OOB2);
+	be300_nand_read_pos++;
 	return readb(be300_nand_stream_io);
 }
 
 static void be300_nand_discard_stream(unsigned int len)
 {
-	while (len >= 4) {
+	while (len >= 4 &&
+	       be300_nand_read_pos + 4 <= BE300_NAND_PAGE_DATA + 8) {
 		(void)readl(be300_nand_stream_io);
+		be300_nand_read_pos += 4;
 		len -= 4;
 	}
 	while (len--)
-		(void)readb(be300_nand_stream_io);
+		(void)be300_nand_stream_read_byte();
 }
 
 static void be300_nand_read_buf(struct mtd_info *mtd, u8 *buf, int len)
