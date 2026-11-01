@@ -138,6 +138,7 @@ static void nand_read_page(uint32_t page, uint32_t *dest)
     (void)STREAM_DATA;
     (void)STREAM_DATA;
     XFER_MODE = 0x04u;
+    nand_wait_ready();
     (void)STREAM_DATA;
     (void)STREAM_DATA;
     XFER_MODE = 0;

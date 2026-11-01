@@ -9,4 +9,6 @@ void be300_girq0_pending_ack(unsigned int pending);
 void be300_girq0_init(void);
 /* Before the first companion SIU access: powers its units on if needed. */
 void be300_console_ready(void);
+/* Linux 2.4 registers fbcon before the board initcall runs. */
+void be300_framebuffer_ready(void);
 #endif

@@ -25,3 +25,5 @@
 #   Keep the patch file for future input diagnostics; re-enable by
 #   uncommenting this line.
 0016-be300-2_4-front-buttons-evdev.patch
+0017-sound-firmware-errno.patch
+0018-disable-compiler-builtins.patch

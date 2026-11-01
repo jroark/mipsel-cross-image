@@ -1,0 +1,14 @@
+Prevent modern GCC turning kernel string operations into unavailable libc calls.
+The MIPS kernel supplies strcpy as an inline assembly helper, not an external
+symbol; sprintf("%s", ...) in the OSS core otherwise becomes a call to strcpy.
+
+--- a/Makefile
++++ b/Makefile
+@@ -91,4 +91,4 @@
+-CFLAGS := $(CPPFLAGS) -Wall -Wstrict-prototypes -Wno-trigraphs -O2 \
+-	  -fomit-frame-pointer -fno-strict-aliasing -fno-common \
+-	  -finline-limit=5000
++CFLAGS := $(CPPFLAGS) -Wall -Wstrict-prototypes -Wno-trigraphs -O2 \
++	  -fomit-frame-pointer -fno-strict-aliasing -fno-common -fno-builtin \
++	  -finline-limit=5000
+ AFLAGS := -D__ASSEMBLY__ $(CPPFLAGS)
