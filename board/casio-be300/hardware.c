@@ -77,6 +77,16 @@ void be300_giu0_prepare(void)
 	be300_regs_giu0();
 }
 
+void be300_piu_start(void)
+{
+	be300_regs_piu_start();
+}
+
+void be300_piu_ack(unsigned int status)
+{
+	be300_regs_piu_ack(status);
+}
+
 int be300_piu_prepare(void)
 {
 	if (be300_regs_piu_prepare()) {

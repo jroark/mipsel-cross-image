@@ -19,6 +19,7 @@
  * published by the Free Software Foundation.
  */
 #include <linux/init.h>
+#include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/mtd/mtd.h>
@@ -26,312 +27,9 @@
 #include <linux/mtd/partitions.h>
 #include <linux/platform_device.h>
 
-#define BE300_NAND_XFER_PA		0x0a00a400
-#define BE300_NAND_XFER_LEN		0x100
-#define BE300_NAND_STREAM_PA		0x0a00b000
-#define BE300_NAND_STREAM_LEN		4
+#include "nand_controller.h"
 
-#define BE300_NAND_XFER_CMD		0x14
-#define BE300_NAND_XFER_ADDR		0x20
-#define BE300_NAND_XFER_ACK		0x30
-#define BE300_NAND_XFER_STATUS		0x40
-#define BE300_NAND_XFER_KICK		0x60
-#define BE300_NAND_XFER_MODE		0x64
-
-#define BE300_NAND_MODE_READ		0x05	/* 512 data + first 8 spare */
-#define BE300_NAND_MODE_READ_OOB2	0x04	/* last 8 spare bytes */
-#define BE300_NAND_MODE_PROGRAM		0x07
-#define BE300_NAND_MODE_PROGRAM_OOB2	0x06
-
-#define BE300_NAND_PAGE_DATA		512
-#define BE300_NAND_PAGE_OOB		16
-#define BE300_NAND_PAGE_RAW		(BE300_NAND_PAGE_DATA + \
-					 BE300_NAND_PAGE_OOB)
-#define BE300_NAND_STATUS_READY		0xc0
-
-static void __iomem *be300_nand_xfer_io;
-static void __iomem *be300_nand_stream_io;
-
-static enum {
-	BE300_NAND_PHASE_NONE,
-	BE300_NAND_PHASE_ADDR,
-} be300_nand_phase;
-
-static u8 be300_nand_last_cmd;
-static u8 be300_nand_id_pos;
-static u8 be300_nand_addr_pos;
-static u16 be300_nand_area_base;
-static u16 be300_nand_read_skip;
-static bool be300_nand_read_skip_done;
-static bool be300_nand_stream_started;
-static u16 be300_nand_read_pos;
-static u16 be300_nand_program_column;
-static u16 be300_nand_program_pos;
-static bool be300_nand_program_started;
-
-static inline void be300_nand_xfer_write(u32 off, u32 val)
-{
-	writel(val, be300_nand_xfer_io + off);
-}
-
-static inline u32 be300_nand_xfer_read(u32 off)
-{
-	return readl(be300_nand_xfer_io + off);
-}
-
-static void be300_nand_wait_xfer_ready(void)
-{
-	unsigned int timeout = 100000;
-
-	while (timeout-- &&
-	       !(be300_nand_xfer_read(BE300_NAND_XFER_STATUS) & 1))
-		;
-}
-
-static void be300_nand_finish_addr(void)
-{
-	if (be300_nand_phase != BE300_NAND_PHASE_ADDR)
-		return;
-
-	(void)be300_nand_xfer_read(BE300_NAND_XFER_ACK);
-	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x02);
-	be300_nand_wait_xfer_ready();
-	be300_nand_phase = BE300_NAND_PHASE_NONE;
-}
-
-static void be300_nand_begin_addr(void)
-{
-	if (be300_nand_phase == BE300_NAND_PHASE_ADDR)
-		return;
-
-	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x06);
-	be300_nand_addr_pos = 0;
-	be300_nand_phase = BE300_NAND_PHASE_ADDR;
-}
-
-static void be300_nand_send_addr(int addr)
-{
-	u8 byte = addr;
-
-	be300_nand_begin_addr();
-	writeb(byte, be300_nand_xfer_io + BE300_NAND_XFER_ADDR);
-
-	if (be300_nand_addr_pos == 0 &&
-	    be300_nand_last_cmd == NAND_CMD_SEQIN)
-		be300_nand_program_column += byte;
-	be300_nand_addr_pos++;
-}
-
-static void be300_nand_send_command(u8 cmd)
-{
-	/* NK/SPL 80F0A654: select the unit explicitly. */
-	writel(1, (void *)0xaa001134UL);
-	writel(1, (void *)0xaa00a400UL);
-	writel(1, (void *)0xaa00a408UL);
-	writel(1, (void *)0xaa00a40cUL);
-	writel(1, (void *)0xaa00a410UL);
-	be300_nand_finish_addr();
-
-	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x02);
-	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x03);
-	writeb(cmd, be300_nand_xfer_io + BE300_NAND_XFER_ADDR);
-	(void)be300_nand_xfer_read(BE300_NAND_XFER_ACK);
-	be300_nand_xfer_write(BE300_NAND_XFER_CMD, 0x02);
-	be300_nand_wait_xfer_ready();
-
-	be300_nand_last_cmd = cmd;
-	be300_nand_stream_started = false;
-	be300_nand_read_skip_done = false;
-
-	switch (cmd) {
-	case NAND_CMD_READ0:
-		be300_nand_area_base = 0;
-		be300_nand_read_skip = 0;
-		break;
-	case NAND_CMD_READ1:
-		be300_nand_area_base = 256;
-		be300_nand_read_skip = 256;
-		break;
-	case NAND_CMD_READOOB:
-		be300_nand_area_base = BE300_NAND_PAGE_DATA;
-		be300_nand_read_skip = BE300_NAND_PAGE_DATA;
-		break;
-	case NAND_CMD_SEQIN:
-		be300_nand_program_column = be300_nand_area_base;
-		be300_nand_program_pos = 0;
-		be300_nand_program_started = false;
-		break;
-	case NAND_CMD_READID:
-		be300_nand_id_pos = 0;
-		break;
-	case NAND_CMD_PAGEPROG:
-		be300_nand_program_started = false;
-		break;
-	default:
-		break;
-	}
-}
-
-static void be300_nand_cmd_ctrl(struct mtd_info *mtd, int cmd,
-				unsigned int ctrl)
-{
-	if (!be300_nand_xfer_io)
-		return;
-
-	if ((ctrl & NAND_CTRL_CHANGE) && !(ctrl & NAND_ALE))
-		be300_nand_finish_addr();
-
-	if (cmd == NAND_CMD_NONE)
-		return;
-
-	if (ctrl & NAND_ALE) {
-		be300_nand_send_addr(cmd);
-		return;
-	}
-
-	if (ctrl & NAND_CLE)
-		be300_nand_send_command(cmd);
-}
-
-static int be300_nand_dev_ready(struct mtd_info *mtd)
-{
-	return !!(be300_nand_xfer_read(BE300_NAND_XFER_STATUS) & 1);
-}
-
-static void be300_nand_start_read_stream(void)
-{
-	be300_nand_finish_addr();
-
-	if (!be300_nand_stream_started) {
-		be300_nand_xfer_write(BE300_NAND_XFER_KICK, 1);
-		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
-				       BE300_NAND_MODE_READ);
-		be300_nand_wait_xfer_ready();
-		be300_nand_stream_started = true;
-		be300_nand_read_pos = 0;
-	}
-}
-
-/*
- * A page streams as the ROM (9FC01A98-1AAE) and Casio's SPL read it: 520
- * bytes in MODE 5, then MODE 4 for the last 8 spare bytes. After the ROM's
- * NAND boot a MODE-5 burst ends at 520 bytes, and on a real BE-300 a
- * further stream read hangs the bus for good (glaze-os
- * docs/NAND_BOOT_AUDIT.md).
- */
-static u8 be300_nand_stream_read_byte(void)
-{
-	if (be300_nand_read_pos >= BE300_NAND_PAGE_RAW)
-		return 0xff;
-	if (be300_nand_read_pos == BE300_NAND_PAGE_DATA + 8) {
-		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
-				       BE300_NAND_MODE_READ_OOB2);
-		be300_nand_wait_xfer_ready();
-	}
-	be300_nand_read_pos++;
-	return readb(be300_nand_stream_io);
-}
-
-static void be300_nand_discard_stream(unsigned int len)
-{
-	while (len >= 4 &&
-	       be300_nand_read_pos + 4 <= BE300_NAND_PAGE_DATA + 8) {
-		(void)readl(be300_nand_stream_io);
-		be300_nand_read_pos += 4;
-		len -= 4;
-	}
-	while (len--)
-		(void)be300_nand_stream_read_byte();
-}
-
-static void be300_nand_read_buf(struct mtd_info *mtd, u8 *buf, int len)
-{
-	int i;
-
-	if (len <= 0)
-		return;
-
-	if (be300_nand_last_cmd == NAND_CMD_STATUS) {
-		memset(buf, BE300_NAND_STATUS_READY, len);
-		return;
-	}
-
-	if (be300_nand_last_cmd == NAND_CMD_READID) {
-		for (i = 0; i < len; i++) {
-			static const u8 id[] = {
-				0xec, 0x73, 0xff, 0xff,
-				0xff, 0xff, 0xff, 0xff,
-			};
-
-			if (be300_nand_id_pos < ARRAY_SIZE(id))
-				buf[i] = id[be300_nand_id_pos++];
-			else
-				buf[i] = 0xff;
-		}
-		return;
-	}
-
-	be300_nand_start_read_stream();
-	if (!be300_nand_read_skip_done) {
-		be300_nand_discard_stream(be300_nand_read_skip);
-		be300_nand_read_skip_done = true;
-	}
-
-	for (i = 0; i < len; i++)
-		buf[i] = be300_nand_stream_read_byte();
-}
-
-static unsigned char be300_nand_read_byte(struct mtd_info *mtd)
-{
-	u8 byte;
-
-	be300_nand_read_buf(mtd, &byte, 1);
-	return byte;
-}
-
-static void be300_nand_start_program_stream(void)
-{
-	if (!be300_nand_program_started) {
-		be300_nand_finish_addr();
-		be300_nand_xfer_write(BE300_NAND_XFER_KICK, 1);
-		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
-				       BE300_NAND_MODE_PROGRAM);
-		be300_nand_wait_xfer_ready();
-		be300_nand_program_started = true;
-		be300_nand_program_pos = 0;
-	}
-}
-
-static void be300_nand_stream_write_byte(u8 byte)
-{
-	if (be300_nand_program_pos >= BE300_NAND_PAGE_RAW)
-		return;
-
-	if (be300_nand_program_pos == BE300_NAND_PAGE_DATA + 8) {
-		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
-				       BE300_NAND_MODE_PROGRAM_OOB2);
-		be300_nand_wait_xfer_ready();
-	}
-
-	writeb(byte, be300_nand_stream_io);
-	be300_nand_program_pos++;
-}
-
-static void be300_nand_write_buf(struct mtd_info *mtd, const u8 *buf, int len)
-{
-	int i;
-
-	if (len <= 0 || be300_nand_last_cmd != NAND_CMD_SEQIN)
-		return;
-
-	be300_nand_start_program_stream();
-
-	while (be300_nand_program_pos < be300_nand_program_column)
-		be300_nand_stream_write_byte(0xff);
-
-	for (i = 0; i < len; i++)
-		be300_nand_stream_write_byte(buf[i]);
-}
+#include "nand_physical.h"
 
 /*
  * The emulator synthesizes OOB on the fly using Casio's NANDWRITER tag
@@ -347,6 +45,8 @@ static int be300_nand_block_bad(struct mtd_info *mtd, loff_t ofs, int getchip)
 	return 0;
 }
 
+static void physical_partition_size(void);
+
 static int be300_nand_ctrl_probe(struct platform_device *pdev)
 {
 	/*
@@ -358,6 +58,7 @@ static int be300_nand_ctrl_probe(struct platform_device *pdev)
 	 * OOB makes every block look bad and JFFS2 sees an empty rootfs.
 	 */
 	struct nand_chip *chip = platform_get_drvdata(pdev);
+	int physical;
 
 	if (chip) {
 		chip->block_bad = be300_nand_block_bad;
@@ -377,6 +78,14 @@ static int be300_nand_ctrl_probe(struct platform_device *pdev)
 				     BE300_NAND_XFER_LEN);
 	if (!be300_nand_xfer_io)
 		return -ENOMEM;
+	physical = physical_setup(chip);
+	if (physical > 0)
+		physical_partition_size();
+	if (physical < 0) {
+		iounmap(be300_nand_xfer_io);
+		be300_nand_xfer_io = NULL;
+		return physical;
+	}
 	return 0;
 }
 
@@ -423,6 +132,11 @@ static struct mtd_partition be300_nand_partitions[] = {
 		.size		= 0xb00000,
 	},
 };
+
+static void physical_partition_size(void)
+{
+	be300_nand_partitions[3].size = 684 * 16384;
+}
 
 static struct platform_nand_data be300_nand_data = {
 	.chip = {

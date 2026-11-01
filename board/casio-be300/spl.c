@@ -9,6 +9,10 @@
  */
 
 #include <stdint.h>
+#include "nand_boot.h"
+/* Keep the standalone SPL build shared by all kernel versions. */
+#include "nand_ecc.c"
+#include "nand_boot.c"
 
 /* Kernel layout — overridden by -DKERNEL_* on the SPL command line. */
 #ifndef KERNEL_LOAD_VA
@@ -49,8 +53,8 @@
  */
 static int siu_clocked(void)
 {
-    return (*(volatile uint32_t *)0xAA001108u | *(volatile uint32_t *)0xAA00112Cu |
-            *(volatile uint32_t *)0xAA001138u | *(volatile uint32_t *)0xAA00113Cu) & 1u;
+    return (*(volatile uint32_t *)0xAA001108u & *(volatile uint32_t *)0xAA00112Cu &
+            *(volatile uint32_t *)0xAA001138u & *(volatile uint32_t *)0xAA00113Cu) & 1u;
 }
 
 static void uart_putc(char c)
@@ -135,16 +139,97 @@ static void nand_read_page(uint32_t page, uint32_t *dest)
      * do: after the ROM's NAND boot a MODE-5 burst ends at 520 bytes, and
      * on a real BE-300 a further read hangs the bus for good (glaze-os
      * docs/NAND_BOOT_AUDIT.md). MODE 4 streams the last 8 spare bytes. */
-    (void)STREAM_DATA;
-    (void)STREAM_DATA;
+    dest[128] = STREAM_DATA;
+    dest[129] = STREAM_DATA;
     XFER_MODE = 0x04u;
     nand_wait_ready();
-    (void)STREAM_DATA;
-    (void)STREAM_DATA;
+    dest[130] = STREAM_DATA;
+    dest[131] = STREAM_DATA;
     XFER_MODE = 0;
     XFER_CMD = 0;
     *(volatile uint32_t *)0xAA00A410u = 0;
 }
+
+static struct nand_boot_map boot_map;
+
+static int read_raw(void *ctx, uint32_t page, uint8_t raw[528])
+{
+    (void)ctx;
+    nand_read_page(page, (uint32_t *)raw);
+    return 0;
+}
+
+static void __attribute__((noreturn)) boot_fail(const char *reason)
+{
+    uart_puts(reason);
+    for (;;) ;
+}
+
+/* Match the stock SPL's cold NAND handoff before touching DMA state. */
+static void nand_cold_init(void)
+{
+    static const uint16_t gates[] = {
+        0x1128, 0x1100, 0x110c, 0x1104, 0x1108,
+        0x1120, 0x112c, 0x1138, 0x113c
+    };
+    for (unsigned i = 0; i < sizeof(gates) / sizeof(gates[0]); i++)
+        *(volatile uint32_t *)(0xaa000000u + gates[i]) = 1;
+    *(volatile uint32_t *)0xaa00a0dcu = 0xff;
+    *(volatile uint32_t *)0xaa001134u = 1;
+    *(volatile uint32_t *)0xaa00a400u = 0;
+    *(volatile uint32_t *)0xaa001cc0u = 0;
+    *(volatile uint32_t *)0xaa00a400u = 1;
+    *(volatile uint32_t *)0xaa00a408u = 1;
+    *(volatile uint32_t *)0xaa00a40cu = 1;
+    *(volatile uint32_t *)0xaa00a410u = 1;
+    XFER_MODE = 0;
+    XFER_CMD = 2;
+    XFER_CMD = 3;
+    XFER_ADDR8 = 0xff; /* RESET */
+    (void)XFER_ACK;
+    XFER_CMD = 2;
+    nand_wait_ready();
+}
+
+#ifdef BE300_SPL_DIAG
+/* DIAGNOSTIC: light the panel from the SPL and paint numbered bands so a
+ * hang before the kernel's own LCD init is visible (see docs/HARDWARE.md). */
+typedef uint32_t u32;
+#define BE300_R32(pa) (*(volatile uint32_t *)(0xa0000000u | (pa)))
+#define BE300_W32(pa, v) (*(volatile uint32_t *)(0xa0000000u | (pa)) = (v))
+#define BE300_R16(pa) (*(volatile uint16_t *)(0xa0000000u | (pa)))
+#define BE300_W16(pa, v) (*(volatile uint16_t *)(0xa0000000u | (pa)) = (v))
+static void spl_delay(unsigned int us)
+{
+    for (volatile unsigned int i = 0; i < us * 40u; i++) ;
+}
+#define BE300_DELAY(us) spl_delay(us)
+#include "hardware-regs.h"
+static void diag_mark(unsigned int n)
+{
+    static const uint16_t colors[] = {
+        0xf800, 0xffe0, 0x07e0, 0x07ff, 0x001f, 0xf81f, 0xffff, 0xfc00
+    };
+    volatile uint16_t *fb = (volatile uint16_t *)0xaa200000u;
+    for (unsigned int y = n * 12; y < n * 12 + 10; y++)
+        for (unsigned int x = 0; x < 240; x++)
+            fb[y * 256 + x] = x < 8 * (n + 1) ? 0xffff : colors[n % 8];
+}
+static void diag_lcd_on(void)
+{
+    be300_regs_power_on();
+    BE300_W32(0x0a001100, 1);
+    BE300_W32(0x0a00110c, 1);
+    be300_regs_lcd_init();
+    be300_regs_brightness(5);
+    volatile uint16_t *fb = (volatile uint16_t *)0xaa200000u;
+    for (unsigned int i = 0; i < 320 * 256; i++) fb[i] = 0;
+    diag_mark(0);
+}
+#else
+#define diag_lcd_on() do { } while (0)
+#define diag_mark(n) do { } while (0)
+#endif
 
 uint32_t spl_main(void)
 {
@@ -164,11 +249,24 @@ uint32_t spl_main(void)
      * cached kernel-entry fetch without an explicit cache flush. */
     uint32_t *dst = (uint32_t *)((KERNEL_LOAD_VA & 0x1FFFFFFFu) | 0xA0000000u);
 
+    nand_cold_init();
+    diag_lcd_on();
+    if (nand_boot_scan(&boot_map, read_raw, 0, true))
+        boot_fail("SPL: ambiguous NAND boot map\n");
+    if (boot_map.protected) {
+        uint8_t manifest[512] __attribute__((aligned(4)));
+        if (nand_boot_read(&boot_map, read_raw, 0, 1, manifest, false) ||
+            nand_boot_manifest_valid(manifest))
+            boot_fail("SPL: invalid physical NAND manifest\n");
+    }
+    diag_mark(1);
     for (uint32_t i = 0; i < pages; i++) {
-        nand_read_page(start_page + i, dst);
+        if (nand_boot_read(&boot_map, read_raw, 0, start_page + i, dst, true))
+            boot_fail("SPL: missing or corrupt kernel page\n");
         dst += NAND_PAGE_DATA / 4;
     }
 
+    diag_mark(2);
     uart_puts("kernel loaded; jumping\n");
     return KERNEL_ENTRY_VA;
 }

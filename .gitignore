@@ -103,3 +103,12 @@ __pycache__/
 
 # Optional Wi-Fi userspace build (sources and binaries are local only)
 /build-wifi/
+
+# Separate kernel tree for the NAND-capable Linux 2.4 backport
+/linux-2.4.18-physical/
+
+# Private hardware backups and physical NAND candidates
+/out/physical-nand/
+
+# Native image tools
+/out/host/

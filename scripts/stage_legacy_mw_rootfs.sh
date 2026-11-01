@@ -17,6 +17,10 @@
 # nxterm hardcodes; they are appended to the device table when missing.
 set -euo pipefail
 
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    export BE300_JFFS2_PAD="${BE300_JFFS2_PAD:-0xAB0000}"
+fi
+
 REPO=/work
 DEVTABLE=""
 JFFS2_ROOTFS=""
@@ -430,6 +434,6 @@ echo "--- Building JFFS2 image $JFFS2_ROOTFS ---"
 mkfs.jffs2 --root="$JFFS2_WORK/root" \
     --devtable="$DEVTABLE_PGUI" \
     --eraseblock=16384 --pagesize=512 --no-cleanmarkers \
-    --pad=0xB00000 --little-endian \
+    --pad="${BE300_JFFS2_PAD:-0xB00000}" --little-endian \
     --output="$JFFS2_ROOTFS"
 echo "  rootfs : $(ls -la "$JFFS2_ROOTFS" | awk '{print $5, $9}')"

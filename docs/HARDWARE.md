@@ -71,7 +71,19 @@ switching it on and off live over USB:
   (`board/casio-be300/nand.c`, which the installer now copies into the tree)
   and the 2.6/2.4 drivers (the installer's `nand_drain`) all split this way.
 
-The emulator models these since `be300` `docs/POWER_ON_STATE.md`. Images that
+- **Reset does not invalidate the I-cache, and RAM keeps the last OS's data**
+  (2026-11-01). The ROM's tag loop at `0xBFC00700` runs `cache 0x8,0(t0)` while
+  it increments `a0`, so it clears one I-cache line. Its D-cache loop at
+  `0xBFC0071C` is correct. After a Glaze RAM recovery, a reset into Linux could
+  run stale Glaze lines at the kernel's addresses. The SPL's un-zeroed BSS also
+  left `nand_ecc.c`'s lazily built RS tables holding Glaze data. Either one
+  silently hangs before the LCD/backlight comes up. `spl_start.S` now runs this
+  sequence from KSEG1 before any C, as Glaze's SPL does:
+  `Index_Writeback_Inv_D` + `Index_Invalidate_I` over 32 KiB, then it zeroes
+  `__bss_start..__bss_end`.
+
+The emulator models these since `be300` `docs/POWER_ON_STATE.md`. It does not
+model caches or leftover RAM contents, so it cannot catch the last rule. Images that
 break a rule stop with a `[BUS] stall:` line instead of booting.
 
 ## Source evidence
@@ -353,10 +365,11 @@ Microwindows copies include the optional diagnostic serial-shell overlay.
 The follow-up [sound and Wi-Fi drivers](WIFI_SOUND.md) add OSS wave output
 and XI-825/WL54-CF station networking. Their interfaces and validation limits
 are documented separately. Existing
-APM status estimates are not calibrated battery measurements. The legacy MTD
-NOR-emulation/OOB/ECC policy is not converted into a verified physical NAND
-FTL by adding unit enables; physical flash writes still require a separately
-validated ECC/bad-block/layout path. The SPL does not add speculative ECC.
+APM status estimates are not calibrated battery measurements. Physical NAND
+now has a separate [ECC, inventory and recovery path](PHYSICAL_NAND.md), including
+a NAND-capable MTD/JFFS2 backport for Linux 2.4. Default legacy emulator builds
+retain their original data-only storage policy; use the explicit physical mode
+and a backup-bound raw candidate for hardware.
 
 Timing-field meanings, panel optical curves, factory EEPROM contents, full
 suspend/reset retention, and the separate buzzer remain unmeasured. No live

@@ -366,3 +366,29 @@ CVS repository snapshots from the linux4.be project (2002-2006):
 - `vmlinux-2.6` (Linux 2.6.8.1) — boots to userspace, `2.6.log` has sample output
 
 Compare boot output (PClock/VTClock/TClock, CPU revision, memory detection) against these references.
+
+## Physical NAND builds
+
+See `docs/PHYSICAL_NAND.md`. `BE300_PHYSICAL_NAND=1` enables stock-RAM physical
+profiles, a fresh 684-block JFFS2 filesystem and persistent OPIE home storage.
+Linux 2.4 uses a separate `linux-2.4.18-physical/` tree with the pinned upstream
+MTD/JFFS2 backport. The offline `tools/physical_linux_nand.py` encoder requires
+a source-built physical-capable kernel and a device-bound raw CE backup.
+Data-only `.nand` images are intermediates, not raw programmer inputs.
+
+Hardware lessons (Nov 1, 2026; real BE-300 flashed through Glaze `nand-apply`):
+- **The boot ROM never invalidates the I-cache.** Its tag loop at `0xBFC00700`
+  runs `cache 0x8,0(t0)` while incrementing `a0`. RAM also keeps the previous
+  OS's data, so `spl_start.S` flushes both caches from KSEG1 and zeroes its own
+  BSS before any C, as Glaze's SPL does. The emulator has no caches and zeroes
+  RAM, so it cannot catch this class of bug. See docs/HARDWARE.md.
+- **Real-panel touch needs the stroke filter.** Unfiltered samples made taps
+  read as drags. 4.2 carries it inline in `touch_be300.c`; 2.4/2.6 get
+  `board/casio-be300/touch_filter.h` from `install_board_hardware.py`.
+- **Some 4.2 builds stayed black (no backlight) on hardware for an unknown
+  reason** while booting fine in the emulator. A build with
+  `-DBE300_SPL_DIAG` booted. That SPL lights the LCD early and paints numbered
+  progress bands, so keep it on for hardware candidates until the cause is
+  known. Legacy builds take it via `BE300_SPL_EXTRA_CFLAGS=-DBE300_SPL_DIAG`.
+- `BE300_2_6_UI=pgui` packs the staged `rootfs_be300_picogui_legacy26/` tree,
+  which is untracked. Override the path with `BE300_2_6_PGUI_ROOT`.

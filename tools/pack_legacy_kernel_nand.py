@@ -111,6 +111,9 @@ def build_spl(build_dir: Path, load_va: int, entry_va: int, size: int) -> Path:
         f"-DKERNEL_ENTRY_VA={entry_va:#010x}u",
         f"-DKERNEL_SIZE={size:#x}u",
     ]
+    # Opt-in extras, e.g. BE300_SPL_EXTRA_CFLAGS=-DBE300_SPL_DIAG for the
+    # early-LCD progress bands on hardware.
+    cflags += os.environ.get("BE300_SPL_EXTRA_CFLAGS", "").split()
     spl_start_o = build_dir / "spl_start.o"
     spl_o = build_dir / "spl.o"
     spl_elf = build_dir / "spl.elf"

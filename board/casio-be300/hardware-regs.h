@@ -104,6 +104,29 @@ static int be300_regs_piu_prepare(void)
 	return 0;
 }
 
+/* Hardware-verified Glaze/NEC scan mode: start AND stop requests, and
+ * restart after acknowledging a page or an overrun (VRC4173 UM 9.7). */
+static void be300_regs_piu_start(void)
+{
+	BE300_W32(0x0a0003c8, 3);
+	BE300_W16(0x0a000308, 0x05dc);
+	BE300_W16(0x0a00030c, 0x00c8);
+	BE300_W16(0x0a000304, 0xdd00);
+	BE300_W16(0x0a000300, 0x0306);
+}
+
+static void be300_regs_piu_ack(unsigned int status)
+{
+	unsigned int pending = (status & 0xff) & (status >> 8);
+
+	if (!pending)
+		return;
+	if (pending & 0x04)
+		pending |= 0x18; /* both full pages must clear after DATALOST */
+	BE300_W16(0x0a000304, (status & 0xff00) | pending);
+	BE300_W16(0x0a000300, 0x0306);
+}
+
 static void be300_regs_watchdog_reload(void)
 {
 	(void)BE300_R32(0x0a007834);

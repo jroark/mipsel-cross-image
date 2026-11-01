@@ -17,6 +17,10 @@ For deep hardware / porting notes see [`CLAUDE.md`](CLAUDE.md).
 - Framebuffer, polled keyboard, early printk over the companion-chip UART,
   and devtmpfs all work.
 
+Source builds also have a physical NAND encoder and writable JFFS2 path for
+stock 16 MiB hardware. See [physical NAND builds, backup and recovery](docs/PHYSICAL_NAND.md)
+for build flags, the Linux 2.4 backport and validation evidence.
+
 ## Hardware initialization
 
 Source rebuilds of the 2.4.18, 2.6.8.1 and 4.2.9 profiles install the shared

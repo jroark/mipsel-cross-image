@@ -42,6 +42,11 @@
 
 set -euo pipefail
 
+# Physical images leave the top 20 erase blocks for boot replacements.
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    export BE300_JFFS2_PAD="${BE300_JFFS2_PAD:-0xAB0000}"
+fi
+
 REPO=/work
 MODE="${BE300_2_6_MODE:-rebuild}"
 
@@ -85,8 +90,9 @@ CONSOLE="${BE300_2_6_CONSOLE:-tty0}"
 case "$UI" in
     opie) OUT="${BE300_2_6_NAND:-$REPO/linux-4.2.9/be300-2_6-opie.nand}" ;;
     mw)   OUT="${BE300_2_6_NAND:-$REPO/linux-4.2.9/be300-2_6-mw.nand}" ;;
+    pgui) OUT="${BE300_2_6_NAND:-$REPO/linux-4.2.9/be300-2_6-pgui.nand}" ;;
     none) OUT="${BE300_2_6_NAND:-$REPO/linux-4.2.9/be300-2_6-rebuilt.nand}" ;;
-    *) echo "ERROR: BE300_2_6_UI must be 'opie', 'mw' or 'none' (got '$UI')" >&2; exit 2 ;;
+    *) echo "ERROR: BE300_2_6_UI must be 'opie', 'mw', 'pgui' or 'none' (got '$UI')" >&2; exit 2 ;;
 esac
 case "$CONSOLE" in
     tty0|ttyS0) ;;
@@ -133,6 +139,9 @@ python3 "$REPO/scripts/install_board_hardware.py" "$SOURCE_DIR" --kernel 2.6
 echo "--- Configuring be300_2_6_defconfig ---"
 "${KMAKE[@]}" be300_2_6_defconfig >/dev/null
 CMDLINE=$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "$SOURCE_DIR/.config")
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    CMDLINE="$CMDLINE rw"
+fi
 if [[ "$CONSOLE" == "ttyS0" ]]; then
     CMDLINE="${CMDLINE/console=tty0/console=ttyS0}"
 fi
@@ -147,6 +156,12 @@ if [[ "$UI" == "mw" ]]; then
         sed -i -e "/^$opt=/d" -e "/^# $opt is not set/d" "$SOURCE_DIR/.config"
     done
     grep -E '^CONFIG_' "$FRAG" >> "$SOURCE_DIR/.config"
+fi
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    sed -i -e '/^CONFIG_MTD_NAND=/d' -e '/^# CONFIG_MTD_NAND is not set/d' \
+        -e '/^CONFIG_JFFS2_FS_NAND=/d' -e '/^# CONFIG_JFFS2_FS_NAND is not set/d' \
+        -e '/^CONFIG_MTD_NAND_VERIFY_WRITE=/d' "$SOURCE_DIR/.config"
+    printf '%s\n' CONFIG_MTD_NAND=y CONFIG_MTD_NAND_VERIFY_WRITE=y CONFIG_JFFS2_FS_NAND=y >> "$SOURCE_DIR/.config"
 fi
 "${KMAKE[@]}" oldconfig </dev/null >/dev/null
 echo "  cmdline  = $CMDLINE"
@@ -185,6 +200,18 @@ elif [[ "$UI" == "mw" ]]; then
         --donor "${BE300_2_6_RAMDISK_SRC:-$REPO/vmlinux-mw}" \
         --devtable "$REPO/board/casio-be300/be300_2_6_devtable.txt" \
         --out "$JFFS2_ROOTFS"
+elif [[ "$UI" == "pgui" ]]; then
+    # Modern jserv PicoGUI (uClibc-ng, dynamic) staged for the legacy
+    # kernels; see BE300_2_6_PGUI_ROOT. Device nodes come from the devtable.
+    PGUI_ROOT="${BE300_2_6_PGUI_ROOT:-$REPO/rootfs_be300_picogui_legacy26}"
+    [[ -x "$PGUI_ROOT/bin/busybox" && -f "$PGUI_ROOT/etc/inittab" ]] || {
+        echo "ERROR: $PGUI_ROOT is not a staged PicoGUI rootfs" >&2; exit 1; }
+    JFFS2_ROOTFS="$REPO/linux-4.2.9/rootfs-2_6-pgui.jffs2"
+    mkfs.jffs2 --root="$PGUI_ROOT" \
+        --devtable="$REPO/board/casio-be300/be300_2_6_devtable.txt" \
+        --output="$JFFS2_ROOTFS" --eraseblock=16384 --pagesize=512 \
+        --no-cleanmarkers --pad="${BE300_JFFS2_PAD:-0xB00000}" \
+        --little-endian --squash
 fi
 
 # 6. Pack: SPL + flat kernel + JFFS2 mtd3 (tools/pack_legacy_kernel_nand.py

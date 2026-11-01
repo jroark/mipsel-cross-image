@@ -5,6 +5,7 @@ Only board drivers are adapted. Refuse unknown source layouts and preserve
 repeatability on already patched build trees; canonical code stays in board/.
 """
 import argparse
+import os
 import re
 from pathlib import Path
 
@@ -77,6 +78,105 @@ def touch(text):
         # Reset before allocating/registering input or enabling conversion.
         return inject(body, '\n\tif (be300_piu_prepare())\n\t\treturn -ETIMEDOUT;\n')
     return function_body(text, 'be300_touch_init', prepare)
+
+def touch_scan_upgrade(path, version):
+    if version == '4.2':
+        return
+    text = path.read_text()
+    if 'BE300 PIU hardware scan v2' in text:
+        return
+    text, count = re.subn(r'\*PIU_CNTREG = PIUCNT_PIUPWR \| PIUCNT_PIUSEQEN \|\s*PIUCNT_PADATSTART;',
+                          'be300_piu_start();', text)
+    if not count:
+        raise RuntimeError('legacy PIU startup needs review')
+    text, count = re.subn(r'\*PIU_INTREG = \(mask << 8\) \| eff;',
+                          'be300_piu_ack(status);', text)
+    if not count:
+        raise RuntimeError('legacy PIU acknowledgement needs review')
+    path.write_text('/* BE300 PIU hardware scan v2. */\n' + text)
+
+def touch_filter_upgrade(path, version):
+    """Route the legacy PIU drivers' samples through touch_filter.h."""
+    if version == '4.2':
+        return
+    text = path.read_text()
+    if 'BE300 touch filter v1' in text:
+        return
+    pages = {}
+    if version == '2.6':
+        old = (
+            '\tif (eff & PIUINT_PADPAGE0INTR) {\n'
+            '\t\tdecode_page(PIU_PB00, &x, &y);\n'
+            '\t\tbe300_ts_report(x, y, 1);\n'
+            '\t}\n'
+            '\tif (eff & PIUINT_PADPAGE1INTR) {\n'
+            '\t\tdecode_page(PIU_PB10, &x, &y);\n'
+            '\t\tbe300_ts_report(x, y, 1);\n'
+            '\t}\n'
+            '\tif (eff & PIUINT_PENCHGINTR)\n'
+            '\t\tbe300_ts_report(x, y, !!(*PIU_CNTREG & PIUCNT_PEN_DETECTED));\n')
+        new = (
+            '\tif ((eff & PIUINT_PENCHGINTR) && (*PIU_CNTREG & PIUCNT_PEN_DETECTED))\n'
+            '\t\tbe300_stroke_pen_change(&be300_stroke, 1, be300_ts_report);\n'
+            '\tif ((eff & PIUINT_PADPAGE0INTR) && be300_page_valid(PIU_PB00)) {\n'
+            '\t\tdecode_page(PIU_PB00, &x, &y);\n'
+            '\t\tbe300_stroke_sample(&be300_stroke, x, y, be300_ts_report);\n'
+            '\t}\n'
+            '\tif ((eff & PIUINT_PADPAGE1INTR) && be300_page_valid(PIU_PB10)) {\n'
+            '\t\tdecode_page(PIU_PB10, &x, &y);\n'
+            '\t\tbe300_stroke_sample(&be300_stroke, x, y, be300_ts_report);\n'
+            '\t}\n'
+            '\tif ((eff & PIUINT_PENCHGINTR) && !(*PIU_CNTREG & PIUCNT_PEN_DETECTED))\n'
+            '\t\tbe300_stroke_pen_change(&be300_stroke, 0, be300_ts_report);\n')
+        anchor = 'static void be300_ts_poll(unsigned long data)'
+        glue = 'static struct be300_stroke be300_stroke;\n\n'
+    else:
+        old = (
+            '\tif (eff & PIUINT_PADPAGE0INTR) {\n'
+            '\t\tdecode_page(PIU_PB00, &x, &y);\n'
+            '\t\tpush_event(x, y, 1);\n'
+            '\t\tbe300_ts_report(x, y, 1);\n'
+            '\t}\n'
+            '\tif (eff & PIUINT_PADPAGE1INTR) {\n'
+            '\t\tdecode_page(PIU_PB10, &x, &y);\n'
+            '\t\tpush_event(x, y, 1);\n'
+            '\t\tbe300_ts_report(x, y, 1);\n'
+            '\t}\n'
+            '\tif (eff & PIUINT_PENCHGINTR) {\n'
+            '\t\tcnt = *PIU_CNTREG;\n'
+            '\t\tpen = !!(cnt & PIUCNT_PEN_DETECTED);\n'
+            '\t\ttp.pen_down = pen;\n'
+            '\t\tpush_event(x, y, pen);\n'
+            '\t\tbe300_ts_report(x, y, pen);\n'
+            '\t}\n')
+        new = (
+            '\tcnt = *PIU_CNTREG;\n'
+            '\tpen = !!(cnt & PIUCNT_PEN_DETECTED);\n'
+            '\tif ((eff & PIUINT_PENCHGINTR) && pen)\n'
+            '\t\tbe300_stroke_pen_change(&be300_stroke, 1, be300_ts_out);\n'
+            '\tif ((eff & PIUINT_PADPAGE0INTR) && be300_page_valid(PIU_PB00)) {\n'
+            '\t\tdecode_page(PIU_PB00, &x, &y);\n'
+            '\t\tbe300_stroke_sample(&be300_stroke, x, y, be300_ts_out);\n'
+            '\t}\n'
+            '\tif ((eff & PIUINT_PADPAGE1INTR) && be300_page_valid(PIU_PB10)) {\n'
+            '\t\tdecode_page(PIU_PB10, &x, &y);\n'
+            '\t\tbe300_stroke_sample(&be300_stroke, x, y, be300_ts_out);\n'
+            '\t}\n'
+            '\tif ((eff & PIUINT_PENCHGINTR) && !pen)\n'
+            '\t\tbe300_stroke_pen_change(&be300_stroke, 0, be300_ts_out);\n')
+        anchor = 'static void be300_touch_poll_tick(unsigned long _data)'
+        glue = ('static struct be300_stroke be300_stroke;\n\n'
+                '/* Filtered strokes feed both the misc queue and evdev. */\n'
+                'static void be300_ts_out(int x, int y, int down)\n{\n'
+                '\ttp.pen_down = down;\n'
+                '\tpush_event(x, y, down);\n'
+                '\tbe300_ts_report(x, y, down);\n}\n\n')
+    if text.count(old) != 1 or text.count(anchor) != 1 or text.count('static int adc_valid(') != 1:
+        raise RuntimeError(f'legacy {version} PIU report path needs review')
+    text = text.replace(old, new)
+    text = text.replace(anchor, glue + anchor)
+    text = text.replace('static int adc_valid(', '#include "touch_filter.h"\n\nstatic int adc_valid(', 1)
+    path.write_text('/* BE300 touch filter v1. */\n' + text)
 
 def irq(text, version):
     init = 'be300_irq_chip_init' if version == '4.2' else 'be300_irq_cascade_init'
@@ -173,14 +273,43 @@ def install(tree, version):
     source = REPO / 'board/casio-be300'
     for name in ['hardware.c', 'hardware.h', 'hardware-regs.h', 'audio.c', 'audio-regs.h', 'wifi.c', 'wifi-proto.h', 'wifi-wext.h', 'card.h']:
         copy_changed(source / name, board / name)
+    if version in ('2.4', '2.6'):
+        physical = os.environ.get('BE300_PHYSICAL_NAND', '0') == '1'
+        target = board / ('nand_be300.c' if version == '2.4' else 'nand.c')
+        saved = board / 'nand_emulator.c'
+        if physical:
+            if 'be300_physical_init' not in target.read_text():
+                copy_changed(target, saved)
+            copy_changed(source / 'nand_legacy_physical.c', target)
+            if version == '2.6':
+                # Upstream MTD fixed this after 2.6.8: offset zero is a
+                # valid free area; length zero means there is no space.
+                wbuf = tree / 'fs/jffs2/wbuf.c'
+                text = wbuf.read_text()
+                text = text.replace('if (!oinfo->oobfree[0][0])', 'if (!oinfo->oobfree[0][1])')
+                wbuf.write_text(text)
+            for name in ('nand_controller.h', 'nand_ecc.c', 'nand_ecc.h'):
+                copy_changed(source / name, board / name)
+        elif 'be300_physical_init' in target.read_text():
+            if not saved.exists():
+                raise RuntimeError('restage the legacy NAND driver before an emulator build')
+            copy_changed(saved, target)
     if version == '4.2':
         # 2.6 and 2.4 bring their own 520-byte page readers in their patch
         # series; 4.2's driver is this file, kept current here.
         copy_changed(source / 'nand.c', board / 'nand.c')
+        for name in ('nand_controller.h', 'nand_physical.h', 'nand_ecc.c', 'nand_ecc.h', 'nand_boot.c', 'nand_boot.h'):
+            copy_changed(source / name, board / name)
     copy_changed(source / 'hardware.h', tree / 'include/linux/be300_hardware.h')
     copy_changed(source / 'card.h', tree / 'include/linux/be300_card.h')
     makefile = board / 'Makefile'
     text = makefile.read_text()
+    if version in ('4.2', '2.6') and 'CFLAGS_nand.o' not in text:
+        text += '\nCFLAGS_nand.o += -std=gnu99\n'
+        makefile.write_text(text)
+    if version == '2.4' and os.environ.get('BE300_PHYSICAL_NAND') == '1' and 'CFLAGS += -std=gnu99' not in text:
+        text += '\nCFLAGS += -std=gnu99\n'
+        makefile.write_text(text)
     if 'hardware.o' not in text:
         text, count = re.subn(r'(obj-y\s*[:+]?=\s*)', r'\1hardware.o ', text, count=1)
         if not count:
@@ -256,11 +385,18 @@ def install(tree, version):
         if 'be300_framebuffer_ready();' not in text:
             fb.write_text(function_body(text, 'sfb_init', lambda b:
                 inject(b, '\tbe300_framebuffer_ready();\n')))
-    adapt(board / ('touch.c' if version == '2.6' else 'touch_be300.c'), touch)
+    touch_path = board / ('touch.c' if version == '2.6' else 'touch_be300.c')
+    if version == '4.2':
+        copy_changed(source / 'touch_be300.c', touch_path)
+    adapt(touch_path, touch)
+    touch_scan_upgrade(touch_path, version)
+    if version != '4.2':
+        copy_changed(source / 'touch_filter.h', touch_path.parent / 'touch_filter.h')
+    touch_filter_upgrade(touch_path, version)
     adapt(board / ('irq_be300.c' if version == '2.4' else 'irq.c'),
           lambda s: irq(s, version))
     adapt(board / ('nand_be300.c' if version == '2.4' else 'nand.c'), nand)
-    if version != '4.2':
+    if version != '4.2' and not (version in ('2.4','2.6') and os.environ.get('BE300_PHYSICAL_NAND') == '1'):
         # Adapted trees are skipped above; this rewrite is idempotent.
         path = board / ('nand_be300.c' if version == '2.4' else 'nand.c')
         path.write_text(nand_drain(path.read_text()))
