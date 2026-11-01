@@ -223,9 +223,11 @@ static u8 be300_nand_stream_read_byte(void)
 {
 	if (be300_nand_read_pos >= BE300_NAND_PAGE_RAW)
 		return 0xff;
-	if (be300_nand_read_pos == BE300_NAND_PAGE_DATA + 8)
+	if (be300_nand_read_pos == BE300_NAND_PAGE_DATA + 8) {
 		be300_nand_xfer_write(BE300_NAND_XFER_MODE,
 				       BE300_NAND_MODE_READ_OOB2);
+		be300_nand_wait_xfer_ready();
+	}
 	be300_nand_read_pos++;
 	return readb(be300_nand_stream_io);
 }

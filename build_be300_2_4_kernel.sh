@@ -364,7 +364,9 @@ PYEOF
         exit 1
     fi
 fi
-if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" && "$ROOT_MODE" != "mw" && ! -f "$RAMDISK_GZ" ]]; then
+# GUI-only builds may have left the gzip-of-empty link placeholder behind.
+if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" && "$ROOT_MODE" != "mw" ]] &&
+   { [[ ! -f "$RAMDISK_GZ" ]] || (( $(wc -c < "$RAMDISK_GZ") < 1024 )); }; then
     echo "--- Extracting initrd from $PREBUILT_VMLINUX into $RAMDISK_GZ ---"
     [[ -f "$PREBUILT_VMLINUX" ]] || { echo "ERROR: $PREBUILT_VMLINUX missing" >&2; exit 1; }
     python3 - <<PYEOF
@@ -427,21 +429,23 @@ if [[ "$ROOT_MODE" != "opie" && "$ROOT_MODE" != "pgui" && "$ROOT_MODE" != "mw" ]
 #
 # Idempotency: $RAMDISK_GZ.orig is the pristine ramdisk extracted
 # straight from kernels/vmlinux-2.4's __rd_start..__rd_end (refreshed
-# only if missing). $RAMDISK_GZ.hwstamp records the sha1 of
-# be300_hw_test.c; when it matches the current source, we trust the
+# if missing or still an empty GUI link placeholder). $RAMDISK_GZ.hwstamp
+# records the sha1 of be300_hw_test.c; when it matches the source, we trust the
 # existing $RAMDISK_GZ and skip the inject step.
 HWTEST_SRC="$REPO/board/casio-be300/be300_hw_test.c"
 HWTEST_STAMP="$RAMDISK_GZ.hwstamp"
 RAMDISK_ORIG="$RAMDISK_GZ.orig"
 HWTEST_HASH=$(sha1sum "$HWTEST_SRC" | awk '{print $1}')
+HWTEST_REBASE=0
 
-# Snapshot the pristine extracted ramdisk on first build so we can
-# re-inject from a known-good base every subsequent run.
-if [[ ! -f "$RAMDISK_ORIG" ]]; then
+# Snapshot the pristine extracted ramdisk, replacing a cached GUI-only
+# placeholder, so subsequent injections have a real filesystem as a base.
+if [[ ! -f "$RAMDISK_ORIG" ]] || (( $(wc -c < "$RAMDISK_ORIG") < 1024 )); then
     cp "$RAMDISK_GZ" "$RAMDISK_ORIG"
+    HWTEST_REBASE=1
 fi
 
-if [[ ! -f "$HWTEST_STAMP" || "$(cat "$HWTEST_STAMP" 2>/dev/null)" != "$HWTEST_HASH" ]]; then
+if [[ "$HWTEST_REBASE" == 1 || ! -f "$HWTEST_STAMP" || "$(cat "$HWTEST_STAMP" 2>/dev/null)" != "$HWTEST_HASH" ]]; then
     echo "--- Building be300_hw_test and injecting into initrd ---"
     HWTEST_BIN="$REPO/linux-2.4.18/be300_hw_test"
 

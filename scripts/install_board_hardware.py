@@ -240,10 +240,22 @@ def install(tree, version):
     if version == '2.4':
         adapt(tree / 'drivers/char/serial_be300.c',
               lambda t: console(t, ['be300_console_init', 'be300_serial_init']))
+        # Linux4BE's printk bypasses the serial driver before console_init.
+        early = tree / 'kernel/printk.c'
+        text = early.read_text()
+        if 'be300_console_ready();' not in text:
+            updated = console(text, ['Uart16550Init', 'Uart16550GetPoll',
+                                     'Uart16550Put'])
+            early.write_text(HEADER + updated)
     else:
         adapt(setup, lambda t: console(t, ['prom_putchar']))
     fb = board / 'sfb.c' if version == '4.2' else tree / 'drivers/video/sfb.c'
     adapt(fb, lambda s: framebuffer(s, version))
+    if version == '2.4':
+        text = fb.read_text()
+        if 'be300_framebuffer_ready();' not in text:
+            fb.write_text(function_body(text, 'sfb_init', lambda b:
+                inject(b, '\tbe300_framebuffer_ready();\n')))
     adapt(board / ('touch.c' if version == '2.6' else 'touch_be300.c'), touch)
     adapt(board / ('irq_be300.c' if version == '2.4' else 'irq.c'),
           lambda s: irq(s, version))

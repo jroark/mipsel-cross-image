@@ -65,6 +65,13 @@ void be300_console_ready(void)
 	if (!be300_regs_siu_clocked())
 		be300_regs_power_on();
 }
+void be300_framebuffer_ready(void)
+{
+	/* Enable VRAM access before early fbcon draws. Full panel setup and
+	 * settling delays run later, after delay calibration, in hardware_init. */
+	BE300_W32(0x0a001100, BE300_R32(0x0a001100) | 1);
+	BE300_W32(0x0a00110c, BE300_R32(0x0a00110c) | 1);
+}
 void be300_giu0_prepare(void)
 {
 	be300_regs_giu0();

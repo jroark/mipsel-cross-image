@@ -1,0 +1,10 @@
+Fix the firmware loader's errno declaration for the MIPS syscall wrappers.
+asm/unistd.h declares errno extern; its definition must have external linkage.
+
+--- a/drivers/sound/sound_firmware.c
++++ b/drivers/sound/sound_firmware.c
+@@ -10,3 +10,3 @@
+-static int errno;
++int errno;
+ static int do_mod_firmware_load(const char *fn, char **fp)
+ {

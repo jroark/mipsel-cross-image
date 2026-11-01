@@ -237,12 +237,116 @@ Logs, source snapshots, test kernels and NAND copies remain outside Git under
 `boot26-release-check`, `boot42-release-check` and the supplemental
 `boot42-final`. No boot assets or guest modules are included in this change.
 
-The original Linux4BE 2.4 source archive was unavailable. Its new board
+During that earlier validation the original Linux4BE 2.4 archive was
+unavailable. Its new board
 drivers, reconstructed from the committed patch series, pass staging and
 repeat-staging checks. The blank callback adaptation was checked against
 upstream 2.4's `fb_info.blank` interface (void callback, rather than the
 later `fb_ops.fb_blank`). This is **not** a compiled or boot-tested 2.4
 kernel. Provide the original archive to complete that verification.
+
+## Current-emulator NAND compatibility (2026-10-31)
+
+The current emulator reproduces the ROM's NAND-boot transfer limit: MODE 5
+provides 512 data bytes and eight spare bytes. The shared SPL and all three
+source-built kernel NAND readers now select MODE 4 before consuming the last
+eight spare bytes. Linux 4.2 tracks stream position across partial reads and
+skipped bytes, including reads of the spare area. The installer upgrades trees
+already carrying the v1 hardware integration marker as well as fresh trees.
+
+Linux4BE 2.4 also accesses the companion before its board initcall. Its
+`kernel/printk.c` polling UART now enables SIU clocks before accessing the
+unit. Its framebuffer initializer enables the two VRAM clocks before fbcon
+can draw; full panel setup and settling delays remain in the board initcall,
+after delay calibration. The 2.4 patch series also fixes the OSS firmware
+loader's errno linkage and disables compiler builtins that otherwise turn
+its sprintf into a call to an unavailable external strcpy. Switching from a
+GUI-only build to initrd/NAND-root mode replaces an empty ramdisk placeholder
+with the donor initrd.
+
+Run the focused host regression checks with:
+
+```sh
+python3 tests/nand_burst.py
+cc -std=gnu89 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    tests/hardware_regs.c -o /tmp/be300-hardware-regs
+/tmp/be300-hardware-regs
+```
+
+The NAND check compiles the actual modern byte/skip reader against a strict
+520-byte stream model and exercises split reads, spare-only skips and multiple
+pages. It also checks both legacy patch layouts, upgrade idempotence and
+both fresh and previously staged spare-drain layouts. Hardware-register checks
+cover clock ordering,
+LCD controls, PIU, GIRQ and the watchdog transaction sequence.
+
+
+### Build and boot results
+
+The local `mips-cross-dev` Docker image rebuilt every GUI profile, plus the
+2.4 initrd/NAND-root and 2.6 kernel-only profiles. The original 2.4 archive was
+available for this run, superseding the earlier uncompiled-2.4 limitation.
+The host emulator executable's SHA256 was
+`d8b6d76d8e1773b29ef7defe718de0fa9cca5709022f4eee3fb35343d20f5427`.
+The sibling emulator checkout was at `1bd451a6` (power-state/watchdog model).
+
+| Kernel | Build selector or wrapper | Observed boot result |
+| --- | --- | --- |
+| 2.4 | `BE300_2_4_UI=mw` | Microwindows launcher; touch opens a working terminal |
+| 2.4 | `BE300_2_4_UI=opie` | OPIE desktop |
+| 2.4 | `build_be300_2_4_pgui_nand.sh` | PicoGUI video-test pattern |
+| 2.4 | `build_be300_2_4_pgui_demo_nand.sh` | PicoGUI desktop and on-screen keyboard |
+| 2.4 | `BE300_2_4_UI=none BE300_2_4_ROOT=initrd` | Embedded ext2 root mounted; BusyBox console prompt |
+| 2.4 | `BE300_2_4_UI=none BE300_2_4_ROOT=nand` | Ext2 bootstrap, JFFS2 root, framebuffer test exit=0; BusyBox console prompt |
+| 2.6 | `BE300_2_6_UI=mw` | Microwindows launcher; touch opens a working terminal |
+| 2.6 | `build_be300_2_6_opie_nand.sh` | OPIE desktop |
+| 2.6 | `BE300_2_6_UI=none` | Expected VFS panic: this profile supplies no rootfs |
+| 4.2 | `build_be300_kernel.sh` | Microwindows launcher; touch opens terminal |
+| 4.2 | `BE300_LIBC=uclibc ./build_be300_kernel.sh` | Dynamic Microwindows/Dillo profile; touch opens terminal |
+| 4.2 | `build_be300_opie_nand.sh` | OPIE desktop |
+| 4.2 | `build_be300_opie64_nand.sh` | OPIE64 desktop with 64 MiB RAM |
+| 4.2 | `build_be300_picogui_nand.sh` | PicoGUI desktop/terminal |
+| 4.2 | `build_be300_tinyx_nand.sh` | TinyX dock with Term/Stat/Kbd buttons, 16 MiB RAM |
+
+Builds used `docker run --rm -v "$PWD":/work -v /tmp/be300-compat:/validation
+mips-cross-dev bash ...`; each selector above was run with its existing build
+script. Per-profile logs and saved NANDs are under `/tmp/be300-compat/`.
+Boots used disposable NAND copies in `/tmp/be300-compat/boots/<profile>/`,
+with this command (serial port numbers were unique per run):
+
+```sh
+BE300_AUTOSTOP_SEC=180 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    /Users/jroark/src/mipsel-cross-image/bin/be300 --nand nand.bin --speed 0 \
+    --ne2000 --serial1-bridge tcp-listen:18891@127.0.0.1
+```
+
+OPIE64 adds `--sdram 64`. Microwindows input checks additionally use
+`--touch-script touch.txt`, containing `10000 down 40 30` and `10100 up`.
+Screenshots show an opened terminal on all three kernel families. GUI boots
+completed without `[BUS] stall` reports. The static and dynamic 4.2 profiles
+and the 2.4/2.6 diagnostic shells wrote, synced, read back and removed a small
+file on a disposable JFFS2 root. This does not validate physical NAND writes.
+
+Longer runs used `BE300_AUTOSTOP_SEC=600`; a shell background job slept 161
+guest seconds and printed `/proc/uptime` and `WATCHDOG_SURVIVED`. Observed
+uptimes were 170.99 seconds on 2.4, 166.03 on 2.6 and 164.29 on 4.2. For shell
+checks the legacy Microwindows staging used `BE300_MW_SERIAL_SHELL=1`. The
+2.6 serial-console diagnostic also disabled `CONFIG_CASIO_BE300_STOWAWAY`:
+serial console plus the dock driver otherwise stalled during boot because
+they share the SIU. The normal framebuffer-console GUI images retain the
+dock driver. All checks remain emulator-only; no new physical-device boot
+is claimed.
+
+Repacking the untouched prebuilt 2.4/2.6 donors now gets through the corrected
+SPL, but those kernels still stall on their first ungated SIU access. Use
+source rebuild mode for the current emulator; repacking cannot replace their
+compiled-in drivers.
+
+Final generated NANDs are restored under `linux-4.2.9/`. The extra names
+`be300-uclibc.nand` and `be300-2_4-nand-root.nand` preserve alternatives that
+normally overwrite `be300.nand` and `be300-2_4-rebuilt.nand`. Image hashes and
+source-copy paths are recorded in `/tmp/be300-compat/images.json`. The legacy
+Microwindows copies include the optional diagnostic serial-shell overlay.
 
 ## Limits
 
