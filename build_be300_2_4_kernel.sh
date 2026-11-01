@@ -108,19 +108,31 @@
 
 set -euo pipefail
 
+# Physical images leave the top 20 erase blocks for boot replacements.
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    export BE300_JFFS2_PAD="${BE300_JFFS2_PAD:-0xAB0000}"
+fi
+
 REPO=/work
 MODE="${BE300_2_4_MODE:-rebuild}"
 # Default prebuilt kernel donor (override with BE300_2_4_PREBUILT_VMLINUX).
 # Used by prebuilt mode AND as the initrd source for the rebuild path's
 # ramdisk extract step.
 PREBUILT_VMLINUX="${BE300_2_4_PREBUILT_VMLINUX:-$REPO/kernels/vmlinux-2.4}"
-SOURCE_DIR="$REPO/linux-2.4.18"
+SOURCE_DIR="${BE300_2_4_SOURCE_DIR:-$REPO/linux-2.4.18}"
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    SOURCE_DIR="${BE300_2_4_SOURCE_DIR:-$REPO/linux-2.4.18-physical}"
+fi
 BUILT_VMLINUX="$SOURCE_DIR/vmlinux"
 PATCH_SERIES="$REPO/patches/linux-2.4.18-be300/series"
 TARBALL="$REPO/archives/linux4be-2.4.18-20021129.tar.gz"
 SPL_BUILD="$SOURCE_DIR/spl_build"
 
 if [[ "$MODE" == "prebuilt" ]]; then
+    if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+        echo "ERROR: physical NAND requires source-built kernels" >&2
+        exit 2
+    fi
     OUT="${BE300_2_4_NAND:-$REPO/linux-4.2.9/be300-2_4.nand}"
     VMLINUX="$PREBUILT_VMLINUX"
     SPL_BUILD="${BE300_2_4_SPL_BUILD:-$REPO/linux-4.2.9/spl_build_2_4}"
@@ -153,6 +165,9 @@ OUT="${BE300_2_4_NAND:-$REPO/linux-4.2.9/be300-2_4-rebuilt.nand}"
 #                      /dev/console / /dev/tty0 / /dev/input/* device
 #                      nodes), via mkfs.jffs2 --devtable.
 ROOT_MODE="${BE300_2_4_ROOT:-initrd}"
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" && -z "${BE300_2_4_ROOT:-}" ]]; then
+    ROOT_MODE=nand
+fi
 
 # BE300_2_4_UI=opie selects the dynamically-linked uClibc-ng Opie 1.2.5 /
 # Qt-Embedded 2.3.10 userspace stack on top of the 2.4.18 kernel. It
@@ -234,6 +249,13 @@ fi
 
 # 2. Apply modern-toolchain patch series. Wraps git apply, idempotent.
 "$REPO/scripts/apply_patch_series.sh" "$PATCH_SERIES" "$SOURCE_DIR"
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    MTD_ARCHIVE="$REPO/archives/mtd_20050122.orig.tar.gz"
+    if [[ ! -f "$MTD_ARCHIVE" ]]; then
+        curl -L --fail https://archive.debian.org/debian/pool/main/m/mtd/mtd_20050122.orig.tar.gz -o "$MTD_ARCHIVE"
+    fi
+    python3 "$REPO/scripts/install_24_nand_backport.py" "$SOURCE_DIR" --archive "$MTD_ARCHIVE"
+fi
 python3 "$REPO/scripts/install_board_hardware.py" "$SOURCE_DIR" --kernel 2.4
 
 # 2b. Force a kernel object clean.  $SOURCE_DIR lives on the host-mounted
@@ -739,6 +761,10 @@ elif [[ "$ROOT_MODE" == "pgui" || "$ROOT_MODE" == "mw" ]]; then
     echo "--- patched prom.c for $ROOT_MODE direct JFFS2 root cmdline (${BE300_2_4_CONSOLE}) ---"
 fi
 
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    sed -i 's|rootfstype=jffs2 |rootfstype=jffs2 rw |g' "$PROM_C"
+fi
+
 # 4. Configure
 echo "--- make oldconfig ---"
 cp "$SOURCE_DIR/config_be300" "$SOURCE_DIR/.config"
@@ -837,6 +863,10 @@ fi
 sed -i -e '/^CONFIG_SOUND=/d' -e '/^# CONFIG_SOUND is not set/d' "$SOURCE_DIR/.config"
 echo 'CONFIG_SOUND=y' >> "$SOURCE_DIR/.config"
 
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    printf '%s\n' CONFIG_MTD_NAND=y CONFIG_MTD_NAND_IDS=y CONFIG_MTD_NAND_VERIFY_WRITE=y CONFIG_JFFS2_FS_NAND=y CONFIG_JFFS2_ZLIB=y CONFIG_JFFS2_RTIME=y >> "$SOURCE_DIR/.config"
+fi
+
 # `yes ""` keeps writing after `make oldconfig` closes its stdin, which raises
 # SIGPIPE on yes — with `set -o pipefail` that would fail the whole pipeline
 # even though make exited 0. Disable pipefail just for this line so we accept
@@ -920,7 +950,7 @@ PYEOF
     mkfs.jffs2 --root="$JFFS2_WORK/root" \
         --devtable="$JFFS2_WORK/devtable" \
         --eraseblock=16384 --pagesize=512 --no-cleanmarkers \
-        --pad=0xB00000 --little-endian \
+        --pad="${BE300_JFFS2_PAD:-0xB00000}" --little-endian \
         --output="$JFFS2_ROOTFS"
     echo "  rootfs : $(ls -la "$JFFS2_ROOTFS" | awk '{print $5, $9}')"
 fi
@@ -1301,7 +1331,7 @@ PYEOF
     mkfs.jffs2 --root="$JFFS2_WORK/root" \
         --devtable="$DEVTABLE_PGUI" \
         --eraseblock=16384 --pagesize=512 --no-cleanmarkers \
-        --pad=0xB00000 --little-endian \
+        --pad="${BE300_JFFS2_PAD:-0xB00000}" --little-endian \
         --output="$JFFS2_ROOTFS"
     echo "  rootfs : $(ls -la "$JFFS2_ROOTFS" | awk '{print $5, $9}')"
 fi

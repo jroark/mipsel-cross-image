@@ -57,6 +57,9 @@
 #include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/slab.h>
+#include <linux/timer.h>
+#include <linux/spinlock.h>
+#include <linux/jiffies.h>
 
 #include <asm/vr41xx/irq.h>
 
@@ -106,11 +109,28 @@
 #define BE300_TOUCH_HEIGHT	320
 #define BE300_TOUCH_PANEL_HEIGHT	359
 
+/*
+ * A real BE-300 panel's samples jump by more than a tap's slop as the
+ * contact settles and again at lift-off (the emulator's are exact), so an
+ * unfiltered tap reads as a drag. As Glaze and tslib do: drop the first
+ * sample after pen-down, hold the newest back so the lift-off sample is
+ * never reported, average the last FILTER_N and ignore moves under MOVE_MIN.
+ */
+#define BE300_TOUCH_FILTER_N	3
+#define BE300_TOUCH_MOVE_MIN	2
+
 struct be300_touch {
 	void __iomem *base;
 	struct input_dev *input;
 	int irq;
 	bool pen_down;
+	/* Stroke filter state (Glaze kernel/drivers/input.c). */
+	int stroke_samples, first_x, first_y;
+	int win_x[BE300_TOUCH_FILTER_N], win_y[BE300_TOUCH_FILTER_N], win_n;
+	bool held;
+	int held_x, held_y, pen_x, pen_y;
+	spinlock_t lock;
+	struct timer_list poll;
 };
 
 static struct be300_touch *be300_touch_dev;
@@ -118,11 +138,6 @@ static struct be300_touch *be300_touch_dev;
 static u16 piu_read(struct be300_touch *t, unsigned off)
 {
 	return readw(t->base + off);
-}
-
-static void piu_write(struct be300_touch *t, unsigned off, u16 val)
-{
-	writew(val, t->base + off);
 }
 
 static bool piu_adc_valid(u16 value, u16 min, u16 max)
@@ -150,7 +165,7 @@ static int piu_adc_to_pos_inv(u16 value, u16 min, u16 max, int span)
 	return ((int)(max - value) * (span - 1)) / (max - min);
 }
 
-static void piu_decode_page(struct be300_touch *t, unsigned page_off,
+static bool piu_decode_page(struct be300_touch *t, unsigned page_off,
 			    int *out_x, int *out_y)
 {
 	u16 yp = piu_read(t, page_off + 0x00);
@@ -158,6 +173,9 @@ static void piu_decode_page(struct be300_touch *t, unsigned page_off,
 	u16 xm = piu_read(t, page_off + 0x08);
 	u16 xp = piu_read(t, page_off + 0x0c);
 	int x = 0, y = 0, n = 0;
+
+	if (!(yp & ym & xm & xp & 0x8000))
+		return false;
 
 	if (piu_adc_valid(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX)) {
 		x += piu_adc_to_pos(xp, PIU_ADC_X_MIN, PIU_ADC_X_MAX,
@@ -190,77 +208,127 @@ static void piu_decode_page(struct be300_touch *t, unsigned page_off,
 
 	*out_x = x;
 	*out_y = y;
+	return true;
+}
+
+static void be300_touch_stroke_reset(struct be300_touch *t)
+{
+	t->stroke_samples = 0;
+	t->win_n = 0;
+	t->held = false;
+}
+
+static void be300_touch_report(struct be300_touch *t, int x, int y)
+{
+	if (t->pen_down) {
+		int dx = x - t->pen_x, dy = y - t->pen_y;
+
+		if (dx < BE300_TOUCH_MOVE_MIN && dx > -BE300_TOUCH_MOVE_MIN &&
+		    dy < BE300_TOUCH_MOVE_MIN && dy > -BE300_TOUCH_MOVE_MIN)
+			return;
+	}
+	input_report_abs(t->input, ABS_X, x);
+	input_report_abs(t->input, ABS_Y, y);
+	if (!t->pen_down) {
+		input_report_abs(t->input, ABS_PRESSURE, 1);
+		input_report_key(t->input, BTN_TOUCH, 1);
+	}
+	input_sync(t->input);
+	t->pen_down = true;
+	t->pen_x = x;
+	t->pen_y = y;
+}
+
+static void be300_touch_sample(struct be300_touch *t, int x, int y)
+{
+	int i, k, n, sx = 0, sy = 0;
+
+	if (t->stroke_samples++ == 0) {
+		t->first_x = x;
+		t->first_y = y;
+		return;
+	}
+	i = t->win_n++ % BE300_TOUCH_FILTER_N;
+	n = t->win_n < BE300_TOUCH_FILTER_N ? t->win_n : BE300_TOUCH_FILTER_N;
+	t->win_x[i] = x;
+	t->win_y[i] = y;
+	for (k = 0; k < n; k++) {
+		sx += t->win_x[k];
+		sy += t->win_y[k];
+	}
+	if (t->held)
+		be300_touch_report(t, t->held_x, t->held_y);
+	t->held = true;
+	t->held_x = sx / n;
+	t->held_y = sy / n;
+}
+
+/* Pen-up drops the held lift-off sample, unless the tap was too short to
+ * report anything; then it lands where it began. */
+static void be300_touch_release(struct be300_touch *t)
+{
+	if (!t->pen_down && t->stroke_samples) {
+		if (t->held)
+			be300_touch_report(t, t->held_x, t->held_y);
+		else
+			be300_touch_report(t, t->first_x, t->first_y);
+	}
+	if (t->pen_down) {
+		t->pen_down = false;
+		input_report_key(t->input, BTN_TOUCH, 0);
+		input_report_abs(t->input, ABS_PRESSURE, 0);
+		input_sync(t->input);
+	}
+	be300_touch_stroke_reset(t);
 }
 
 static void be300_touch_report_page(struct be300_touch *t, unsigned page_off)
 {
 	int x, y;
 
-	piu_decode_page(t, page_off, &x, &y);
-	t->pen_down = true;
-	input_report_abs(t->input, ABS_X, x);
-	input_report_abs(t->input, ABS_Y, y);
-	input_report_abs(t->input, ABS_PRESSURE, 1);
-	input_report_key(t->input, BTN_TOUCH, 1);
-	input_sync(t->input);
+	if (piu_decode_page(t, page_off, &x, &y))
+		be300_touch_sample(t, x, y);
 }
 
 static irqreturn_t be300_touch_isr(int irq, void *dev)
 {
 	struct be300_touch *t = dev;
-	u16 status = piu_read(t, PIU_INTREG);
-	u16 pending = status & 0xff;
-	u16 mask = status >> 8;
-	u16 effective = pending & mask;
-	u16 ack = 0;
+	unsigned long flags;
+	u16 status, effective;
 
-	if (!effective)
+	spin_lock_irqsave(&t->lock, flags);
+	status = piu_read(t, PIU_INTREG);
+	effective = (status & 0xff) & (status >> 8);
+	if (!effective) {
+		spin_unlock_irqrestore(&t->lock, flags);
 		return IRQ_NONE;
+	}
 
-	/*
-	 * A short tap can coalesce page-ready and pen-up in one IRQ. Page data
-	 * was captured while the pen was down, so publish it before PENCHG.
-	 */
-	if (effective & PIUINT_PADPAGE0INTR) {
+	/* A new stroke starts clean; a coalesced short tap publishes its
+	 * coordinates before its release. */
+	if ((effective & PIUINT_PENCHGINTR) && !t->pen_down &&
+	    (piu_read(t, PIU_CNTREG) & PIUCNT_PEN_DETECTED))
+		be300_touch_stroke_reset(t);
+	if (effective & PIUINT_PADPAGE0INTR)
 		be300_touch_report_page(t, PIU_PB00);
-		ack |= PIUINT_PADPAGE0INTR;
-	}
-
-	if (effective & PIUINT_PADPAGE1INTR) {
+	if (effective & PIUINT_PADPAGE1INTR)
 		be300_touch_report_page(t, PIU_PB10);
-		ack |= PIUINT_PADPAGE1INTR;
-	}
-
-	if (effective & PIUINT_PENCHGINTR) {
-		bool down = !!(piu_read(t, PIU_CNTREG) & PIUCNT_PEN_DETECTED);
-
-		/*
-		 * Pen-down fires before the first coordinate page converts.
-		 * Reporting BTN_TOUCH=1 here would publish a press at the
-		 * previous tap's ABS_X/ABS_Y, so Qt saw press-at-old-spot,
-		 * drag, release-at-new-spot and ignored the click.  Let the
-		 * first page report the press with fresh coordinates (as the
-		 * 2.4.18 driver does) and only publish pen-up here.
-		 */
-		if (!down) {
-			t->pen_down = false;
-			input_report_key(t->input, BTN_TOUCH, 0);
-			input_report_abs(t->input, ABS_PRESSURE, 0);
-			input_sync(t->input);
-		}
-		ack |= PIUINT_PENCHGINTR;
-	}
-
-	if (effective & PIUINT_PADDLOSTINTR) {
-		/* coordinate buffer overrun — ack and let the scan re-arm */
-		ack |= PIUINT_PADDLOSTINTR;
-	}
-
-	/* W1C the bits we serviced; preserve the high-byte mask. */
-	if (ack)
-		piu_write(t, PIU_INTREG, (mask << 8) | ack);
-
+	if ((effective & PIUINT_PENCHGINTR) &&
+	    !(piu_read(t, PIU_CNTREG) & PIUCNT_PEN_DETECTED))
+		be300_touch_release(t);
+	be300_piu_ack(status);
+	spin_unlock_irqrestore(&t->lock, flags);
 	return IRQ_HANDLED;
+}
+
+/* Glaze and the legacy Linux drivers also service the PIU by polling.
+ * Keep input usable when the companion IRQ cascade misses a transition. */
+static void be300_touch_poll(unsigned long data)
+{
+	struct be300_touch *t = (struct be300_touch *)data;
+
+	be300_touch_isr(t->irq, t);
+	mod_timer(&t->poll, jiffies + msecs_to_jiffies(20));
 }
 
 static int __init be300_touch_init(void)
@@ -274,6 +342,7 @@ static int __init be300_touch_init(void)
 	if (!t)
 		return -ENOMEM;
 
+	spin_lock_init(&t->lock);
 	t->base = ioremap_nocache(BE300_PIU_BASE_PA, BE300_PIU_SIZE);
 	if (!t->base) {
 		err = -ENOMEM;
@@ -306,28 +375,17 @@ static int __init be300_touch_init(void)
 
 	t->irq = VRC4173_IRQ_BASE + 9;
 	err = request_irq(t->irq, be300_touch_isr, 0, "be300-touch", t);
-	if (err)
-		goto fail_unregister;
-
-	/*
-	 * Configure PIU defaults from VRC4173 UM §9 idle dump
-	 * (docs/hardware/hw_dump_vrc4173.txt:983) and enable PENCHG +
-	 * page 0/1 + datalost interrupts. The 0x0106 control word
-	 * enables PIUPWR + PIUSEQEN + PADATSTART with mode 00 WaitPenTouch.
-	 */
-	piu_write(t, PIU_SIVL, 0x05DC);
-	piu_write(t, PIU_STBL, 0x00C8);
-	piu_write(t, PIU_INTREG, (PIUINT_PENDING_ALL << 8) | 0);
-	piu_write(t, PIU_CNTREG,
-		  PIUCNT_PIUPWR | PIUCNT_PIUSEQEN |
-		  PIUCNT_PADATSTART);
+	if (err) {
+		pr_warn("BE-300 touch: IRQ unavailable, using PIU polling\n");
+		t->irq = -1;
+	}
+	setup_timer(&t->poll, be300_touch_poll, (unsigned long)t);
+	be300_piu_start();
+	mod_timer(&t->poll, jiffies + msecs_to_jiffies(20));
 
 	be300_touch_dev = t;
 	return 0;
 
-fail_unregister:
-	input_unregister_device(t->input);
-	t->input = NULL;
 fail_input_free:
 	if (t->input)
 		input_free_device(t->input);

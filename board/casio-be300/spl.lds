@@ -21,10 +21,16 @@ SECTIONS {
         *(.data)
         *(.data.*)
     }
+    /* The B000FF container carries file-backed bytes only, so spl_start.S
+     * zeroes this range itself (RAM still holds the previous OS's data). */
     .bss : {
+        . = ALIGN(4);
+        __bss_start = .;
         *(.bss)
         *(.bss.*)
         *(COMMON)
+        . = ALIGN(4);
+        __bss_end = .;
     }
     /DISCARD/ : {
         *(.reginfo)

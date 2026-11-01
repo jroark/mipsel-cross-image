@@ -69,6 +69,16 @@ int main(void)
 	assert(regs[0x308/4] == 1500 && regs[0x30c/4] == 200);
 	assert(regs[0x310/4] == 50 && regs[0x318/4] == 1);
 	assert(regs[0x304/4] == 255 && !(regs[0x300/4] & 1));
+	be300_regs_piu_start();
+	assert(regs[0x3c8/4] == 3 && regs[0x300/4] == 0x306);
+	assert(regs[0x304/4] == 0xdd00);
+	be300_regs_piu_ack(0xdd04);
+	assert(regs[0x304/4] == 0xdd1c && regs[0x300/4] == 0x306);
+	be300_regs_piu_ack(0xdd08);
+	assert(regs[0x304/4] == 0xdd08 && regs[0x300/4] == 0x306);
+	ntrace = 0;
+	be300_regs_piu_ack(0xdd00);
+	assert(ntrace == 0);
 	stuck = 1; now = 0;
 	assert(be300_regs_piu_prepare() == -1 && now == 10000);
 	regs[0x7834/4] = 3; /* real MCU status need not return zero */

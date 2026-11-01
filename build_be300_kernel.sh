@@ -1,6 +1,15 @@
 #!/bin/bash
 set -e
 
+# Physical images leave the top 20 erase blocks for boot replacements.
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    if [[ "${BE300_UI:-microwindows}" == "opie64" ]]; then
+        echo "ERROR: opie64 is an emulator-only profile; physical NAND requires stock 16 MiB RAM" >&2
+        exit 2
+    fi
+    export BE300_JFFS2_PAD="${BE300_JFFS2_PAD:-0xAB0000}"
+fi
+
 KERNEL_SOURCE_URL="http://distro.ibiblio.org/tinycorelinux/7.x/x86/release/src/kernel/linux-4.2.9-patched.tar.xz"
 BUSYBOX_VERSION="1.24.2"
 KERNEL_PATCH_SERIES="/work/patches/linux-4.2.9/be300/series"
@@ -2377,6 +2386,13 @@ cd /work
 
 # Keep the old ramdisk init approach commented out for reference.
 # To revert, replace the above with the ramdisk_init.S approach.
+if [ "${BE300_PHYSICAL_NAND:-0}" = "1" ]; then
+    sed -i '\|^::sysinit:/bin/mount -t tmpfs -o size=768k tmpfs /root$|d' "$ROOTFS/etc/inittab"
+    if ! grep -q '^::sysinit:/bin/mount -o remount,rw /$' "$ROOTFS/etc/inittab"; then
+        sed -i '1i::sysinit:/bin/mount -o remount,rw /' "$ROOTFS/etc/inittab"
+    fi
+fi
+
 if false; then
 cat > /dev/null << 'INITASM_DISABLED'
 	.set noreorder
@@ -2888,7 +2904,7 @@ mkfs.jffs2 \
     --eraseblock=16384 \
     --pagesize=512 \
     --no-cleanmarkers \
-    --pad=0xB00000 \
+    --pad="${BE300_JFFS2_PAD:-0xB00000}" \
     --little-endian
 ls -l "$ROOTFS_JFFS2"
 

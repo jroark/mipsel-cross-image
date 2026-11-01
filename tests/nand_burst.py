@@ -43,13 +43,14 @@ class BurstTests(unittest.TestCase):
                 self.assertEqual(after.count('(void)*STREAM_PORT;'), 2)
 
     def test_modern_split_and_skip(self):
-        text = (REPO / 'board/casio-be300/nand.c').read_text()
+        text = (REPO / 'board/casio-be300/nand_controller.h').read_text()
         # Compile the actual byte/skip functions with a strict stream model.
         code = '''
 #include <assert.h>
 #include <stdint.h>
 typedef uint8_t u8;
 static unsigned be300_nand_read_pos, cursor, mode, transitions;
+static u8 be300_nand_tag[8];
 #define BE300_NAND_PAGE_DATA 512
 #define BE300_NAND_PAGE_RAW 528
 #define BE300_NAND_MODE_READ_OOB2 4

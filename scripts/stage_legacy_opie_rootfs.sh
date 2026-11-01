@@ -29,6 +29,10 @@
 
 set -euo pipefail
 
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    export BE300_JFFS2_PAD="${BE300_JFFS2_PAD:-0xAB0000}"
+fi
+
 REPO=/work
 LABEL=""
 DEVTABLE=""
@@ -145,6 +149,12 @@ fi
 echo "=== Casio BE-300 Linux $LABEL (BusyBox + Opie) rcS done ==="
 RCSEOF
 sed -i '/^$/d;' "$OPIE_ROOTFS_DIR/etc/init.d/rcS"
+if [[ "${BE300_PHYSICAL_NAND:-0}" == "1" ]]; then
+    # Installed systems keep settings and documents on the writable NAND.
+    sed -i -e '/^mount -t tmpfs -o size=768k tmpfs \/root$/d' \
+        -e 's|^echo "rcS: mount tmpfs /root"$|echo "rcS: persistent NAND home"|' \
+        -e '2i mount -o remount,rw /' "$OPIE_ROOTFS_DIR/etc/init.d/rcS"
+fi
 chmod 0755 "$OPIE_ROOTFS_DIR/etc/init.d/rcS"
 if [[ "$CONSOLE" == "ttyS0" ]]; then
     # Keep the kernel printk console on ttyS0, but avoid mixing rcS
@@ -245,6 +255,6 @@ echo "--- Building JFFS2 image $JFFS2_OUT ---"
 mkfs.jffs2 --root="$OPIE_ROOTFS_DIR" \
     --devtable="$DEVTABLE" \
     --eraseblock=16384 --pagesize=512 --no-cleanmarkers \
-    --pad=0xB00000 --little-endian \
+    --pad="${BE300_JFFS2_PAD:-0xB00000}" --little-endian \
     --output="$JFFS2_OUT"
 echo "  rootfs : $(ls -la "$JFFS2_OUT" | awk '{print $5, $9}')"
