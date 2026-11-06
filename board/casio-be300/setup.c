@@ -26,6 +26,9 @@
 #include <linux/ioport.h>
 #include <linux/platform_device.h>
 #include <linux/serial_8250.h>
+#include <linux/workqueue.h>
+#include <linux/delay.h>
+#include <linux/err.h>
 
 #include <asm/io.h>
 #include <asm/idle.h>
@@ -154,12 +157,6 @@ static struct resource be300_cf_resources[] = {
 	},
 };
 
-static struct platform_device be300_cf_device = {
-	.name		= "pata_be300",
-	.id		= -1,
-	.num_resources	= ARRAY_SIZE(be300_cf_resources),
-	.resource	= be300_cf_resources,
-};
 #endif
 
 /*
@@ -188,12 +185,6 @@ static struct resource be300_ne2000_resources[] = {
 	},
 };
 
-static struct platform_device be300_ne2000_device = {
-	.name		= "ne",
-	.id		= -1,
-	.num_resources	= ARRAY_SIZE(be300_ne2000_resources),
-	.resource	= be300_ne2000_resources,
-};
 
 /*
  * VRC4173 companion dock UART at PA 0x0A008680 exposed as ttyS0 via the
@@ -241,6 +232,27 @@ static struct platform_device be300_serial8250_device = {
 };
 
 /*
+ * A CF serial card (FUNCID 2: the RC56LD modem, the Brainboxes BL-565
+ * Bluetooth card) as ttyS1: a 16550 at I/O 0x3F8 in the card window, once
+ * hardware.c has written the COR of the CIS entry that decodes 3F8h.
+ * Polled (irq 0) like ttyS0, since VRC4173_IRQ(0) belongs to the NE2000.
+ * glaze-os btuart.c drives the BL-565 the same way.
+ */
+static struct plat_serial8250_port be300_card_uart_ports[] = {
+	{
+		.mapbase	= 0x0a00c3f8,
+		.membase	= (void __iomem *)KSEG1ADDR(0x0a00c3f8),
+		.irq		= 0,
+		.uartclk	= 1843200,
+		.regshift	= 0,
+		.iotype		= UPIO_MEM,
+		.flags		= UPF_BOOT_AUTOCONF | UPF_SKIP_TEST,
+	},
+	{ .flags = 0 },
+};
+
+
+/*
  * CF and NE2000 share VRC4173_IRQ(0); the emulator makes them mutually
  * exclusive (--cf vs --ne2000), and socket 0's CIS picks which one is
  * registered. Only NE2000 carries IORESOURCE_IRQ — pata_be300's resource
@@ -253,6 +265,80 @@ static struct platform_device be300_serial8250_device = {
  * ata_polling_mode kicks in when host->irq == 0).
  */
 
+/*
+ * Socket 0's card device, created for the card in the socket and removed
+ * with it. Only an NE2000-compatible card gets ne.c's register probe, only
+ * storage (FUNCID 4) gets ATA, whose polled waits on a modem or NIC card
+ * would only time out, and a serial card (FUNCID 2) gets ttyS1. Wi-Fi
+ * cards are wifi.c's.
+ */
+static struct platform_device *be300_card_dev;
+
+static void be300_card_attach(void)
+{
+	struct platform_device *dev = NULL;
+	int function = be300_card_function();
+
+	if (be300_wired_card())
+		dev = platform_device_register_simple("ne", -1,
+			be300_ne2000_resources, ARRAY_SIZE(be300_ne2000_resources));
+#ifdef CONFIG_ATA_SFF
+	else if (function == 4)
+		dev = platform_device_register_simple("pata_be300", -1,
+			be300_cf_resources, ARRAY_SIZE(be300_cf_resources));
+#endif
+	else if (function == 2)
+		dev = platform_device_register_data(NULL, "serial8250",
+			PLAT8250_DEV_PLATFORM1, be300_card_uart_ports,
+			sizeof(be300_card_uart_ports));
+	be300_card_dev = IS_ERR(dev) ? NULL : dev;
+}
+
+static void be300_card_detach(void)
+{
+	if (be300_card_dev)
+		platform_device_unregister(be300_card_dev);
+	be300_card_dev = NULL;
+}
+
+/*
+ * Hot plug, polled as glaze-os pcmcia_poll() does (card-detect inputs at
+ * A008). An inserted card is powered with the socket baseline and given
+ * its COR; its CIS can take a moment to answer after reset (a real
+ * WL54-CF did), so it is read for up to a second. glaze-os cf.c insert().
+ */
+static bool be300_card_present_now;
+static void be300_card_poll(struct work_struct *work);
+static DECLARE_DELAYED_WORK(be300_card_work, be300_card_poll);
+
+static void be300_card_poll(struct work_struct *work)
+{
+	bool present = !(readl((void __iomem *)KSEG1ADDR(0x0a00a008)) & 6);
+	int n;
+
+	if (present != be300_card_present_now) {
+		be300_card_present_now = present;
+		be300_card_detach();
+		if (present) {
+			be300_socket_power_up();
+			for (n = 0; n < 100; n++) {
+				u8 first = readb((void __iomem *)KSEG1ADDR(0x0a00d000));
+
+				if (first != 0x00 && first != 0xff)
+					break;
+				msleep(10);
+			}
+			be300_card_configure();
+			printk(KERN_INFO "BE-300: card inserted (FUNCID %d)\n",
+			       be300_card_function());
+			be300_card_attach();
+		} else {
+			printk(KERN_INFO "BE-300: card removed\n");
+		}
+	}
+	schedule_delayed_work(&be300_card_work, msecs_to_jiffies(500));
+}
+
 static int __init casio_be300_register_devices(void)
 {
 	int ret;
@@ -260,15 +346,10 @@ static int __init casio_be300_register_devices(void)
 	ret = platform_device_register(&be300_serial8250_device);
 	if (ret)
 		return ret;
-	/* Only an NE2000-compatible card gets ne.c's register probe, and
-	 * only storage (FUNCID 4) gets ATA, whose polled waits on a modem or
-	 * NIC card would only time out. */
-	if (be300_wired_card())
-		ret = platform_device_register(&be300_ne2000_device);
-#ifdef CONFIG_ATA_SFF
-	if (!ret && be300_card_function() == 4)
-		ret = platform_device_register(&be300_cf_device);
-#endif
-	return ret;
+	be300_card_present_now = !(readl((void __iomem *)KSEG1ADDR(0x0a00a008)) & 6);
+	if (be300_card_present_now)
+		be300_card_attach();	/* hardware.c configured it at boot */
+	schedule_delayed_work(&be300_card_work, msecs_to_jiffies(500));
+	return 0;
 }
 device_initcall(casio_be300_register_devices);

@@ -353,7 +353,7 @@ int be300_card_configure(void)
 }
 
 /* pcmcia.dll 0x0198C15C..0x0198C338: Vcc, reset pulse, card windows. */
-static void be300_socket_power_up(void)
+void be300_socket_power_up(void)
 {
 	be300_regs_socket_bus_init();
 	BE300_W32(0x0a00a034, (BE300_R32(0x0a00a034) | 4) & ~0x30U);

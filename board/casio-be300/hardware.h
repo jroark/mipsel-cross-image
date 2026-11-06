@@ -27,4 +27,6 @@ void be300_hard_icon(int icon);
 void be300_cmcu_resume(void);
 void be300_lcd_suspend(void);
 void be300_lcd_resume(void);
+/* Power socket 0 up from its stock baseline (hot plug; sleeps 320 ms). */
+void be300_socket_power_up(void);
 #endif
