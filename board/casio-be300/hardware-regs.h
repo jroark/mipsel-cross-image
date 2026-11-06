@@ -19,6 +19,13 @@
 #define BE300_BLG(off) (0x0a000980UL + (off))
 #define BE300_CMM 0x0a001128UL
 
+/* Millisecond waits as 1 ms steps: some kernels limit constant udelay(). */
+static void be300_regs_delay_ms(unsigned int ms)
+{
+	while (ms--)
+		BE300_DELAY(1000);
+}
+
 static void be300_regs_contrast(unsigned int level)
 {
 	unsigned int command = 208 - level * 3;
@@ -139,6 +146,23 @@ static void be300_regs_lcd_init(void)
 	BE300_W32(BE300_LCD(0x48), 0x30f);
 }
 
+/*
+ * Panel power-down, stock NK 0x80079BB4 as glaze-os display_sleep() does:
+ * C48 bit 9 off, 20 ms, bits 1-3 off, 1 ms, C48 = 0, C30 = 1. Glaze also
+ * stops gate 110C; Linux keeps it, because fbcon or a mapped framebuffer
+ * may still touch VRAM, and VRAM behind a stopped gate stalls the bus for
+ * good. Wake is be300_regs_lcd_init() again.
+ */
+static void be300_regs_lcd_sleep(void)
+{
+	BE300_W32(BE300_LCD(0x48), BE300_R32(BE300_LCD(0x48)) & ~0x200U);
+	be300_regs_delay_ms(20);
+	BE300_W32(BE300_LCD(0x48), BE300_R32(BE300_LCD(0x48)) & ~0x0eU);
+	be300_regs_delay_ms(1);
+	BE300_W32(BE300_LCD(0x48), 0);
+	BE300_W32(BE300_LCD(0x30), 1);
+}
+
 static int be300_regs_piu_prepare(void)
 {
 	unsigned int n;
@@ -229,6 +253,144 @@ static void be300_regs_power_on(void)
 	BE300_DELAY(10);
 }
 
+/*
+ * Calibration EEPROM, bit-banged inside the companion as eeprom.dll does
+ * (E2pRead selector 0x4A: device 0xA0, word address 0x94; 01A21510..
+ * 01A21784; glaze-os battery.c): gate 1124 = 0, A140 = 1, A194 = 0, then
+ * SCL A19C, SDA out A1A0, SDA in A1A4. Units are microseconds, slower
+ * than CE's and safe for the part.
+ */
+#define BE300_EE_SCL(v)	BE300_W32(0x0a00a19c, (v))
+#define BE300_EE_SDA(v)	BE300_W32(0x0a00a1a0, (v))
+
+static void be300_regs_ee_start(void)
+{
+	BE300_EE_SCL(1); BE300_EE_SDA(1); BE300_DELAY(20);
+	BE300_EE_SCL(1); BE300_DELAY(5);
+	BE300_EE_SDA(0); BE300_DELAY(5);
+	BE300_EE_SCL(0); BE300_DELAY(5);
+	BE300_EE_SDA(1);
+}
+
+static void be300_regs_ee_bit_out(unsigned int bit)
+{
+	BE300_EE_SCL(0); BE300_EE_SDA(bit); BE300_DELAY(5);
+	BE300_EE_SCL(1); BE300_DELAY(10);
+	BE300_EE_SCL(0); BE300_DELAY(5);
+}
+
+static unsigned int be300_regs_ee_bit_in(void)
+{
+	unsigned int v;
+
+	BE300_EE_SCL(0); BE300_EE_SDA(1); BE300_DELAY(5);
+	BE300_EE_SCL(1); BE300_DELAY(5);
+	v = BE300_R32(0x0a00a1a4) & 1;
+	BE300_DELAY(5);
+	BE300_EE_SCL(0); BE300_DELAY(5);
+	return v;
+}
+
+/* Returns 1 when the byte was acknowledged. */
+static int be300_regs_ee_send(unsigned int byte)
+{
+	int bit;
+
+	for (bit = 7; bit >= 0; bit--)
+		be300_regs_ee_bit_out((byte >> bit) & 1);
+	BE300_DELAY(5);
+	return be300_regs_ee_bit_in() == 0;
+}
+
+static unsigned int be300_regs_ee_recv(unsigned int last)
+{
+	unsigned int v = 0, i;
+
+	for (i = 0; i < 8; i++)
+		v = (v << 1) | be300_regs_ee_bit_in();
+	BE300_DELAY(5);
+	be300_regs_ee_bit_out(last);
+	return v;
+}
+
+/* The two battery calibration bytes; 0 if the part did not acknowledge. */
+static int be300_regs_ee_battery_cal(unsigned int *b0, unsigned int *b1)
+{
+	int ok;
+
+	BE300_W32(0x0a001124, 0);
+	BE300_W32(0x0a00a140, 1);
+	BE300_W32(0x0a00a194, 0);
+	be300_regs_ee_start();
+	ok = be300_regs_ee_send(0xa0);
+	ok = be300_regs_ee_send(0x4a * 2) && ok;
+	be300_regs_ee_start();
+	ok = be300_regs_ee_send(0xa1) && ok;
+	*b0 = be300_regs_ee_recv(0);
+	*b1 = be300_regs_ee_recv(1);
+	BE300_EE_SDA(0); BE300_EE_SCL(0); BE300_DELAY(5);	/* stop */
+	BE300_EE_SCL(1); BE300_DELAY(5);
+	BE300_EE_SDA(1); BE300_DELAY(5);
+	return ok;
+}
+
+/*
+ * Battery voltage through the PIU's A/D port scan, as gwes.exe's
+ * BatteryPDDGetStatus does (0xB0388-0xB0574; glaze-os battery.c). Only
+ * while the touch sequencer is idle (PIUCNT state Standby or
+ * WaitPenTouch): stop it and drive GPIO8 low, wait at least 10 ms, then
+ * convert. The touch scan is restarted by the caller.
+ */
+#define BE300_GPIO_CHARGING	0x0004	/* GIUPIODL bit 2, with the adapter */
+#define BE300_GPIO_ON_BATTERY	0x1000	/* GIUPIODL bit 12: no adapter */
+
+static unsigned int be300_regs_battery_lines(void)
+{
+	return BE300_R16(0x0f000144) & (BE300_GPIO_CHARGING | BE300_GPIO_ON_BATTERY);
+}
+
+static int be300_regs_piu_idle(void)
+{
+	unsigned int state = BE300_R16(0x0a000300) & 0x1c00;
+
+	return state == 0x0400 || state == 0x1000;
+}
+
+static void be300_regs_battery_begin(void)
+{
+	BE300_W16(0x0a000300, BE300_R16(0x0a000300) & ~0x0100U);
+	BE300_W16(0x0a000300, BE300_R16(0x0a000300) & ~0x0105U);
+	BE300_W16(0x0f000144, BE300_R16(0x0f000144) & ~0x0100U);
+}
+
+/* The 12-bit reading, 0 for none. CE writes PIUINT back with its pending
+ * byte, which would acknowledge touch events; only the mask byte and the
+ * A/D bit (6) are written here. */
+static unsigned int be300_regs_battery_convert(void)
+{
+	unsigned int ctl = BE300_R32(0x0a000314), cfg = BE300_R32(0x0a000318);
+	unsigned int mask = BE300_R16(0x0a000304) & 0xff00;
+	unsigned int v = 0, n;
+
+	BE300_W32(0x0a000314, 5);
+	BE300_W32(0x0a000318, 0x14e);
+	BE300_W16(0x0a000300, BE300_R16(0x0a000300) | 0x0008);
+	BE300_W16(0x0a000304, mask & ~0x4100U);
+	BE300_W16(0x0a000304, (BE300_R16(0x0a000304) & 0xff00) | 0x40);
+	BE300_W16(0x0a000300, BE300_R16(0x0a000300) | 0x0004);
+	for (n = 0; n < 3000 && !(BE300_R16(0x0a000304) & 0x40); n++)
+		;
+	if (n < 3000)
+		v = BE300_R32(0x0a000390) & 0x0fff;
+	BE300_W16(0x0a000300, BE300_R16(0x0a000300) & ~0x0004U);
+	BE300_W16(0x0a000304, (BE300_R16(0x0a000304) & 0xff00) | 0x40);
+	BE300_W16(0x0a000300, BE300_R16(0x0a000300) & ~0x0008U);
+	BE300_W32(0x0a000314, ctl);
+	BE300_W32(0x0a000318, cfg);
+	BE300_W16(0x0a000304, mask);
+	return v;
+}
+
 /* Whether the companion SIU can be touched without stalling the bus. */
 static int be300_regs_siu_clocked(void)
 {
@@ -241,13 +403,6 @@ static int be300_regs_siu_clocked(void)
 static int be300_regs_card_present(void)
 {
 	return (BE300_R32(0x0a00a008) & 6) == 0;
-}
-
-/* Millisecond waits as 1 ms steps: some kernels limit constant udelay(). */
-static void be300_regs_delay_ms(unsigned int ms)
-{
-	while (ms--)
-		BE300_DELAY(1000);
 }
 
 /*
@@ -331,7 +486,7 @@ static int be300_regs_cmcu_stop(void)
 	return -1;
 }
 
-static void __attribute__((unused)) be300_regs_cmcu_start(void)
+static void be300_regs_cmcu_start(void)
 {
 	unsigned int n;
 

@@ -173,6 +173,47 @@ $(TOPDIR)/Rules.make`; the installer moves `buzzer.o hard_icons.o` there.
 have never been built on 2.4: `audio.c` needs `<asm/cacheflush.h>`, which 2.4
 lacks. 2.4 kernels therefore have no OSS or CF Wi-Fi driver yet.
 
+## Battery, display sleep and suspend
+
+`board/casio-be300/battery.c` (all three kernels) reads the battery as
+Windows CE's gwes.exe driver does (glaze-os `kernel/drivers/battery.c`):
+GIUPIODL bit 12 is 1 on battery, bit 2 is 1 while charging with the
+adapter in, the voltage is a 12-bit PIU A/D port-scan result at `0390`, and
+the calibration comes from the EEPROM's bytes 0x94/0x95 (bit-banged at
+`A19C/A1A0/A1A4` after `1124=0 A140=1 A194=0`), else CE's 4.2 V / 3.7 V
+defaults. Every 2 s, only while the touch sequencer is idle, the scan is
+stopped and GPIO8 driven low; 20 ms later one conversion is made and the
+touch scan restarted. A sample is retried if the touch driver restarted the
+scan meanwhile, and the conversion never acknowledges pending touch events.
+Averaging, bands and the critical rule are CE's (`battery.h`). 4.2 answers
+APM emulation (`/proc/apm`, replacing `power.c`'s fixed "AC, 100 %"); 2.4
+and 2.6 get a `/proc/apm` in the same format. In the emulator 4.2 reports
+`--battery 40 --battery-state battery` as 40 % offline and `60 charging`
+as 59 % charging; the 2.4/2.6 file is built and booted but not yet read at
+runtime. Real-hardware EEPROM contents and A/D readings are unmeasured.
+
+Framebuffer blank level POWERDOWN (4) also powers the panel down with
+stock NK 0x80079BB4's C48 sequence (bit 9, 20 ms, bits 1-3, 1 ms, C48=0,
+C30=1); unblank runs the panel start again and restores brightness and
+contrast. Unlike glaze-os, gate `110C` stays on: fbcon or a mapped
+framebuffer may still write VRAM, and VRAM behind a stopped gate stalls
+the bus.
+
+4.2 idles with mainline `vr41xx_cpu_wait()` STANDBY; the busy-wait override
+in `setup.c` is gone now that the emulator models STANDBY setting IE.
+
+4.2 supports suspend to RAM (`echo mem > /sys/power/state`,
+`board/casio-be300/pm.c`), following glaze-os `suspend_until()`: panel
+down, MCU watchdog stopped, only POWERINTR and GIU line 0 with the GIRQ0
+button source unmasked, Status IM2 only so the Count/Compare tick cannot
+wake it, then SUSPEND (`.word 0x42000022`) with IE set, again until the
+Power key is held or POWERINTR is raised. An interrupt taken between
+enabling IE and SUSPEND resumes past it (EPC moved, as glaze's
+`power_trap`). Resume restarts the watchdog and the panel. Patch 0008 keeps
+the Stowaway input device across the serio reconnect, so event numbers do
+not change. Two suspend/resume cycles pass in the emulator; glaze-os has not
+yet verified SUSPEND's wake on hardware. Power-off remains HIBERNATE.
+
 ## Display controls
 
 After boot `/dev/be300-display` is a misc character device. Read it to get

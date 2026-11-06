@@ -288,7 +288,7 @@ def console(text, names):
 # Objects that must really link on 2.4. audio.o and wifi.o are appended
 # after the include too and so have never been built there: audio.c needs
 # <asm/cacheflush.h>, which 2.4 lacks, and neither has been ported.
-RULES_MAKE_OBJECTS = ('buzzer.o', 'hard_icons.o')
+RULES_MAKE_OBJECTS = ('buzzer.o', 'hard_icons.o', 'battery.o')
 
 def rules_make_order(text):
     """Linux 2.4's Rules.make reads obj-y when it is included: objects
@@ -317,7 +317,7 @@ def install(tree, version):
     if not board.is_dir():
         raise RuntimeError('BE-300 board patch series must be applied first')
     source = REPO / 'board/casio-be300'
-    for name in ['hardware.c', 'hardware.h', 'hardware-regs.h', 'audio.c', 'audio-regs.h', 'wifi.c', 'wifi-proto.h', 'wifi-wext.h', 'card.h', 'buzzer.c', 'hard_icons.c', 'hard_icons.h']:
+    for name in ['hardware.c', 'hardware.h', 'hardware-regs.h', 'audio.c', 'audio-regs.h', 'wifi.c', 'wifi-proto.h', 'wifi-wext.h', 'card.h', 'buzzer.c', 'hard_icons.c', 'hard_icons.h', 'battery.c', 'battery.h']:
         copy_changed(source / name, board / name)
     if version in ('2.4', '2.6'):
         physical = os.environ.get('BE300_PHYSICAL_NAND', '0') == '1'
@@ -344,7 +344,7 @@ def install(tree, version):
         # 2.6 and 2.4 bring their own 520-byte page readers in their patch
         # series; 4.2's driver is this file, kept current here.
         copy_changed(source / 'nand.c', board / 'nand.c')
-        for name in ('nand_controller.h', 'nand_physical.h', 'nand_ecc.c', 'nand_ecc.h', 'nand_boot.c', 'nand_boot.h', 'pata_be300.c'):
+        for name in ('nand_controller.h', 'nand_physical.h', 'nand_ecc.c', 'nand_ecc.h', 'nand_boot.c', 'nand_boot.h', 'pata_be300.c', 'pm.c'):
             copy_changed(source / name, board / name)
     copy_changed(source / 'hardware.h', tree / 'include/linux/be300_hardware.h')
     copy_changed(source / 'card.h', tree / 'include/linux/be300_card.h')
@@ -378,6 +378,16 @@ def install(tree, version):
         # Piezo as an EV_SND input device (bltinbuz.dll registers), and the
         # printed icons below the LCD as F1-F7.
         makefile.write_text(text + '\nobj-$(CONFIG_INPUT) += buzzer.o hard_icons.o\n')
+    text = makefile.read_text()
+    if 'battery.o' not in text:
+        # Battery/adapter/charger from the gwes.exe driver; on 4.2 it
+        # replaces power.c's fixed "always on AC, 100 %" APM answer.
+        text = text.replace(' power.o', '') if version == '4.2' else text
+        makefile.write_text(text + '\nobj-y += battery.o\n')
+    text = makefile.read_text()
+    if version == '4.2' and 'pm.o' not in text:
+        # Suspend to RAM through the VR4131 SUSPEND instruction.
+        makefile.write_text(text + '\nobj-$(CONFIG_SUSPEND) += pm.o\n')
     text = makefile.read_text()
     if version == '4.2' and 'pata_be300.o' not in text:
         # Byte-wide CF ATA (glaze-os cf.c); replaces pata_platform.

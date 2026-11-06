@@ -9,7 +9,7 @@ static unsigned ntrace, serial, clocks, latches, bits, stuck, reset_reads;
 static unsigned long now;
 static unsigned regs[0x10000 / 4], giu[16], rtc[32];
 static unsigned char attr[0x800];
-static int cor_ignored;
+static int cor_ignored, adc_reading = -1, piu_w1c;
 static unsigned read8(unsigned long pa)
 {
 	assert(pa >= 0x0a00d000 && pa < 0x0a00d800);
@@ -44,12 +44,20 @@ static void write_reg(unsigned long pa, unsigned value)
 		if ((value & 1) && !(old & 1)) { assert(bits == 8); latches++; bits = 0; }
 	}
 	regs[(pa - 0x0a000000) / 4] = value;
+	if (pa == 0x0a000304 && piu_w1c)	/* PIUINT: mask byte, W1C status */
+		regs[0x304/4] = (value & 0xff00) | (old & 0xff & ~value);
 	/* Power MCU: 5C after ARG0 35 stops the watchdog, 3A after ARG 53
 	 * starts it; STATUS reads 3 while it runs (be300 src/hw/cmcu.c). */
 	if (pa == 0x0a007800 && value == 0x5c && regs[0x7804/4] == 0x35)
 		regs[0x7834/4] = 0;
 	if (pa == 0x0a007808 && value == 0x3a && regs[0x780c/4] == 0x53)
 		regs[0x7834/4] = 3;
+	/* PIU A/D port scan: PIUSEQEN with PIUMODE 01 latches the battery
+	 * reading at 0390 and raises PIUINT bit 6 (be300 src/hw/piu.c). */
+	if (pa == 0x0a000300 && (value & 0x0c) == 0x0c && adc_reading >= 0) {
+		regs[0x390/4] = 0xf000 | adc_reading;
+		regs[0x304/4] |= 0x40;
+	}
 }
 #define BE300_R32(pa) read_reg(pa)
 #define BE300_W32(pa,v) write_reg(pa,v)
@@ -184,6 +192,40 @@ int main(void)
 		be300_regs_backlight_on(saved, 1);
 		assert(regs[0x980/4] == 1 && regs[0x1128/4] == 0xa5);
 	}
-	puts("LCD sequence/delays, serial contrast, duty, PIU timeout, GIU preservation, MCU protocol, power-on gates/GPIO, card detect, GIU lines, socket baseline, COR and watchdog stop/start, alarm-off, buzzer and shared-gate blanking passed");
+	/* Panel power-down: C48 30F -> 10F (20 ms) -> 101 (1 ms) -> 0, C30 1;
+	 * the VRAM gates stay on so a late framebuffer write cannot stall. */
+	regs[0xc48/4] = 0x30f; regs[0x1100/4] = regs[0x110c/4] = 1; ntrace = 0; now = 0;
+	be300_regs_lcd_sleep();
+	assert(ntrace == 4 && trace[0].value == 0x10f && trace[1].value == 0x101);
+	assert(trace[1].time >= 20000 && trace[2].time >= 21000 && trace[2].value == 0);
+	assert(regs[0xc30/4] == 1 && regs[0x1100/4] == 1 && regs[0x110c/4] == 1);
+	/* Battery: lines from GIUPIODL bits 2/12; an A/D sample only while the
+	 * touch sequencer is idle, PIU state restored, touch events untouched. */
+	giu[2] = 0x1004;
+	assert(be300_regs_battery_lines() == 0x1004);
+	regs[0x300/4] = 0x0400 | 0x0106; assert(be300_regs_piu_idle());
+	regs[0x300/4] = 0x0800 | 0x0106; assert(!be300_regs_piu_idle());
+	regs[0x300/4] = 0x1000 | 0x0106;
+	giu[2] = 0x1104;
+	be300_regs_battery_begin();
+	assert(regs[0x300/4] == 0x1002 && giu[2] == 0x1004);
+	regs[0x314/4] = 0x11; regs[0x318/4] = 0x22; regs[0x304/4] = 0xdd09;
+	adc_reading = 0xcd5; piu_w1c = 1;
+	assert(be300_regs_battery_convert() == 0xcd5);
+	assert(regs[0x314/4] == 0x11 && regs[0x318/4] == 0x22);
+	/* Pending touch events (09) survive; the A/D bit is cleared. */
+	assert(regs[0x304/4] == 0xdd09 && !(regs[0x300/4] & 0x0c));
+	adc_reading = -1; regs[0x304/4] = 0xdd00;
+	assert(be300_regs_battery_convert() == 0);	/* no result: bounded */
+	piu_w1c = 0;
+	{
+		/* An absent or erased EEPROM never acknowledges. */
+		unsigned int b0 = 0, b1 = 0;
+		regs[0xa1a4/4] = 1;
+		assert(!be300_regs_ee_battery_cal(&b0, &b1));
+		assert(b0 == 0xff && b1 == 0xff && regs[0x1124/4] == 0);
+		assert(regs[0xa140/4] == 1 && regs[0xa194/4] == 0);
+	}
+	puts("LCD sequence/delays, serial contrast, duty, PIU timeout, GIU preservation, MCU protocol, power-on gates/GPIO, card detect, GIU lines, socket baseline, COR and watchdog stop/start, alarm-off, buzzer, shared-gate blanking, battery A/D, EEPROM and panel sleep passed");
 	return 0;
 }
