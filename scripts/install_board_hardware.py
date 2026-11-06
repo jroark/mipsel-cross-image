@@ -298,7 +298,7 @@ def install(tree, version):
         # 2.6 and 2.4 bring their own 520-byte page readers in their patch
         # series; 4.2's driver is this file, kept current here.
         copy_changed(source / 'nand.c', board / 'nand.c')
-        for name in ('nand_controller.h', 'nand_physical.h', 'nand_ecc.c', 'nand_ecc.h', 'nand_boot.c', 'nand_boot.h'):
+        for name in ('nand_controller.h', 'nand_physical.h', 'nand_ecc.c', 'nand_ecc.h', 'nand_boot.c', 'nand_boot.h', 'pata_be300.c'):
             copy_changed(source / name, board / name)
     copy_changed(source / 'hardware.h', tree / 'include/linux/be300_hardware.h')
     copy_changed(source / 'card.h', tree / 'include/linux/be300_card.h')
@@ -328,6 +328,10 @@ def install(tree, version):
                 text += '\tselect SOUND_OSS_CORE\n'
             config.write_text(text)
     text = makefile.read_text()
+    if version == '4.2' and 'pata_be300.o' not in text:
+        # Byte-wide CF ATA (glaze-os cf.c); replaces pata_platform.
+        makefile.write_text(text + '\nobj-$(CONFIG_ATA_SFF) += pata_be300.o\n')
+    text = makefile.read_text()
     if 'wifi.o' not in text:
         makefile.write_text(text + '\nobj-$(CONFIG_BE300_WIFI) += wifi.o\n')
     if version != '2.4':
@@ -356,16 +360,28 @@ def install(tree, version):
                 '    define_bool CONFIG_BE300_WIFI y\n    define_bool CONFIG_NET_RADIO y\n  fi\nfi\n')
         cf = board / 'cf_be300.c'
         text = cf.read_text()
-        if 'be300_wireless_card()' not in text:
-            text = '#include <linux/be300_card.h>\n' + text
-            text = function_body(text, 'be300_ide_default_io_base', lambda b: inject(b, '\tif (be300_wireless_card())\n\t\treturn 0;\n'))
+        # Only storage (FUNCID 4) gets an IDE channel: polled ATA waits on
+        # a network, serial or empty socket only time out.
+        gate = '\tif (be300_card_function() != 4)\n\t\treturn 0;\n'
+        if 'be300_card_function() != 4' not in text:
+            old_gate = '\tif (be300_wireless_card())\n\t\treturn 0;\n'
+            if old_gate in text:
+                text = text.replace(old_gate, gate, 1)
+            else:
+                text = '#include <linux/be300_card.h>\n' + text
+                text = function_body(text, 'be300_ide_default_io_base', lambda b: inject(b, gate))
             cf.write_text(text)
     setup = board / 'setup.c'
     text = setup.read_text()
-    old = '*(volatile u32 *)KSEG1ADDR(BE300_GIRQ0_ACK_PA) = 0xffffffffu;'
-    if old in text:
-        text = '#include <linux/be300_hardware.h>\n' + text
-        setup.write_text(text.replace(old, 'be300_girq0_source_mask(1);'))
+    # 0A000014 is source 1's control word, not a W1C latch: all-ones would
+    # enable the button source with junk mode bits (2.4 patch 0013 form).
+    for old in ('*(volatile u32 *)KSEG1ADDR(BE300_GIRQ0_ACK_PA) = 0xffffffffu;',
+                '*(volatile unsigned long *) KSEG1ADDR(0x0a000014) = 0xffffffffu;'):
+        if old in text:
+            if 'linux/be300_hardware.h' not in text:
+                text = '#include <linux/be300_hardware.h>\n' + text
+            text = text.replace(old, 'be300_girq0_source_mask(1);')
+            setup.write_text(text)
     if version == '2.4':
         adapt(tree / 'drivers/char/serial_be300.c',
               lambda t: console(t, ['be300_console_init', 'be300_serial_init']))

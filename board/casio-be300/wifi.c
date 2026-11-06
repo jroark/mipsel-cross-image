@@ -385,20 +385,47 @@ static int marvell_firmware(void)
 	vfree(helper);
 	return ret;
 }
+/*
+ * Which A020 setting gives the XI-825 16-bit I/O cycles: a 16-bit write of
+ * PRISM SWSUPPORT0 (0x28) reads back whole only over a 16-bit bus, the test
+ * hostap uses. Keep bit 3 if both settings work (glaze-os cf.c).
+ */
+static void prism_bus_width(void)
+{
+	void __iomem *a020 = (void __iomem *)0xaa00a020UL;
+	u32 base = readl(a020) & ~0x0cU;
+	u16 with, without;
+
+	writel(base | 8, a020);
+	WIFI_W16(0x28, 0x8a32);
+	with = WIFI_R16(0x28);
+	writel(base, a020);
+	WIFI_W16(0x28, 0x8a32);
+	without = WIFI_R16(0x28);
+	if (with == 0x8a32 || without != 0x8a32)
+		writel(base | 8, a020);
+}
 static int initialize_card(void)
 {
 	int ret;
 	unsigned int poll, revision;
 	be300_girq0_source_mask(0);
 	if (station.kind == BW_XI825) {
-		writeb(1, (void *)0xaa00d3e0UL);
+		/* COR 0x3E0: entry 1, level interrupts (glaze-os cf.c). */
+		be300_card_write_cor(0x3e0, 0x41);
+		prism_bus_width();
 		ret = bx_init(&station);
 	} else {
-		/* Byte-addressed attribute bridge, never NAND DIO at AA00D200.
+		/*
+		 * COR at attribute 0x200 through the card window at AA00D000
+		 * with A020 bit 3 set: a real WL54-CF read back 0x41 there and
+		 * associated (glaze-os docs/hardware/WL54CF.md). The 0x0B400100
+		 * alias was never verified on hardware. Linux NAND uses the
+		 * XFER engine, not the DIO port that shares this address.
 		 */
-		writeb(0x80, (void *)0xab400100UL);
+		be300_card_write_cor(0x200, 0x80);
 		udelay(1000);
-		writeb(1, (void *)0xab400100UL);
+		be300_card_write_cor(0x200, 0x41);
 		WIFI_W16(4, 31);
 		for (poll = 0; poll < 1000; poll++) {
 			revision = WIFI_R8(0x1c);

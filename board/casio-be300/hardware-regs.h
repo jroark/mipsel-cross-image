@@ -10,6 +10,8 @@
 #define BE300_W32(pa, v) writel((v), (void __iomem *)(0xa0000000UL | (pa)))
 #define BE300_R16(pa) readw((void __iomem *)(0xa0000000UL | (pa)))
 #define BE300_W16(pa, v) writew((v), (void __iomem *)(0xa0000000UL | (pa)))
+#define BE300_R8(pa) readb((void __iomem *)(0xa0000000UL | (pa)))
+#define BE300_W8(pa, v) writeb((v), (void __iomem *)(0xa0000000UL | (pa)))
 #define BE300_DELAY(us) udelay(us)
 #endif
 
@@ -185,6 +187,122 @@ static int be300_regs_card_present(void)
 	return (BE300_R32(0x0a00a008) & 6) == 0;
 }
 
+/* Millisecond waits as 1 ms steps: some kernels limit constant udelay(). */
+static void be300_regs_delay_ms(unsigned int ms)
+{
+	while (ms--)
+		BE300_DELAY(1000);
+}
+
+/*
+ * Stock SPL 80F03248/80F03290: companion socket clock, bus timings and
+ * GPIO5 (socket power) as a driven-high output. CE may gate the socket
+ * while no card is present, so glaze-os (kernel/drivers/cf.c
+ * socket_bus_init) restores this before every power-up; on a real BE-300
+ * hot insertion only worked with it (glaze-os docs/hardware/PHYSICAL_NAND.md).
+ * GIUPIODL first, then GIUIOSELL, so the pin never drives a stale level.
+ */
+static void be300_regs_socket_bus_init(void)
+{
+	BE300_W32(0x0a00111c, 1);
+	BE300_W32(0x0a00a010, 0x1073);
+	BE300_W32(0x0a00a014, 0x1061);
+	BE300_W32(0x0a00a018, 0x10b1);
+	BE300_W16(0x0f000144, BE300_R16(0x0f000144) | 0x20);
+	BE300_W16(0x0f000140, BE300_R16(0x0f000140) | 0x20);
+}
+
+/*
+ * Map the card's configuration registers (pcmcia.dll before atadisk.dll's
+ * first command, 0x0198A468): A034 bit 2, A024 bits 2-3 clear, A020 bit 3.
+ * Attribute address N is then the byte at PA 0x0A00D000 + N.
+ */
+static void be300_regs_card_config_window(void)
+{
+	BE300_W32(0x0a00a034, (BE300_R32(0x0a00a034) | 4) & ~0x30U);
+	BE300_W32(0x0a00a024, BE300_R32(0x0a00a024) & ~0x0cU);
+	BE300_W32(0x0a00a020, (BE300_R32(0x0a00a020) & ~4U) | 8);
+}
+
+/* An I/O card's COR: its CONFIG base, entry index plus level IRQs (0x40).
+ * A real WL54-CF read back 0x41 at 0x200 and then associated. */
+static void be300_regs_card_cor(unsigned int attr, unsigned int cor)
+{
+	be300_regs_card_config_window();
+	BE300_W8(0x0a00d000UL + attr, cor);
+	be300_regs_delay_ms(10);
+}
+
+/*
+ * ATA: CCSR, COR, CCSR at attribute 0x202/0x200, read back because a card
+ * still settling drops the write (glaze-os cf.c configure). COR 0x43 is
+ * the secondary IDE ports (the taskfile at C170) with level interrupts,
+ * CF spec 4.3.2. Zero, the unconfigured memory mode, disables ATA.
+ */
+static int be300_regs_ata_cor(unsigned int cor)
+{
+	unsigned int n;
+
+	be300_regs_card_config_window();
+	for (n = 0; n < 5; n++) {
+		BE300_W8(0x0a00d202, 0xfd);
+		BE300_W8(0x0a00d200, cor);
+		BE300_W8(0x0a00d202, 0x01);
+		be300_regs_delay_ms(10);
+		if (BE300_R8(0x0a00d200) == cor)
+			return 0;
+		be300_regs_delay_ms(100);
+	}
+	return -1;
+}
+
+/*
+ * Stop and start the power MCU's watchdog as Windows CE does around sleep
+ * (cedmbltin.dll CDM_PowerDown 0x019F1430 / StopWDT 0x019F1A6C, start loop
+ * 0x019F1990; glaze-os kernel/drivers/cmcu.c). Without a stop a halted or
+ * powered-off BE-300 resets about 150 s after the last reload.
+ */
+static int be300_regs_cmcu_stop(void)
+{
+	unsigned int n;
+
+	for (n = 0; n < 1000; n++) {
+		BE300_W32(0x0a007804, 0x35);
+		BE300_W32(0x0a007800, 0x5c);
+		if (!(BE300_R32(0x0a007834) & 7))
+			return 0;
+	}
+	return -1;
+}
+
+static void __attribute__((unused)) be300_regs_cmcu_start(void)
+{
+	unsigned int n;
+
+	BE300_W32(0x0a007814, 0x96);
+	for (n = 0; n < 1000; n++) {
+		BE300_W32(0x0a00780c, 0x53);
+		BE300_W32(0x0a007808, 0x3a);
+		if ((BE300_R32(0x0a007834) & 7) == 3)
+			break;
+	}
+}
+
+/*
+ * Keep the elapsed-time alarm from waking a powered-off BE-300 out of
+ * HIBERNATE: mainline rtc-vr41xx leaves ECMP at 0 when /dev/rtc closes,
+ * and the emulator treats any ETIME >= ECMP as the alarm. Move ECMP out
+ * of reach and clear a latched ELAPSEDTIME interrupt (RTCINTREG, W1C).
+ * VR4131 UM ch. 13.
+ */
+static void be300_regs_rtc_alarm_off(void)
+{
+	BE300_W16(0x0f00010c, 0xffff);	/* high word first: no transient match */
+	BE300_W16(0x0f00010a, 0xffff);
+	BE300_W16(0x0f000108, 0xffff);
+	BE300_W16(0x0f00013e, 1);
+}
+
 static void be300_regs_giu0(void)
 {
 	/* NK 800A5F60/6C/78/80: change only the pin owned by this cascade. */
@@ -192,5 +310,16 @@ static void be300_regs_giu0(void)
 	BE300_W16(0x0f000150, BE300_R16(0x0f000150) & ~1U);
 	BE300_W16(0x0f000154, BE300_R16(0x0f000154) | 1);
 	BE300_W16(0x0f000158, BE300_R16(0x0f000158) | 1);
+	/*
+	 * Only GIU line 0 is the board's. After a RAM boot from Windows CE
+	 * other lines stay enabled (its serial driver's), and one firing held
+	 * SYSINT1's GIU bit with nothing to clear it: an interrupt storm on a
+	 * real BE-300 (glaze-os kernel/drivers/irq.c). Disable them and clear
+	 * what is pending; the cascade enables line 0 afterwards.
+	 */
+	BE300_W16(0x0f00014c, 0);
+	BE300_W16(0x0f00014e, 0);
+	BE300_W16(0x0f000148, 0xffff);
+	BE300_W16(0x0f00014a, 0xffff);
 }
 #endif

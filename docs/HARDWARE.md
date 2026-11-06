@@ -32,8 +32,38 @@ The emulator is a regression target, not an electrical specification.
   source words are not treated as a bitmap W1C register at offset 0014.
   Each driver retains its existing interrupt or polling delivery policy.
 - Socket power/reset/window preparation before cold-boot ATA/NIC probing,
-  without guessing card COR values or replacing a configured handoff. Card
-  presence comes from the `A008` card-detect inputs.
+  without replacing a configured handoff. Card presence comes from the `A008`
+  card-detect inputs. Each power-up first restores the stock SPL socket
+  baseline (`111C=1`, `A010=1073`, `A014=1061`, `A018=10B1`, GPIO5 driven
+  high), then writes the card's COR through attribute memory at
+  `0A00D000+addr` with the configuration window mapped (`A034` bit 2, `A024`
+  bits 2-3 clear, `A020` bit 3): ATA gets CCSR FD / COR 43 / CCSR 01 at
+  0x202/0x200 with readback and five tries; an I/O card gets `0x40|entry` at
+  its CIS CONFIG base, the entry being the one decoding port 0x300 (else the
+  default). These are glaze-os `kernel/drivers/cf.c`; on a real BE-300 a COR
+  of zero left ATA disabled and a WL54-CF read back 0x41 at 0x200 and
+  associated. The Wi-Fi driver resets and rewrites its COR through the same
+  window, not the unverified `0B400100` alias.
+- Socket-0 cards are classified by CIS FUNCID and MANFID (`card.h`): only an
+  NE2000-compatible network card reaches `ne.c`'s register probe (3Com 0101
+  and Lucent 0156 are excluded), and only FUNCID 4 storage gets an ATA host.
+  On 4.2 that host is `pata_be300`: 8-bit data transfers after SET FEATURES
+  01h on every reset, because on hardware each 16-bit data access carried one
+  byte with a zero high byte (glaze-os `identify_as`/`read_sector`). 2.4's
+  IDE channel is limited to FUNCID 4 but still uses 16-bit transfers.
+- GIU lines other than 0 are disabled and their status cleared before the
+  cascade is enabled (a CE RAM handoff left its serial line enabled and
+  stormed on hardware), and the PCMCIA, button, audio and touch source words
+  are written with bit 2 set at init, which also clears stale latches.
+- Halt, power-off and restart stop the power MCU's watchdog (ARG0 35 / CMD0
+  5C until STATUS&7 is 0, at most 1000 tries; cedmbltin.dll StopWDT) after
+  stopping the keepalive timer, whose 53/3A pair would restart it. Without
+  this a powered-off BE-300 resets about 150 s later. Halt and power-off also
+  move the ETIME alarm out of reach (ECMP all ones, RTCINTREG cleared), since
+  `rtc-vr41xx` leaves ECMP at 0 and the emulator then wakes HIBERNATE at once.
+- 4.2 RTC writes wait 200 us before and after writing ETIME and read the count
+  back, retrying up to three times (VR4131 UM 13.2.1; a real BE-300 read back
+  the old count right after a write, glaze-os `rtc.c`). Patch 0007.
 - Explicit NAND unit clock/PIO enables. The shared SPL now frames command and
   address phases like the recovered WinCE path, reads ACK, drains the full
   spare area, deselects transfers and bounds NAND/UART waits. A failed kernel
@@ -164,7 +194,19 @@ cc -std=gnu89 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
 
 It checks the recovered enable order and minimum waits, contrast command and
 edges, duty semantics, reserved-bit preservation, bounded PIU reset failure,
-GIU pin isolation and MCU protocol with status=3.
+GIU pin isolation and line clearing, MCU protocol with status=3, the socket
+baseline, ATA and I/O COR writes with readback retries, watchdog stop/start
+and the power-off alarm disarm.
+
+`tests/card_cis.c` runs `card.h`'s classification and COR selection over the
+CIS images the emulator presents for ATA, NE2000, XI-825, WL54-CF, 3c589,
+Hermes and the CF modem (several read from real cards):
+
+```sh
+cc -std=gnu89 -O2 -Wall -Wextra -Werror -Itests/include \
+    -fsanitize=address,undefined tests/card_cis.c -o /tmp/be300-card-cis
+/tmp/be300-card-cis
+```
 
 `tools/hw_smoke_init.c` is a freestanding MIPS o32 `/init` for validation with
 no GUI/libc donor. It checks display read/write and invalid levels, draws a
