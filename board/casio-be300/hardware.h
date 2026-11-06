@@ -19,4 +19,8 @@ int be300_card_configure(void);
 void be300_card_write_cor(unsigned int attr, unsigned int cor);
 /* Stop the power MCU watchdog before halt, power-off or sleep. */
 void be300_cmcu_shutdown(void);
+/* Piezo tone at hz (80..6000), 0 stops it. */
+void be300_buzzer_tone(unsigned int hz);
+/* A released hard-icon tap (0..6): sends KEY_F1 + icon. */
+void be300_hard_icon(int icon);
 #endif

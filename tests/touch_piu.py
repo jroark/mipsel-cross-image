@@ -30,12 +30,18 @@ static void w16(unsigned long pa,unsigned v) {
 #define BE300_W32(pa,v) w32(pa,v)
 #define BE300_R16(pa) r32(pa)
 #define BE300_W16(pa,v) w16(pa,v)
+#define BE300_R8(pa) r32(pa)
+#define BE300_W8(pa,v) w32(pa,v)
 #define BE300_DELAY(us) ((void)(us))
 #include "hardware-regs.h"
+#include "hard_icons.h"
+static int icons[8];static unsigned nicons;
+static void be300_hard_icon(int icon) {if(icon>=0){assert(nicons<8);icons[nicons++]=icon;}}
 struct input_dev {int x,y,down;};
 struct event {int x,y,down;}; static struct event events[32];static unsigned nevents;
 struct be300_touch {struct input_dev *input;int irq,lock,poll;bool pen_down;
- int stroke_samples,first_x,first_y,win_x[3],win_y[3],win_n;bool held;int held_x,held_y,pen_x,pen_y;};
+ int stroke_samples,first_x,first_y,win_x[3],win_y[3],win_n;bool held;int held_x,held_y,pen_x,pen_y;
+ struct be300_icon_stroke icon;};
 #define BE300_TOUCH_FILTER_N 3
 #define BE300_TOUCH_MOVE_MIN 2
 #define ABS_X 0
@@ -61,7 +67,7 @@ typedef int irqreturn_t;
 #define PIU_ADC_X_MAX 0x8d1b
 #define BE300_TOUCH_WIDTH 240
 #define BE300_TOUCH_HEIGHT 320
-#define BE300_TOUCH_PANEL_HEIGHT 359
+#define BE300_TOUCH_PANEL_HEIGHT BE300_PANEL_ROWS
 static u16 piu_read(struct be300_touch *t,unsigned off) {
  (void)t;return off==0?cnt:off==4?status:sample[off/4];
 }
@@ -119,6 +125,36 @@ int main(void) {
  assert(nevents==2&&events[0].down==1&&events[1].down==0);
  int expect=(0x8700-0x8300)*239/(0x8d1b-0x8300);
  assert(events[0].x>=expect-2&&events[0].x<=expect+2);
+ /* Hard icons: a tap on the strip below the LCD (y 340, x 120: icon 4)
+  * sends no pointer events and fires icon index 3 on release. */
+ unsigned yp=0x81e1+340*(0x8e30-0x81e1)/359, xp=0x8300+120*(0x8d1b-0x8300)/239;
+ nevents=0;cnt=0x306;status=0xdd01;cnt|=0x2000;be300_touch_isr(81,&t);
+ for(unsigned i=0;i<4;i++){
+  sample[0x20/4]=yp;sample[0x24/4]=0x8e30-(yp-0x81e1);sample[0x28/4]=0x8d1b-(xp-0x8300);sample[0x2c/4]=xp;
+  status=0xdd08;cnt=0x2306;be300_touch_isr(81,&t);
+ }
+ cnt=0x306;status=0xdd01;be300_touch_isr(81,&t);
+ assert(nevents==0&&nicons==1&&icons[0]==3);
+ /* Sliding off the icon cancels it. */
+ nicons=0;cnt=0x306;status=0xdd01;cnt|=0x2000;be300_touch_isr(81,&t);
+ for(unsigned i=0;i<4;i++){
+  unsigned x=0x8300+(120+i*25)*(0x8d1b-0x8300)/239;
+  sample[0x20/4]=yp;sample[0x24/4]=0x8e30-(yp-0x81e1);sample[0x28/4]=0x8d1b-(x-0x8300);sample[0x2c/4]=x;
+  status=0xdd08;cnt=0x2306;be300_touch_isr(81,&t);
+ }
+ cnt=0x306;status=0xdd01;be300_touch_isr(81,&t);
+ assert(nevents==0&&nicons==0);
+ /* A stroke that starts on the LCD and slides onto the strip stays a
+  * pointer stroke, clamped to the bottom row. */
+ nevents=0;cnt=0x306;status=0xdd01;cnt|=0x2000;be300_touch_isr(81,&t);
+ for(unsigned i=0;i<10;i++){
+  unsigned row=250+i*20>350?350:250+i*20, y=0x81e1+row*(0x8e30-0x81e1)/359;
+  sample[0x20/4]=y;sample[0x24/4]=0x8e30-(y-0x81e1);sample[0x28/4]=0x8d1b-(xp-0x8300);sample[0x2c/4]=xp;
+  status=0xdd08;cnt=0x2306;be300_touch_isr(81,&t);
+ }
+ cnt=0x306;status=0xdd01;be300_touch_isr(81,&t);
+ assert(nevents>2&&nicons==0&&events[nevents-2].y==319&&!events[nevents-1].down);
+ for(unsigned i=0;i<nevents;i++) assert(events[i].y<320);
  return 0;
 }
 '''

@@ -47,6 +47,62 @@ static void be300_regs_brightness(unsigned int level)
 	BE300_W32(BE300_BLG(0x0c), duty[level]);
 }
 
+/*
+ * Piezo on the second BLG PWM channel, from the stock bltinbuz.dll
+ * (glaze-os kernel/drivers/buzzer.c, docs/hardware/BUZZER.md; beeps heard
+ * on a real BE-300): stop 09A0, shared clock gate 1128 bit 0, OR 0202 into
+ * the shared configuration 0984, period 09A4 = 1411200/Hz - 1, duty 09A8 =
+ * period*(100-pulse)/100 - 1, start 09A0. Never touches the backlight's
+ * own 0980/0988/098C. hz 0 only stops the channel.
+ */
+#define BE300_BUZZER_CLOCK 1411200U
+
+static void be300_regs_buzzer(unsigned int hz, unsigned int pulse)
+{
+	unsigned int period;
+
+	BE300_W32(BE300_BLG(0x20), 0);
+	if (!hz)
+		return;
+	period = BE300_BUZZER_CLOCK / hz - 1;
+	if (period > 0xffff)
+		period = 0xffff;
+	BE300_W32(BE300_CMM, BE300_R32(BE300_CMM) | 1);
+	BE300_W32(BE300_BLG(4), BE300_R32(BE300_BLG(4)) | 0x0202);
+	BE300_W32(BE300_BLG(0x24), period);
+	BE300_W32(BE300_BLG(0x28), period * (100 - pulse) / 100 - 1);
+	BE300_W32(BE300_BLG(0x20), 1);
+}
+
+/*
+ * Backlight off/on as stock ddi.dll 0x01A55900 does, keeping what the
+ * buzzer shares: BLG control 0980 to zero, then only the backlight's mode
+ * nibble of 0984 and, unless a tone is sounding, gate 1128 bit 0 cleared
+ * (glaze-os display.c). saved[] holds control, config and gate.
+ */
+static void be300_regs_backlight_off(u32 *saved, int buzzer)
+{
+	saved[0] = BE300_R32(BE300_BLG(0));
+	saved[1] = BE300_R32(BE300_BLG(4));
+	saved[2] = BE300_R32(BE300_CMM) & 1;
+	BE300_W32(BE300_BLG(0), 0);
+	if (buzzer) {
+		BE300_W32(BE300_BLG(4), BE300_R32(BE300_BLG(4)) | 0x0202);
+	} else {
+		BE300_W32(BE300_BLG(4), BE300_R32(BE300_BLG(4)) & ~0xfU);
+		BE300_W32(BE300_CMM, BE300_R32(BE300_CMM) & ~1U);
+	}
+}
+
+static void be300_regs_backlight_on(const u32 *saved, int buzzer)
+{
+	BE300_W32(BE300_CMM, (BE300_R32(BE300_CMM) & ~1U) | saved[2] |
+		  (buzzer ? 1 : 0));
+	BE300_W32(BE300_BLG(4), (BE300_R32(BE300_BLG(4)) & ~0xfU) |
+		  (saved[1] & 0xf));
+	BE300_W32(BE300_BLG(0), saved[0]);
+}
+
 static void be300_regs_lcd_init(void)
 {
 	BE300_W32(BE300_CMM, BE300_R32(BE300_CMM) | 1);
@@ -249,7 +305,7 @@ static int be300_regs_ata_cor(unsigned int cor)
 		BE300_W8(0x0a00d200, cor);
 		BE300_W8(0x0a00d202, 0x01);
 		be300_regs_delay_ms(10);
-		if (BE300_R8(0x0a00d200) == cor)
+		if ((unsigned int)BE300_R8(0x0a00d200) == cor)
 			return 0;
 		be300_regs_delay_ms(100);
 	}

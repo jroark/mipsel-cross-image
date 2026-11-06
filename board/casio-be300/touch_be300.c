@@ -1,5 +1,6 @@
 /* BE300 board hardware integration v1. */
 #include <linux/be300_hardware.h>
+#include "hard_icons.h"
 /*
  * arch/mips/vr41xx/casio-be300/touch_be300.c
  *
@@ -107,7 +108,7 @@
 
 #define BE300_TOUCH_WIDTH	240
 #define BE300_TOUCH_HEIGHT	320
-#define BE300_TOUCH_PANEL_HEIGHT	359
+#define BE300_TOUCH_PANEL_HEIGHT	BE300_PANEL_ROWS	/* LCD + icon strip */
 
 /*
  * A real BE-300 panel's samples jump by more than a tap's slop as the
@@ -129,6 +130,7 @@ struct be300_touch {
 	int win_x[BE300_TOUCH_FILTER_N], win_y[BE300_TOUCH_FILTER_N], win_n;
 	bool held;
 	int held_x, held_y, pen_x, pen_y;
+	struct be300_icon_stroke icon;	/* hard_icons.h */
 	spinlock_t lock;
 	struct timer_list poll;
 };
@@ -203,8 +205,6 @@ static bool piu_decode_page(struct be300_touch *t, unsigned page_off,
 	}
 	y = n ? y / n : piu_adc_to_pos(yp, PIU_ADC_Y_MIN, PIU_ADC_Y_MAX,
 				       BE300_TOUCH_PANEL_HEIGHT);
-	if (y >= BE300_TOUCH_HEIGHT)
-		y = BE300_TOUCH_HEIGHT - 1;
 
 	*out_x = x;
 	*out_y = y;
@@ -216,10 +216,13 @@ static void be300_touch_stroke_reset(struct be300_touch *t)
 	t->stroke_samples = 0;
 	t->win_n = 0;
 	t->held = false;
+	t->icon.strip = 0;
 }
 
 static void be300_touch_report(struct be300_touch *t, int x, int y)
 {
+	if (y >= BE300_TOUCH_HEIGHT)
+		y = BE300_TOUCH_HEIGHT - 1;
 	if (t->pen_down) {
 		int dx = x - t->pen_x, dy = y - t->pen_y;
 
@@ -246,6 +249,11 @@ static void be300_touch_sample(struct be300_touch *t, int x, int y)
 	if (t->stroke_samples++ == 0) {
 		t->first_x = x;
 		t->first_y = y;
+		be300_icon_begin(&t->icon, x, y);
+		return;
+	}
+	if (t->icon.strip) {
+		be300_icon_move(&t->icon, x, y);
 		return;
 	}
 	i = t->win_n++ % BE300_TOUCH_FILTER_N;
@@ -267,6 +275,11 @@ static void be300_touch_sample(struct be300_touch *t, int x, int y)
  * report anything; then it lands where it began. */
 static void be300_touch_release(struct be300_touch *t)
 {
+	if (t->icon.strip) {	/* a strip stroke: no pointer events */
+		be300_hard_icon(be300_icon_end(&t->icon));
+		be300_touch_stroke_reset(t);
+		return;
+	}
 	if (!t->pen_down && t->stroke_samples) {
 		if (t->held)
 			be300_touch_report(t, t->held_x, t->held_y);
