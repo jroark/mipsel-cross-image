@@ -344,7 +344,7 @@ def install(tree, version):
         # 2.6 and 2.4 bring their own 520-byte page readers in their patch
         # series; 4.2's driver is this file, kept current here.
         copy_changed(source / 'nand.c', board / 'nand.c')
-        for name in ('nand_controller.h', 'nand_physical.h', 'nand_ecc.c', 'nand_ecc.h', 'nand_boot.c', 'nand_boot.h', 'pata_be300.c', 'pm.c'):
+        for name in ('nand_controller.h', 'nand_physical.h', 'nand_ecc.c', 'nand_ecc.h', 'nand_boot.c', 'nand_boot.h', 'pata_be300.c', 'pm.c', 'usb_serial.c'):
             copy_changed(source / name, board / name)
     copy_changed(source / 'hardware.h', tree / 'include/linux/be300_hardware.h')
     copy_changed(source / 'card.h', tree / 'include/linux/be300_card.h')
@@ -384,6 +384,10 @@ def install(tree, version):
         # replaces power.c's fixed "always on AC, 100 %" APM answer.
         text = text.replace(' power.o', '') if version == '4.2' else text
         makefile.write_text(text + '\nobj-y += battery.o\n')
+    text = makefile.read_text()
+    if version == '4.2' and 'usb_serial.o' not in text:
+        # The USB function controller's bulk pipe as /dev/ttyBEU0.
+        makefile.write_text(text + '\nobj-$(CONFIG_TTY) += usb_serial.o\n')
     text = makefile.read_text()
     if version == '4.2' and 'pm.o' not in text:
         # Suspend to RAM through the VR4131 SUSPEND instruction.
