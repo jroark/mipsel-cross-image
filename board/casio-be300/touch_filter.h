@@ -11,10 +11,16 @@
  * reported, average the last BE300_STROKE_N and ignore moves under
  * BE300_STROKE_MOVE_MIN pixels. Verified on hardware with 4.2 (2026-11-01).
  *
+ * Strokes that begin on the hard-icon strip below the LCD (hard_icons.h)
+ * report no pointer events; on release they call icon_out with the icon,
+ * if set. Pointer strokes are clamped to the LCD's 320 rows.
+ *
  * No kernel API is used: output goes through a (x, y, down) callback.
  */
 #ifndef BE300_TOUCH_FILTER_H
 #define BE300_TOUCH_FILTER_H
+
+#include "hard_icons.h"
 
 #define BE300_STROKE_N		3
 #define BE300_STROKE_MOVE_MIN	2
@@ -27,6 +33,8 @@ struct be300_stroke {
 	int win_x[BE300_STROKE_N], win_y[BE300_STROKE_N], win_n;
 	int held, held_x, held_y;
 	int pen_down, pen_x, pen_y;
+	struct be300_icon_stroke icon;
+	void (*icon_out)(int icon);
 };
 
 /* All four plates (y+, y-, x-, x+) must carry the valid flag. */
@@ -40,11 +48,14 @@ static inline void be300_stroke_reset(struct be300_stroke *s)
 	s->samples = 0;
 	s->win_n = 0;
 	s->held = 0;
+	s->icon.strip = 0;
 }
 
 static inline void be300_stroke_emit(struct be300_stroke *s, int x, int y,
 				     be300_stroke_out out)
 {
+	if (y >= BE300_LCD_ROWS)
+		y = BE300_LCD_ROWS - 1;
 	if (s->pen_down) {
 		int dx = x - s->pen_x, dy = y - s->pen_y;
 
@@ -66,6 +77,11 @@ static inline void be300_stroke_sample(struct be300_stroke *s, int x, int y,
 	if (s->samples++ == 0) {
 		s->first_x = x;
 		s->first_y = y;
+		be300_icon_begin(&s->icon, x, y);
+		return;
+	}
+	if (s->icon.strip) {
+		be300_icon_move(&s->icon, x, y);
 		return;
 	}
 	i = s->win_n++ % BE300_STROKE_N;
@@ -88,6 +104,14 @@ static inline void be300_stroke_sample(struct be300_stroke *s, int x, int y,
 static inline void be300_stroke_release(struct be300_stroke *s,
 					be300_stroke_out out)
 {
+	if (s->icon.strip) {
+		int icon = be300_icon_end(&s->icon);
+
+		if (icon >= 0 && s->icon_out)
+			s->icon_out(icon);
+		be300_stroke_reset(s);
+		return;
+	}
 	if (!s->pen_down && s->samples)
 		be300_stroke_emit(s, s->held ? s->held_x : s->first_x,
 				  s->held ? s->held_y : s->first_y, out);

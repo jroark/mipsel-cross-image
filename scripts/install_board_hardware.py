@@ -178,6 +178,31 @@ def touch_filter_upgrade(path, version):
     text = text.replace('static int adc_valid(', '#include "touch_filter.h"\n\nstatic int adc_valid(', 1)
     path.write_text('/* BE300 touch filter v1. */\n' + text)
 
+def touch_icons_upgrade(path, version):
+    """Scale the legacy PIU drivers to the 360-row panel so strokes that
+    start on the hard-icon strip reach touch_filter.h, which turns them
+    into be300_hard_icon() calls instead of pointer events."""
+    if version == '4.2':
+        return
+    text = path.read_text()
+    if 'BE300 hard icons v1' in text:
+        return
+    text, count = re.subn(r'#define BE300_TOUCH_PANEL_HEIGHT\s+359\b',
+                          '#define BE300_TOUCH_PANEL_HEIGHT\t360', text)
+    if count != 1:
+        raise RuntimeError(f'legacy {version} touch panel height needs review')
+    # touch_filter.h clamps pointer strokes to the LCD; strip rows must pass.
+    text, count = re.subn(r'\n\tif \(y >= BE300_TOUCH_HEIGHT\)\n\t\ty = BE300_TOUCH_HEIGHT - 1;',
+                          '', text)
+    if count != 1:
+        raise RuntimeError(f'legacy {version} touch clamp needs review')
+    old = 'static struct be300_stroke be300_stroke;\n'
+    if text.count(old) != 1:
+        raise RuntimeError(f'legacy {version} touch stroke state needs review')
+    text = text.replace(old, 'static struct be300_stroke be300_stroke = {\n'
+                        '\t.icon_out = be300_hard_icon,\n};\n')
+    path.write_text('/* BE300 hard icons v1. */\n' + text)
+
 def irq(text, version):
     init = 'be300_irq_chip_init' if version == '4.2' else 'be300_irq_cascade_init'
     text = function_body(text, init,
@@ -260,6 +285,27 @@ def console(text, names):
         raise RuntimeError('early console layout needs review: ' + ', '.join(names))
     return text
 
+# Objects that must really link on 2.4. audio.o and wifi.o are appended
+# after the include too and so have never been built there: audio.c needs
+# <asm/cacheflush.h>, which 2.4 lacks, and neither has been ported.
+RULES_MAKE_OBJECTS = ('buzzer.o', 'hard_icons.o')
+
+def rules_make_order(text):
+    """Linux 2.4's Rules.make reads obj-y when it is included: objects
+    appended after `include $(TOPDIR)/Rules.make` are silently never built.
+    Move the RULES_MAKE_OBJECTS lines in front of the include."""
+    include = 'include $(TOPDIR)/Rules.make'
+    if include not in text:
+        return text
+    head, tail = text.split(include, 1)
+    moved = [l for l in tail.splitlines() if re.match(r'obj-\S*\s*[:+]?=', l)
+             and any(o in l for o in RULES_MAKE_OBJECTS)]
+    if not moved:
+        return text
+    rest = [l for l in tail.splitlines() if l not in moved]
+    return (head.rstrip('\n') + '\n\n' + '\n'.join(moved) + '\n\n' + include +
+            '\n'.join(rest).rstrip('\n') + '\n')
+
 def copy_changed(source, target):
     data = source.read_bytes()
     if not target.exists() or target.read_bytes() != data:
@@ -271,7 +317,7 @@ def install(tree, version):
     if not board.is_dir():
         raise RuntimeError('BE-300 board patch series must be applied first')
     source = REPO / 'board/casio-be300'
-    for name in ['hardware.c', 'hardware.h', 'hardware-regs.h', 'audio.c', 'audio-regs.h', 'wifi.c', 'wifi-proto.h', 'wifi-wext.h', 'card.h']:
+    for name in ['hardware.c', 'hardware.h', 'hardware-regs.h', 'audio.c', 'audio-regs.h', 'wifi.c', 'wifi-proto.h', 'wifi-wext.h', 'card.h', 'buzzer.c', 'hard_icons.c', 'hard_icons.h']:
         copy_changed(source / name, board / name)
     if version in ('2.4', '2.6'):
         physical = os.environ.get('BE300_PHYSICAL_NAND', '0') == '1'
@@ -328,6 +374,11 @@ def install(tree, version):
                 text += '\tselect SOUND_OSS_CORE\n'
             config.write_text(text)
     text = makefile.read_text()
+    if 'buzzer.o' not in text:
+        # Piezo as an EV_SND input device (bltinbuz.dll registers), and the
+        # printed icons below the LCD as F1-F7.
+        makefile.write_text(text + '\nobj-$(CONFIG_INPUT) += buzzer.o hard_icons.o\n')
+    text = makefile.read_text()
     if version == '4.2' and 'pata_be300.o' not in text:
         # Byte-wide CF ATA (glaze-os cf.c); replaces pata_platform.
         makefile.write_text(text + '\nobj-$(CONFIG_ATA_SFF) += pata_be300.o\n')
@@ -342,6 +393,11 @@ def install(tree, version):
                      '\tdepends on CASIO_BE300 && NET && INET\n\tdefault y\n\tselect NETDEVICES\n')
             text += ('\tselect WIRELESS\n\tselect WIRELESS_EXT\n\tselect WEXT_CORE\n\tselect WEXT_PROC\n' if version == '4.2' else '\tselect NET_RADIO\n')
             config.write_text(text)
+    if version == '2.4':
+        text = makefile.read_text()
+        ordered = rules_make_order(text)
+        if ordered != text:
+            makefile.write_text(ordered)
     ne = tree / ('drivers/net/ethernet/8390/ne.c' if version == '4.2' else 'drivers/net/ne.c')
     # Generic ISA probing must never issue DP8390 commands to a wireless card.
     if ne.exists() and 'be300_wired_card()' not in ne.read_text():
@@ -409,6 +465,7 @@ def install(tree, version):
     if version != '4.2':
         copy_changed(source / 'touch_filter.h', touch_path.parent / 'touch_filter.h')
     touch_filter_upgrade(touch_path, version)
+    touch_icons_upgrade(touch_path, version)
     adapt(board / ('irq_be300.c' if version == '2.4' else 'irq.c'),
           lambda s: irq(s, version))
     adapt(board / ('nand_be300.c' if version == '2.4' else 'nand.c'), nand)

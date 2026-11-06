@@ -141,6 +141,38 @@ The comparison NAND's SHA256 is
 `cfafca7f1bdcdd82f9a9980b4a684a9830562c8b8f19bc1287131c83a674d6ec`.
 It and the extracted guest modules are local-only assets, not repository files.
 
+## Buzzer and hard icons
+
+The piezo is the second BLG PWM channel, from stock `bltinbuz.dll` (glaze-os
+`kernel/drivers/buzzer.c`, beeps heard on a real BE-300): stop `09A0`, set
+gate `1128` bit 0, OR `0202` into the shared configuration `0984`, period
+`09A4 = 1411200/Hz - 1`, duty `09A8 = period*(100-pulse)/100 - 1`, start
+`09A0`. The backlight's own `0980/0988/098C` are never touched. Linux
+exposes it as the "BE-300 Buzzer" input device (`board/casio-be300/buzzer.c`,
+EV_SND `SND_TONE` hz / `SND_BELL`), so the console bell, `KIOCSOUND` and
+`KDMKTONE` sound it; on 2.4, which has no input bell path, the driver takes
+over `kd_mksound`. Tones are clamped to 80-6000 Hz at 50% duty. Framebuffer
+blanking now clears only the backlight's mode nibble of `0984`, and keeps the
+shared gate on while a tone sounds (glaze-os `display.c`).
+
+The touch panel is 360 rows tall; rows 320-359 cover seven printed icons
+below the LCD. A stroke whose first sample lands there produces no pointer
+events; releasing it over the same icon, no more than 8 rows above the strip,
+sends `KEY_F1..KEY_F7` from the "BE-300 Hard Icons" input device (zones from
+touch.dll: columns 0-33, 34-68, 69-102, 103-136, 137-170, 171-205,
+206-239; glaze-os `docs/os/HARD_ICONS.md`). A stroke that starts on the LCD
+stays a pointer stroke clamped to row 319. The logic is in
+`board/casio-be300/hard_icons.h`, shared by the 4.2 driver and the 2.4/2.6
+`touch_filter.h`. Both new devices register after the existing ones, so the
+4.2 order stays buttons `event0`, touch `event1`, Stowaway `event2` (buzzer
+`event3`, icons `event4`).
+
+On 2.4 the board Makefile's objects must come before `include
+$(TOPDIR)/Rules.make`; the installer moves `buzzer.o hard_icons.o` there.
+`audio.o` and `wifi.o` have always been appended after that include and so
+have never been built on 2.4: `audio.c` needs `<asm/cacheflush.h>`, which 2.4
+lacks. 2.4 kernels therefore have no OSS or CF Wi-Fi driver yet.
+
 ## Display controls
 
 After boot `/dev/be300-display` is a misc character device. Read it to get

@@ -32,8 +32,8 @@ static struct timer_list cmcu_timer;
 static unsigned int cmcu_polls;
 static int cmcu_halted;
 static unsigned int brightness = 5, contrast = 5;
-static int blanked;
-static u32 saved_control, saved_config, saved_gate;
+static int blanked, buzzer_on;
+static u32 saved_backlight[3];
 
 void be300_girq0_source_mask(unsigned int source)
 {
@@ -120,22 +120,33 @@ int be300_lcd_blank(int blank)
 	blank = !!blank;
 	spin_lock_irqsave(&display_lock, flags);
 	if (blank != blanked) {
-		if (blank) {
-			saved_control = BE300_R32(BE300_BLG(0));
-			saved_config = BE300_R32(BE300_BLG(4));
-			saved_gate = BE300_R32(BE300_CMM) & 1;
-			BE300_W32(BE300_BLG(0), 0);
-			BE300_W32(BE300_BLG(4), 0);
-			BE300_W32(BE300_CMM, BE300_R32(BE300_CMM) & ~1U);
-		} else {
-			BE300_W32(BE300_CMM, (BE300_R32(BE300_CMM) & ~1U) | saved_gate);
-			BE300_W32(BE300_BLG(4), saved_config);
-			BE300_W32(BE300_BLG(0), saved_control);
-		}
+		if (blank)
+			be300_regs_backlight_off(saved_backlight, buzzer_on);
+		else
+			be300_regs_backlight_on(saved_backlight, buzzer_on);
 		blanked = blank;
 	}
 	spin_unlock_irqrestore(&display_lock, flags);
 	return 0;
+}
+
+/* Sound the piezo at hz (80..6000, clamped), or stop it with 0. Safe from
+ * interrupt context: the console bell stops it from a timer. */
+void be300_buzzer_tone(unsigned int hz)
+{
+	unsigned long flags;
+
+	if (hz && hz < 80)
+		hz = 80;
+	if (hz > 6000)
+		hz = 6000;
+	spin_lock_irqsave(&display_lock, flags);
+	be300_regs_buzzer(hz, 50);
+	buzzer_on = hz != 0;
+	/* While blanked the shared gate was released; a tone needs it. */
+	if (blanked && !buzzer_on)
+		BE300_W32(BE300_CMM, BE300_R32(BE300_CMM) & ~1U);
+	spin_unlock_irqrestore(&display_lock, flags);
 }
 
 static ssize_t display_read(struct file *file, char __user *buf,
@@ -336,6 +347,7 @@ static int __init be300_hardware_init(void)
 	spin_lock_init(&display_lock);
 	be300_regs_power_on();	/* before any other companion unit */
 	be300_regs_lcd_init();
+	be300_regs_buzzer(0, 0);	/* stop a tone the previous OS left */
 	be300_socket_prepare();
 	BE300_W16(0x0a00a040, 0x9eff); /* NK 80076D58, keybddr 01A3246C */
 	BE300_W32(0x0a0003c8, 2);    /* shared analog interface, NK 80076D94 */

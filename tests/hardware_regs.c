@@ -156,6 +156,34 @@ int main(void)
 	 * cleared, so only Power wakes HIBERNATE. */
 	be300_regs_rtc_alarm_off();
 	assert(rtc[4] == 0xffff && rtc[5] == 0xffff && rtc[6] == 0xffff && rtc[0x1f] == 1);
-	puts("LCD sequence/delays, serial contrast, duty, PIU timeout, GIU preservation, MCU protocol, power-on gates/GPIO, card detect, GIU lines, socket baseline, COR and watchdog stop/start, alarm-off passed");
+	/* Piezo: 2 kHz at 50% is period 704, duty 351; the backlight's own
+	 * 0980/0988/098C are untouched. */
+	regs[0x980/4] = 1; regs[0x984/4] = 0x12340002; regs[0x988/4] = 0xf70;
+	regs[0x98c/4] = 981; regs[0x1128/4] = 0xa4;
+	be300_regs_buzzer(2000, 50);
+	assert(regs[0x9a0/4] == 1 && regs[0x9a4/4] == 704 && regs[0x9a8/4] == 351);
+	assert(regs[0x1128/4] == 0xa5 && regs[0x984/4] == 0x12340202);
+	assert(regs[0x980/4] == 1 && regs[0x988/4] == 0xf70 && regs[0x98c/4] == 981);
+	ntrace = 0;
+	be300_regs_buzzer(0, 50);
+	assert(regs[0x9a0/4] == 0 && ntrace == 1);
+	{
+		u32 saved[3];
+		/* Blank with no tone: control 0, mode nibble and gate cleared. */
+		be300_regs_backlight_off(saved, 0);
+		assert(regs[0x980/4] == 0 && regs[0x984/4] == 0x12340200);
+		assert(regs[0x1128/4] == 0xa4);
+		be300_regs_backlight_on(saved, 0);
+		assert(regs[0x980/4] == 1 && regs[0x984/4] == 0x12340202);
+		assert(regs[0x1128/4] == 0xa5);
+		/* Blank while a tone sounds: the shared gate and 0202 stay. */
+		be300_regs_buzzer(1000, 50);
+		be300_regs_backlight_off(saved, 1);
+		assert(regs[0x980/4] == 0 && regs[0x1128/4] == 0xa5);
+		assert((regs[0x984/4] & 0x0202) == 0x0202 && regs[0x9a0/4] == 1);
+		be300_regs_backlight_on(saved, 1);
+		assert(regs[0x980/4] == 1 && regs[0x1128/4] == 0xa5);
+	}
+	puts("LCD sequence/delays, serial contrast, duty, PIU timeout, GIU preservation, MCU protocol, power-on gates/GPIO, card detect, GIU lines, socket baseline, COR and watchdog stop/start, alarm-off, buzzer and shared-gate blanking passed");
 	return 0;
 }
