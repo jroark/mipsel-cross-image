@@ -12,6 +12,8 @@
 #include <linux/timer.h>
 #include <linux/delay.h>
 #include <linux/spinlock.h>
+#include <linux/notifier.h>
+#include <linux/reboot.h>
 #include <asm/io.h>
 #include <asm/uaccess.h>
 #include "hardware.h"
@@ -22,11 +24,13 @@
 #define __user
 #endif
 #include "hardware-regs.h"
+#include "card.h"
 
 /* Initialized before registering controls; valid on all three kernels. */
 static spinlock_t display_lock;
 static struct timer_list cmcu_timer;
 static unsigned int cmcu_polls;
+static int cmcu_halted;
 static unsigned int brightness = 5, contrast = 5;
 static int blanked;
 static u32 saved_control, saved_config, saved_gate;
@@ -55,8 +59,21 @@ void be300_girq0_pending_ack(unsigned int pending)
 void be300_girq0_init(void)
 {
 	unsigned int source;
-	for (source = 0; source < 16; source++)
-		be300_girq0_source_mask(source);
+	unsigned long pa;
+
+	/*
+	 * Writing a source word clears its latch; a power-on boot's touch
+	 * source is latched before anything runs. Bit 2 must stay set on a
+	 * source Linux serves or its latch never clears: PCMCIA 0, buttons 1,
+	 * audio 8, touch 9 (glaze-os irq.c, docs/HARDWARE.md).
+	 */
+	for (source = 0; source < 16; source++) {
+		pa = 0x0a000010UL + source * 4;
+		if (source <= 1 || source == 8 || source == 9)
+			BE300_W32(pa, (BE300_R32(pa) & ~8U) | 4);
+		else
+			be300_girq0_source_mask(source);
+	}
 	BE300_W32(0x0a000008, 1);
 }
 
@@ -211,6 +228,8 @@ static struct miscdevice display_device = {
 
 static void cmcu_tick(unsigned long unused)
 {
+	if (cmcu_halted)
+		return;
 	be300_regs_watchdog_poll();
 	if (++cmcu_polls == 50) {
 		be300_regs_watchdog_reload();
@@ -219,16 +238,68 @@ static void cmcu_tick(unsigned long unused)
 	mod_timer(&cmcu_timer, jiffies + (HZ / 10 ? HZ / 10 : 1));
 }
 
-static void __init be300_socket_prepare(void)
+/* Stop serving the power MCU's watchdog and stop the watchdog itself.
+ * The keepalive's 0x53/0x3A pair is also its start command, so the timer
+ * must not run again afterwards. */
+void be300_cmcu_shutdown(void)
 {
-	unsigned int n;
-	u32 ctrl;
+	cmcu_halted = 1;
+	del_timer(&cmcu_timer);
+	if (be300_regs_cmcu_stop())
+		printk(KERN_WARNING "BE-300: MCU watchdog did not stop\n");
+}
+
+/* Halt and power-off end in HIBERNATE or a spin; restart would otherwise
+ * also find the watchdog armed before the new kernel serves it. */
+static int be300_reboot_notify(struct notifier_block *nb, unsigned long code,
+			       void *unused)
+{
+	be300_cmcu_shutdown();
+	if (code != SYS_RESTART)	/* stay off until Power is pressed */
+		be300_regs_rtc_alarm_off();
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block be300_reboot_nb = {
+	.notifier_call = be300_reboot_notify,
+};
+
+void be300_card_write_cor(unsigned int attr, unsigned int cor)
+{
+	be300_regs_card_cor(attr, cor);
+}
+
+/*
+ * Configure the card in socket 0 for the function its CIS names: ATA
+ * through COR 0x43 at the secondary IDE ports, an I/O card from its CONFIG
+ * and CFTABLE tuples. On a real BE-300 a COR of zero (power-on) left ATA
+ * disabled (glaze-os docs/hardware/PHYSICAL_NAND.md). Emulated cards
+ * ignore the COR, so an ATA readback mismatch there is only logged.
+ */
+int be300_card_configure(void)
+{
+	unsigned int function = 0xff, man = 0, product = 0, attr, cor;
 
 	if (!be300_regs_card_present())
-		return;
-	ctrl = BE300_R32(0x0a00a000);
-	if ((ctrl & 0x0b) == 0x0b && !(BE300_R32(0x0a00a004) & 1))
-		return; /* configured handoff, leave the card's COR alone */
+		return -ENODEV;
+	be300_card_identity(&function, &man, &product);
+	if (function == 4) {
+		if (be300_regs_ata_cor(0x43))
+			printk(KERN_INFO "BE-300: CF card did not read back COR 43\n");
+		return 0;
+	}
+	if (be300_card_io_config(&attr, &cor)) {
+		be300_regs_card_cor(attr, cor);
+		printk(KERN_INFO "BE-300: card %04x:%04x COR %02x at %03x\n",
+		       man, product, cor, attr);
+	}
+	return 0;
+}
+
+/* pcmcia.dll 0x0198C15C..0x0198C338: Vcc, reset pulse, card windows. */
+static void be300_socket_power_up(void)
+{
+	be300_regs_socket_bus_init();
 	BE300_W32(0x0a00a034, (BE300_R32(0x0a00a034) | 4) & ~0x30U);
 	BE300_W32(0x0a00a034, (BE300_R32(0x0a00a034) | 8) & ~0x30U);
 	BE300_W32(0x0a00a024, BE300_R32(0x0a00a024) & ~0x0cU);
@@ -237,14 +308,27 @@ static void __init be300_socket_prepare(void)
 	BE300_W32(0x0a00a004, BE300_R32(0x0a00a004) | 1);
 	BE300_W32(0x0a00a000, 8);
 	BE300_W32(0x0a00a000, 9);
-	for (n = 0; n < 300; n++)
-		udelay(1000);
+	be300_regs_delay_ms(300);
 	BE300_W32(0x0a00a004, BE300_R32(0x0a00a004) & ~1U);
-	for (n = 0; n < 20; n++)
-		udelay(1000);
+	be300_regs_delay_ms(20);
 	BE300_W32(0x0a00a000, 0x0b);
 	BE300_W32(0x0a001b20, 1);
 	BE300_W32(0x0a00a01c, BE300_R32(0x0a00a01c) | 4);
+}
+
+static void __init be300_socket_prepare(void)
+{
+	u32 ctrl;
+
+	ctrl = BE300_R32(0x0a00a000);
+	if (be300_regs_card_present() && (ctrl & 0x0b) == 0x0b &&
+	    !(BE300_R32(0x0a00a004) & 1))
+		return; /* configured handoff, leave the card's COR alone */
+	be300_regs_socket_bus_init();
+	if (!be300_regs_card_present())
+		return;
+	be300_socket_power_up();
+	be300_card_configure();
 }
 
 static int __init be300_hardware_init(void)
@@ -264,6 +348,7 @@ static int __init be300_hardware_init(void)
 	cmcu_timer.data = 0;
 	cmcu_timer.expires = jiffies + (HZ / 10 ? HZ / 10 : 1);
 	add_timer(&cmcu_timer);
+	register_reboot_notifier(&be300_reboot_nb);
 	printk(KERN_INFO "BE-300: original LCD initialized; MCU watchdog active\n");
 	return 0;
 }

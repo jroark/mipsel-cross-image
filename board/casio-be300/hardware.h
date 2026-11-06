@@ -13,4 +13,10 @@ void be300_girq0_init(void);
 void be300_console_ready(void);
 /* Linux 2.4 registers fbcon before the board initcall runs. */
 void be300_framebuffer_ready(void);
+/* Configure socket 0's card (ATA or I/O COR) from its CIS. */
+int be300_card_configure(void);
+/* Write a card configuration register at attribute address attr. */
+void be300_card_write_cor(unsigned int attr, unsigned int cor);
+/* Stop the power MCU watchdog before halt, power-off or sleep. */
+void be300_cmcu_shutdown(void);
 #endif

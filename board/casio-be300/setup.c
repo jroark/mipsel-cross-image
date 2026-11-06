@@ -26,9 +26,6 @@
 #include <linux/ioport.h>
 #include <linux/platform_device.h>
 #include <linux/serial_8250.h>
-#ifdef CONFIG_ATA
-#include <linux/ata_platform.h>
-#endif
 
 #include <asm/io.h>
 #include <asm/idle.h>
@@ -139,16 +136,15 @@ void prom_putchar(char c)
 }
 
 /*
- * CompactFlash via pata_platform. The emulator exposes the CF taskfile
- * registers at PA 0x0A00C170-7 with alternate-status at 0x0A00C376. The
- * companion chip is hardwired so the data port is 8-bit and there is no
- * register-shift; pata_platform's ioport_shift = 0 leaves the layout as
- * cmd_addr + N for register N. Interrupt routes through GIRQ0 bit 0 ->
+ * CompactFlash via pata_be300 (board/casio-be300/pata_be300.c): taskfile
+ * at PA 0x0A00C170-7, alternate status at 0x0A00C376, register N at
+ * cmd_addr + N, data moved a byte at a time in the card's 8-bit mode as on
+ * real hardware (glaze-os cf.c). Interrupt routes through GIRQ0 bit 0 ->
  * GIU line 0 -> VRIP 8, demuxed by board/casio-be300/irq.c into
  * VRC4173_IRQ(0). Probe will fail cleanly when the emulator is invoked
  * without --cf (or with --ne2000, which steals the same window).
  */
-#ifdef CONFIG_ATA
+#ifdef CONFIG_ATA_SFF
 #define BE300_CF_CMD_PA		0x0a00c170
 #define BE300_CF_CMD_LEN	8
 #define BE300_CF_CTL_PA		0x0a00c376
@@ -171,18 +167,11 @@ static struct resource be300_cf_resources[] = {
 	},
 };
 
-static struct pata_platform_info be300_cf_pdata = {
-	.ioport_shift	= 0,
-};
-
 static struct platform_device be300_cf_device = {
-	.name		= "pata_platform",
+	.name		= "pata_be300",
 	.id		= -1,
 	.num_resources	= ARRAY_SIZE(be300_cf_resources),
 	.resource	= be300_cf_resources,
-	.dev = {
-		.platform_data = &be300_cf_pdata,
-	},
 };
 #endif
 
@@ -266,28 +255,33 @@ static struct platform_device be300_serial8250_device = {
 
 /*
  * CF and NE2000 share VRC4173_IRQ(0); the emulator makes them mutually
- * exclusive (--cf vs --ne2000). Register both pdevs unconditionally,
- * but only NE2000 carries IORESOURCE_IRQ — pata_platform's resource
+ * exclusive (--cf vs --ne2000), and socket 0's CIS picks which one is
+ * registered. Only NE2000 carries IORESOURCE_IRQ — pata_be300's resource
  * list intentionally omits the IRQ so ata_host_activate goes through
  * the polled-mode path (irq=0) and doesn't call request_irq(). That
  * leaves IRQ 72 free for ne_probe1's exclusive request_irq() call.
  *
  * Trade-off: in --cf mode CF transfers are polled rather than
- * interrupt-driven. pata_platform handles this fine (libata's
+ * interrupt-driven. libata handles this fine (libata's
  * ata_polling_mode kicks in when host->irq == 0).
  */
-static struct platform_device *be300_devices[] __initdata = {
-	&be300_ne2000_device,
-	&be300_serial8250_device,
-#ifdef CONFIG_ATA
-	&be300_cf_device,
-#endif
-};
 
 static int __init casio_be300_register_devices(void)
 {
-	if (be300_wireless_card())
-		return platform_device_register(&be300_serial8250_device);
-	return platform_add_devices(be300_devices, ARRAY_SIZE(be300_devices));
+	int ret;
+
+	ret = platform_device_register(&be300_serial8250_device);
+	if (ret)
+		return ret;
+	/* Only an NE2000-compatible card gets ne.c's register probe, and
+	 * only storage (FUNCID 4) gets ATA, whose polled waits on a modem or
+	 * NIC card would only time out. */
+	if (be300_wired_card())
+		ret = platform_device_register(&be300_ne2000_device);
+#ifdef CONFIG_ATA_SFF
+	if (!ret && be300_card_function() == 4)
+		ret = platform_device_register(&be300_cf_device);
+#endif
+	return ret;
 }
 device_initcall(casio_be300_register_devices);

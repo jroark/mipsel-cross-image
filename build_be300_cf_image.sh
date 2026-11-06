@@ -38,6 +38,7 @@ ensure_kernel_patched() {
 		fi
 		cp "$WORK/board/casio-be300/setup.c" \
 			"$KERNEL_DIR/arch/mips/vr41xx/casio-be300/setup.c"
+		python3 "$WORK/scripts/install_board_hardware.py" "$KERNEL_DIR" --kernel 4.2
 		return
 	fi
 	"$WORK/scripts/apply_patch_series.sh" "$PATCH_SERIES" "$KERNEL_DIR"
@@ -46,6 +47,7 @@ ensure_kernel_patched() {
 	fi
 	cp "$WORK/board/casio-be300/setup.c" \
 		"$KERNEL_DIR/arch/mips/vr41xx/casio-be300/setup.c"
+	python3 "$WORK/scripts/install_board_hardware.py" "$KERNEL_DIR" --kernel 4.2
 }
 
 prepare_cf_rootfs() {
