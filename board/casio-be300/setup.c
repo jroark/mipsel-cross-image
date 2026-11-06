@@ -54,11 +54,6 @@
 #define BE300_PCMCIA_BRIDGE_PA	0x0a00a01c
 #define BE300_PCMCIA_BRIDGE_EN	0x04
 
-static void casio_be300_wait(void)
-{
-	local_irq_enable();
-}
-
 static int __init casio_be300_setup(void)
 {
 	set_io_port_base(BE300_IO_PORT_BASE);
@@ -105,19 +100,11 @@ static int __init casio_be300_setup(void)
 arch_initcall(casio_be300_setup);
 
 /*
- * The VR41xx PMU driver (subsys_initcall) sets cpu_wait to
- * vr41xx_cpu_wait() which uses the VR41xx "standby" instruction.
- * The BE-300 emulator doesn't wake from standby on interrupt,
- * so override with a simple enable-and-return idle function.
- * Must run after the PMU's subsys_initcall.
+ * Idle is the VR41xx PMU driver's vr41xx_cpu_wait(): STANDBY, which sets
+ * Status.IE as it executes (VR4131 UM ch. 12). The emulator models that
+ * since be300 commit 972f89a0, and glaze-os idles the same way, so the
+ * former busy "enable and return" override is gone.
  */
-static int __init casio_be300_idle_setup(void)
-{
-	cpu_wait = casio_be300_wait;
-	return 0;
-}
-
-device_initcall(casio_be300_idle_setup);
 
 /*
  * Early console output via the companion chip UART.

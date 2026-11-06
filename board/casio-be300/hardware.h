@@ -23,4 +23,8 @@ void be300_cmcu_shutdown(void);
 void be300_buzzer_tone(unsigned int hz);
 /* A released hard-icon tap (0..6): sends KEY_F1 + icon. */
 void be300_hard_icon(int icon);
+/* Sleep support: watchdog restart, panel off/on around suspend. */
+void be300_cmcu_resume(void);
+void be300_lcd_suspend(void);
+void be300_lcd_resume(void);
 #endif

@@ -32,7 +32,7 @@ static struct timer_list cmcu_timer;
 static unsigned int cmcu_polls;
 static int cmcu_halted;
 static unsigned int brightness = 5, contrast = 5;
-static int blanked, buzzer_on;
+static int blanked, buzzer_on, panel_asleep, blank_level, suspend_level;
 static u32 saved_backlight[3];
 
 void be300_girq0_source_mask(unsigned int source)
@@ -113,11 +113,29 @@ int be300_piu_prepare(void)
 	return 0;
 }
 
-int be300_lcd_blank(int blank)
+/*
+ * Framebuffer blank levels: any nonzero level turns the backlight off;
+ * POWERDOWN (4, also 2.4 fbcon's VESA powerdown + 1) also powers the panel
+ * down, and unblank starts it again with its brightness and contrast.
+ * The fb core serializes calls, so the panel's millisecond waits run
+ * outside display_lock, which only guards the BLG/CMM registers.
+ */
+int be300_lcd_blank(int level)
 {
 	unsigned long flags;
+	int blank = level != 0;
 
-	blank = !!blank;
+	blank_level = level;
+	if (!blank && panel_asleep) {
+		be300_regs_lcd_init();	/* turns the backlight on at level 5 */
+		spin_lock_irqsave(&display_lock, flags);
+		if (blanked)
+			BE300_W32(BE300_BLG(0), 0);
+		be300_regs_brightness(brightness);
+		be300_regs_contrast(contrast);
+		spin_unlock_irqrestore(&display_lock, flags);
+		panel_asleep = 0;
+	}
 	spin_lock_irqsave(&display_lock, flags);
 	if (blank != blanked) {
 		if (blank)
@@ -127,6 +145,10 @@ int be300_lcd_blank(int blank)
 		blanked = blank;
 	}
 	spin_unlock_irqrestore(&display_lock, flags);
+	if (level >= 4 && !panel_asleep) {
+		be300_regs_lcd_sleep();
+		panel_asleep = 1;
+	}
 	return 0;
 }
 
@@ -274,6 +296,29 @@ static int be300_reboot_notify(struct notifier_block *nb, unsigned long code,
 static struct notifier_block be300_reboot_nb = {
 	.notifier_call = be300_reboot_notify,
 };
+
+/* Start the watchdog again and resume serving it (after sleep). */
+void be300_cmcu_resume(void)
+{
+	be300_regs_cmcu_start();
+	cmcu_polls = 0;
+	cmcu_halted = 0;
+	mod_timer(&cmcu_timer, jiffies + (HZ / 10 ? HZ / 10 : 1));
+}
+
+/* Panel and backlight off for sleep; resume restores the blank level. */
+void be300_lcd_suspend(void)
+{
+	suspend_level = blank_level;
+	be300_lcd_blank(4);
+}
+
+void be300_lcd_resume(void)
+{
+	be300_lcd_blank(0);
+	if (suspend_level)
+		be300_lcd_blank(suspend_level);
+}
 
 void be300_card_write_cor(unsigned int attr, unsigned int cor)
 {

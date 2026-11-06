@@ -1,0 +1,36 @@
+From: BE300 Patch Generator <be300@example.invalid>
+Date: Thu, 5 Nov 2026 16:00:00 -0800
+Subject: [PATCH] linux-4.2.9: keep the Stowaway input device across resume
+
+Resume reconnects every serio port; without a reconnect callback the
+Stowaway driver is disconnected and connected again, and the keyboard
+comes back as a new input device with the next /dev/input/event number.
+Keep the existing device instead.
+
+--- a/drivers/input/keyboard/stowaway.c	2026-11-05 18:32:35
++++ b/drivers/input/keyboard/stowaway.c	2026-11-05 18:32:35
+@@ -160,6 +160,16 @@
+ 
+ MODULE_DEVICE_TABLE(serio, skbd_serio_ids);
+ 
++/*
++ * Resume reconnects every serio port. The keyboard keeps no state that a
++ * sleep loses, so keep its input device: a new one would take the next
++ * /dev/input/event number instead of the one profiles were set up with.
++ */
++static int skbd_reconnect(struct serio *serio)
++{
++	return serio_get_drvdata(serio) ? 0 : -1;
++}
++
+ static struct serio_driver skbd_drv = {
+ 	.driver		= {
+ 		.name	= "stowaway",
+@@ -169,6 +179,7 @@
+ 	.interrupt	= skbd_interrupt,
+ 	.connect	= skbd_connect,
+ 	.disconnect	= skbd_disconnect,
++	.reconnect	= skbd_reconnect,
+ };
+ 
+ module_serio_driver(skbd_drv);
