@@ -214,6 +214,25 @@ the Stowaway input device across the serio reconnect, so event numbers do
 not change. Two suspend/resume cycles pass in the emulator; glaze-os has not
 yet verified SUSPEND's wake on hardware. Power-off remains HIBERNATE.
 
+## USB function
+
+The BE-300 is a USB 1.1 device. The companion's function controller
+(`0x0A001300-0x0A00161F`, clock gate `1114`) answers enumeration itself
+from the descriptor table written at `153C+4i`: VID 07CF, PID 2002, vendor
+class, EP1 IN bulk 64, EP2 OUT bulk 64, EP3 IN interrupt 8. Linux 4.2 drives
+its bulk pipe as `/dev/ttyBEU0` (`board/casio-be300/usb_serial.c`), with
+glaze-os's register sequence (`kernel/drivers/usb.c`, which enumerated,
+ran its debugger and carried USB networking on hardware): polled each tick
+with GIRQ0 source 7 masked, RX by PIO from `14D4`, TX by DMA from an
+uncached page, CDC SET_CONTROL_LINE_STATE accepted and other requests
+stalled. Output is discarded until the host has set DTR, as with an
+unplugged serial cable, and a bus reset or deconfiguration hangs the tty
+up. On a Linux host use `modprobe usbserial vendor=0x07cf product=0x2002`;
+run a getty on ttyBEU0 for a USB shell or pppd over it for networking.
+`tools/be300_usb_serial_test.py <nand>` checks both directions through the
+emulator's usbredir bridge (`--pcconnect-dock usb-sync`). 2.4 and 2.6 have
+no driver yet.
+
 ## Display controls
 
 After boot `/dev/be300-display` is a misc character device. Read it to get

@@ -505,23 +505,12 @@ probe can use physical `0x0A00A0C0` to identify the emulated machine.
 
 Base: `0x0A001440`
 
-Status: emulator-modeled/stub.
-
-This is modeled as an OpenHCI-like operational register window:
-
-| Offset | Meaning |
-| ---: | --- |
-| `0x00` | HcRevision, returns `0x0010`. |
-| `0x0C` | HcInterruptStatus. |
-| `0x10` | HcInterruptEnable. |
-| `0x14` | HcInterruptDisable/readback of enable state. |
-| `0x50` | Root hub descriptor/control-like register. |
-| `0x54` | Port 0 status. |
-| `0x58` | Port 1 status. |
-
-The root hub normally has no connected USB device. A generic OHCI driver may
-probe this, but useful USB device functionality is not implemented. Bring up
-serial/debug/storage first.
+Status: superseded (2026-11-05). This is the BE-300's USB **function**
+(device) controller, not an OHCI host: it enumerates as 07CF:2002 from the
+descriptor RAM at `0x0A00153C` (be300 `docs/BE300_USB_FUNCTION.md`, glaze-os
+`kernel/drivers/usb.c`). Linux 4.2 drives it as `/dev/ttyBEU0`
+(`board/casio-be300/usb_serial.c`); see docs/HARDWARE.md, "USB function".
+Do not bind an OHCI driver here.
 
 ### Buzzer
 
@@ -1069,7 +1058,7 @@ This order minimizes dependency on incomplete companion-chip behavior.
 9. Optional devices:
    - PPSH mailbox for debug.
    - Buzzer host pulse support.
-   - USB OHCI probe only after a real USB device model exists.
+   - USB: the function controller is driven as ttyBEU0 on 4.2 (not OHCI).
 
 ## Driver Inventory
 
@@ -1097,7 +1086,7 @@ Recommended Linux driver names are suggestions, not existing upstream bindings.
 - The VRC4173 PCMCIA bridge is not fully modeled. Runtime CF works through
   observed windows and compatibility routing.
 - VRC4173 display acceleration blocks are partial. Use the framebuffer first.
-- VRC4173 USB exposes OHCI-like registers but no useful connected USB device.
+- VRC4173 USB is a function (device) controller, driven as ttyBEU0 on 4.2.
 - DSIU extension registers are stubbed.
 - The ScCmcu range `0x0A007800-0x0A00783F` returns instant completion and is
   not a real MCU model.
