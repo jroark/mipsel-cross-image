@@ -6,3 +6,4 @@
 0006-linux-4.2.9-add-linux4be-fbcon-logo.patch
 0007-linux-4.2.9-settle-vr41xx-rtc-writes.patch
 0008-linux-4.2.9-keep-stowaway-across-resume.patch
+0009-linux-4.2.9-ne-hotplug.patch

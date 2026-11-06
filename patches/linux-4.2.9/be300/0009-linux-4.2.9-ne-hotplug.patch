@@ -1,0 +1,94 @@
+From: BE300 Patch Generator <be300@example.invalid>
+Date: Thu, 5 Nov 2026 18:00:00 -0800
+Subject: [PATCH] linux-4.2.9: let ne.c bind a hot-plugged NE2000
+
+The BE-300 CF socket now registers its NE2000 platform device when the
+card is inserted, which can be after boot. platform_driver_probe() binds
+only devices present at init and drops the driver if there are none, and
+the probe path was __init. Register the driver normally and keep the
+probe path and its tables.
+
+--- a/drivers/net/ethernet/8390/ne.c	2026-11-06 02:57:40.944964605 +0000
++++ b/drivers/net/ethernet/8390/ne.c	2026-11-06 02:57:40.952432116 +0000
+@@ -106,12 +106,12 @@
+ 
+ /* A zero-terminated list of I/O addresses to be probed at boot. */
+ #ifdef NEEDS_PORTLIST
+-static unsigned int netcard_portlist[] __initdata = {
++static unsigned int netcard_portlist[] = {
+ 	0x300, 0x280, 0x320, 0x340, 0x360, 0x380, 0
+ };
+ #endif
+ 
+-static struct isapnp_device_id isapnp_clone_list[] __initdata = {
++static struct isapnp_device_id isapnp_clone_list[] = {
+ 	{	ISAPNP_CARD_ID('A','X','E',0x2011),
+ 		ISAPNP_VENDOR('A','X','E'), ISAPNP_FUNCTION(0x2011),
+ 		(long) "NetGear EA201" },
+@@ -129,7 +129,7 @@
+ #ifdef SUPPORT_NE_BAD_CLONES
+ /* A list of bad clones that we none-the-less recognize. */
+ static struct { const char *name8, *name16; unsigned char SAprefix[4];}
+-bad_clone_list[] __initdata = {
++bad_clone_list[] = {
+     {"DE100", "DE200", {0x00, 0xDE, 0x01,}},
+     {"DE120", "DE220", {0x00, 0x80, 0xc8,}},
+     {"DFI1000", "DFI2000", {'D', 'F', 'I',}}, /* Original, eh?  */
+@@ -208,7 +208,7 @@
+ 	E2010	 starts at 0x100 and ends at 0x4000.
+ 	E2010-x starts at 0x100 and ends at 0xffff.  */
+ 
+-static int __init do_ne_probe(struct net_device *dev)
++static int do_ne_probe(struct net_device *dev)
+ {
+ 	unsigned long base_addr = dev->base_addr;
+ #ifdef NEEDS_PORTLIST
+@@ -243,7 +243,7 @@
+ 	return -ENODEV;
+ }
+ 
+-static int __init ne_probe_isapnp(struct net_device *dev)
++static int ne_probe_isapnp(struct net_device *dev)
+ {
+ 	int i;
+ 
+@@ -291,7 +291,7 @@
+ 	return -ENODEV;
+ }
+ 
+-static int __init ne_probe1(struct net_device *dev, unsigned long ioaddr)
++static int ne_probe1(struct net_device *dev, unsigned long ioaddr)
+ {
+ 	int i;
+ 	unsigned char SA_prom[32];
+@@ -798,7 +798,7 @@
+ 	ei_status.dmaing &= ~0x01;
+ }
+ 
+-static int __init ne_drv_probe(struct platform_device *pdev)
++static int ne_drv_probe(struct platform_device *pdev)
+ {
+ 	struct net_device *dev;
+ 	int err, this_dev = pdev->id;
+@@ -915,6 +915,7 @@
+ #endif
+ 
+ static struct platform_driver ne_driver = {
++	.probe		= ne_drv_probe,
+ 	.remove		= ne_drv_remove,
+ 	.suspend	= ne_drv_suspend,
+ 	.resume		= ne_drv_resume,
+@@ -958,9 +959,12 @@
+ 	return retval;
+ }
+ #else /* MODULE */
++/* BE-300: the CF socket's NE2000 can arrive after boot (hot plug in
++ * arch/mips/vr41xx/casio-be300/setup.c), so the driver stays registered
++ * and its probe path is not discarded with init memory. */
+ static int __init ne_init(void)
+ {
+-	int retval = platform_driver_probe(&ne_driver, ne_drv_probe);
++	int retval = platform_driver_register(&ne_driver);
+ 
+ 	/* Unregister unused platform_devices. */
+ 	ne_loop_rm_unreg(0);

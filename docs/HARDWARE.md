@@ -214,6 +214,26 @@ the Stowaway input device across the serio reconnect, so event numbers do
 not change. Two suspend/resume cycles pass in the emulator; glaze-os has not
 yet verified SUSPEND's wake on hardware. Power-off remains HIBERNATE.
 
+## CF hot plug and serial cards (4.2)
+
+`setup.c` polls the card-detect inputs (`A008`) every 500 ms, as glaze-os
+`pcmcia_poll()` does. On insertion it powers the socket from its stock
+baseline (`be300_socket_power_up()`), waits up to a second for the CIS to
+answer, writes the COR (`be300_card_configure()`) and creates the card's
+device: `ne` for an NE2000-compatible card, `pata_be300` for storage, or a
+16550 at I/O 0x3F8 as ttyS1 for a serial card (FUNCID 2: the RC56LD modem,
+the BL-565 Bluetooth card). Removal unregisters it. Patch 0009 lets `ne.c`
+bind a device registered after boot. `CONFIG_SERIAL_8250_NR_UARTS` is 2.
+
+Emulator results: `--cf img --cf-insert-after 60` attaches sda and reads
+correct sectors; `--cf-eject-after 60` removes sda; `--ne2000
+--net-insert-after 60` brings up eth0, which pings 10.0.0.254;
+`--cf-modem` answers `ATI` on ttyS1.
+
+Not done: Wi-Fi cards are still bound once at boot by `wifi.c`; 2.4 and
+2.6 have no hot plug; the PCMCIA jacket (socket 1 at `0x0B000000`, GIRQ0
+source 6) and drivers for the 3c589 and Hermes cards are not written.
+
 ## USB function
 
 The BE-300 is a USB 1.1 device. The companion's function controller
