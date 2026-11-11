@@ -394,8 +394,10 @@ level write/readback, invalid-level rejection and blank/unblank completed.
 160 guest seconds. A supplemental 600-host-second 4.2 run also reached the
 white 160-guest-second marker. That longer run preceded the final 2.4-compatible
 text-parser change; the final image repeats the controls/blanking check.
-The emulator's MCU window is stubbed, so survival establishes kernel/userspace
-liveness, **not** a physical MCU watchdog test. The host transaction test
+The emulator models the MCU watchdog (stop/start, a 150 s timeout, STATUS 3
+while running; be300 `src/hw/cmcu.c`), but takes the 53/3A poll alone as a
+reload, which is unconfirmed on hardware. Survival there is **not** a
+physical MCU watchdog test. The host transaction test
 separately verifies the keepalive/reload register protocol with status 3.
 
 Logs, source snapshots, test kernels and NAND copies remain outside Git under

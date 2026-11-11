@@ -502,7 +502,8 @@ static void be300_regs_cmcu_start(void)
 /*
  * Keep the elapsed-time alarm from waking a powered-off BE-300 out of
  * HIBERNATE: mainline rtc-vr41xx leaves ECMP at 0 when /dev/rtc closes,
- * and the emulator treats any ETIME >= ECMP as the alarm. Move ECMP out
+ * and the emulator treated any ETIME >= ECMP as the alarm until its
+ * Nov 2026 RTC fix (now a match, as the UM says). Still move ECMP out
  * of reach and clear a latched ELAPSEDTIME interrupt (RTCINTREG, W1C).
  * VR4131 UM ch. 13.
  */
