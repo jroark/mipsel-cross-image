@@ -329,8 +329,9 @@ void be300_card_write_cor(unsigned int attr, unsigned int cor)
  * Configure the card in socket 0 for the function its CIS names: ATA
  * through COR 0x43 at the secondary IDE ports, an I/O card from its CONFIG
  * and CFTABLE tuples. On a real BE-300 a COR of zero (power-on) left ATA
- * disabled (glaze-os docs/hardware/PHYSICAL_NAND.md). Emulated cards
- * ignore the COR, so an ATA readback mismatch there is only logged.
+ * disabled (glaze-os docs/hardware/PHYSICAL_NAND.md). The emulator's
+ * storage card needs the COR too since Nov 2026 and reads it back; its
+ * network cards still ignore theirs. A readback mismatch is only logged.
  */
 int be300_card_configure(void)
 {
